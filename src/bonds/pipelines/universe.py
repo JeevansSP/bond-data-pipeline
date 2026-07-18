@@ -16,6 +16,7 @@ from typing import Protocol
 from bonds.logging import get_logger
 from bonds.models import SecurityRecord
 from bonds.pipelines.base import PipelineResult, RunStatus
+from bonds.quality import QualityInspector
 from bonds.sources.bondcentral import BondCentralSource
 from bonds.storage import Database
 from bonds.storage.repositories import (
@@ -27,7 +28,13 @@ logger = get_logger(__name__)
 
 # Attributes surfaced by connectors that we track over time (SCD-2). Only non-null values are
 # recorded, so day-1 does not flood the table with "unrated" rows.
-TRACKED_ATTRIBUTES: tuple[str, ...] = ("credit_rating", "security_status", "secured_unsecured")
+TRACKED_ATTRIBUTES: tuple[str, ...] = (
+    "credit_rating",
+    "credit_rating_agency",
+    "credit_rating_date",
+    "security_status",
+    "secured_unsecured",
+)
 
 
 class UniverseFetcher(Protocol):
@@ -70,6 +77,9 @@ class UniversePipeline:
             securities = SecurityRepository(session)
             rows = securities.upsert_many(records, seen_on=as_of)
             changes = self._record_attributes(securities, records, effective=as_of)
+            QualityInspector(
+                session, source=self._source.name, dataset=dataset, run_date=as_of
+            ).inspect_universe(records)
             runs.finish(run, status=RunStatus.SUCCESS, rows=rows, message=f"{changes} attr changes")
             logger.info("universe.success", dataset=dataset, rows=rows, attr_changes=changes)
             return PipelineResult(as_of, dataset, RunStatus.SUCCESS, rows=rows)

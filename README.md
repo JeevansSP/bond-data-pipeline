@@ -63,6 +63,14 @@ uv run bonds ingest sovereign-valuation-backfill --start 2026-07-01 --end 2026-0
 
 Browse the data in **DBeaver** → `localhost:5432`, db/user/pass `bonds` (see `.env`).
 
+## Data quality
+
+Every ingest runs checks and persists them to `data_quality_checks` (ISIN check-digit, price/YTM
+range, null-rate ceilings, row-count drift vs the previous run) so quality is monitored, not assumed.
+`CHECK` constraints back-stop bad prices/YTMs at the DB. Use the **`active_securities`** view as the
+investable universe — it excludes matured and non-ACTIVE securities (the ladder must never hold a
+dead bond). For a point-in-time backtest, filter by the as-of date directly instead of the view.
+
 ## Development
 
 ```bash

@@ -9,11 +9,16 @@ import datetime as dt
 from collections.abc import Iterator
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 
 from bonds.models import InstrumentType, SecurityRecord
 from bonds.pipelines import RunStatus, UniversePipeline
-from bonds.storage import Database, IngestionRun, Security, SecurityAttributeHistory
+from bonds.storage import (
+    Database,
+    IngestionRun,
+    Security,
+    SecurityAttributeHistory,
+)
 from bonds.storage.schema import Valuation
 
 pytestmark = pytest.mark.integration
@@ -39,14 +44,21 @@ class FakeUniverseSource:
         yield from self._records
 
 
-def _rec(isin: str, rating: str | None) -> SecurityRecord:
+def _rec(
+    isin: str,
+    rating: str | None,
+    *,
+    maturity: dt.date | None = None,
+    status: str = "ACTIVE",
+) -> SecurityRecord:
     return SecurityRecord(
         isin=isin,
         instrument_type=InstrumentType.CORP,
         source=SOURCE,
         issuer="ACME LTD",
         coupon=7.0,
-        attributes={"credit_rating": rating, "security_status": "ACTIVE"},
+        maturity_date=maturity,
+        attributes={"credit_rating": rating, "security_status": status},
     )
 
 
@@ -118,3 +130,45 @@ def test_rating_downgrade_is_recorded_as_scd2(database: Database) -> None:
         ("AAA", DAY2 - dt.timedelta(days=1)),  # closed the day before the change
         ("AA", None),  # current
     ]
+
+
+def test_quality_checks_are_persisted(database: Database) -> None:
+    source = FakeUniverseSource([_rec(ISIN_A, "AAA"), _rec(ISIN_B, "AA+")])
+    UniversePipeline(database, source=source).run(DAY1)
+    with database.session() as s:
+        checks = (
+            s.execute(
+                text(
+                    "SELECT check_name, passed FROM data_quality_checks "
+                    "WHERE source=:src ORDER BY check_name"
+                ),
+                {"src": SOURCE},
+            )
+            .mappings()
+            .all()
+        )
+    names = {c["check_name"] for c in checks}
+    assert {"row_count", "invalid_isin", "matured_in_universe", "row_count_drift"} <= names
+    # row_count is a real signal here; invalid_isin correctly *flags* the synthetic sentinels.
+    assert next(c for c in checks if c["check_name"] == "row_count")["passed"]
+    assert not next(c for c in checks if c["check_name"] == "invalid_isin")["passed"]
+
+
+def test_active_securities_view_excludes_matured_and_dead(database: Database) -> None:
+    yesterday = DAY1 - dt.timedelta(days=1)
+    future = DAY1 + dt.timedelta(days=365)
+    source = FakeUniverseSource(
+        [
+            _rec(ISIN_A, "AAA", maturity=future, status="ACTIVE"),  # investable
+            _rec(ISIN_B, "AAA", maturity=yesterday, status="ACTIVE"),  # matured -> excluded
+        ]
+    )
+    UniversePipeline(database, source=source).run(DAY1)
+    with database.session() as s:
+        active = (
+            s.execute(text("SELECT isin FROM active_securities WHERE source=:src"), {"src": SOURCE})
+            .scalars()
+            .all()
+        )
+    assert ISIN_A in active
+    assert ISIN_B not in active  # matured is filtered out of the investable universe

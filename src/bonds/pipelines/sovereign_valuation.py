@@ -20,8 +20,9 @@ from sqlalchemy.orm import Session
 
 from bonds.calendar import business_days
 from bonds.logging import get_logger
-from bonds.models import SecurityRecord, SovereignValuation
+from bonds.models import InstrumentType, SecurityRecord, SovereignValuation
 from bonds.pipelines.base import PipelineResult, RunStatus
+from bonds.quality import QualityInspector
 from bonds.sources.base import DataUnavailable
 from bonds.sources.fbil import FbilSource
 from bonds.storage import Database
@@ -90,6 +91,9 @@ class SovereignValuationPipeline:
                 return PipelineResult(date, dataset, RunStatus.FAILED, message=repr(exc))
 
             rows = self._persist(session, valuations, seen_on=date)
+            QualityInspector(
+                session, source=self._source.name, dataset=dataset, run_date=date
+            ).inspect_valuations(valuations)
             runs.finish(run, status=RunStatus.SUCCESS, rows=rows)
             logger.info("pipeline.success", dataset=dataset, date=date.isoformat(), rows=rows)
             return PipelineResult(date, dataset, RunStatus.SUCCESS, rows=rows)
@@ -104,13 +108,31 @@ class SovereignValuationPipeline:
         return len(valuations)
 
 
+# Government securities carry a standard ₹100 face value, which FBIL files omit; default it so
+# downstream cashflow math has a value rather than a null.
+_SOVEREIGN_FACE_VALUE = 100.0
+
+
 def _to_security(v: SovereignValuation) -> SecurityRecord:
-    """Derive a universe :class:`SecurityRecord` from a valuation row."""
+    """Derive a universe :class:`SecurityRecord` from a valuation row, enriching identity."""
     return SecurityRecord(
         isin=v.isin,
         instrument_type=v.instrument_type,
         source=v.source,
         description=v.description,
+        issuer=_sovereign_issuer(v),
         coupon=v.coupon,
+        interest_type="Zero" if v.coupon in (None, 0.0) else "Fixed",
         maturity_date=v.maturity_date,
+        face_value=_SOVEREIGN_FACE_VALUE,
     )
+
+
+def _sovereign_issuer(v: SovereignValuation) -> str:
+    """Derive the issuer: GoI for G-Secs; the issuing state (from the description) for SDLs."""
+    if v.instrument_type is InstrumentType.SDL and v.description:
+        # SDL descriptions look like "07.83 GJ SDL 2026" -> state code is the 2nd token.
+        parts = v.description.split()
+        if len(parts) >= 2 and len(parts[1]) == 2 and parts[1].isalpha():
+            return f"State Government ({parts[1].upper()})"
+    return "Government of India"

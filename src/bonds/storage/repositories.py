@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from bonds.models import SecurityRecord, SovereignValuation
 from bonds.storage.schema import (
+    DataQualityCheck,
     IngestionRun,
     Security,
     SecurityAttributeHistory,
@@ -90,6 +91,7 @@ class SecurityRepository:
                 "description": r.description,
                 "issuer": r.issuer,
                 "coupon": r.coupon,
+                "interest_type": r.interest_type,
                 "maturity_date": r.maturity_date,
                 "face_value": r.face_value,
                 "source": r.source,
@@ -107,6 +109,7 @@ class SecurityRepository:
                     "description": stmt.excluded.description,
                     "issuer": stmt.excluded.issuer,
                     "coupon": stmt.excluded.coupon,
+                    "interest_type": stmt.excluded.interest_type,
                     "maturity_date": stmt.excluded.maturity_date,
                     "face_value": stmt.excluded.face_value,
                     "source": stmt.excluded.source,
@@ -228,3 +231,30 @@ class IngestionRunRepository:
         run.message = message
         run.finished_at = dt.datetime.now(dt.UTC)
         self._session.add(run)
+
+    def previous_row_count(self, dataset: str, *, before: dt.date) -> int | None:
+        """Rows ingested by the most recent successful run of ``dataset`` before ``before``."""
+        return self._session.execute(
+            select(IngestionRun.rows_ingested)
+            .where(
+                IngestionRun.dataset == dataset,
+                IngestionRun.status == "success",
+                IngestionRun.run_date < before,
+            )
+            .order_by(IngestionRun.run_date.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+
+
+class DataQualityRepository:
+    """Persist data-quality check results."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def record(
+        self,
+        checks: list[DataQualityCheck],
+    ) -> None:
+        """Persist a batch of already-constructed :class:`DataQualityCheck` rows."""
+        self._session.add_all(checks)

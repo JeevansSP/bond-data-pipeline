@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from collections import Counter
 from typing import Annotated
 
 import typer
@@ -47,8 +48,6 @@ def db_init() -> None:
 
 
 def _summarise(results: list[PipelineResult], *, label: str) -> None:
-    from collections import Counter
-
     counts = Counter(r.status for r in results)
     total_rows = sum(r.rows for r in results)
     typer.echo(

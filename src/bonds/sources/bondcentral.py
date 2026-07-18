@@ -79,9 +79,11 @@ class BondCentralSource:
         while True:
             payload = self._fetch_page(page, size, as_of)
             items = payload.get("data") or []
+            kept = 0
             for item in items:
                 record = _parse_item(item)
                 if record is not None:
+                    kept += 1
                     yield record
             info = payload.get("pagination_info") or {}
             logger.info(
@@ -89,6 +91,8 @@ class BondCentralSource:
                 page=page,
                 total_pages=info.get("total_pages"),
                 items=len(items),
+                kept=kept,
+                dropped=len(items) - kept,
             )
             if not info.get("has_next"):
                 break
@@ -104,7 +108,7 @@ def _parse_item(item: dict[str, Any]) -> SecurityRecord | None:
     isin = (item.get("isin") or data.get("isin") or "").strip()
     if len(isin) != 12 or not isin.startswith("IN"):
         return None
-    rating = _first_rating(data.get("ratings"))
+    rating, agency, rating_date = _first_rating(data.get("ratings"))
     return SecurityRecord(
         isin=isin,
         instrument_type=InstrumentType.CORP,
@@ -112,26 +116,32 @@ def _parse_item(item: dict[str, Any]) -> SecurityRecord | None:
         description=_as_str(data.get("security_name")),
         issuer=_as_str(data.get("issuer")),
         coupon=_as_float(data.get("coupon_rate")),
+        interest_type=_as_str(data.get("interest_type")),
         maturity_date=_as_date(data.get("maturity_date")),
         face_value=_as_float(data.get("face_value")),
         attributes={
             "credit_rating": rating,
+            "credit_rating_agency": agency,
+            "credit_rating_date": rating_date,
             "security_status": _as_str(data.get("security_status")),
             "secured_unsecured": _as_str(data.get("secured_unsecured")),
         },
     )
 
 
-def _first_rating(ratings: Any) -> str | None:
-    """Return the first non-null ``cra_rating`` from the ratings array, if any."""
-    if not isinstance(ratings, list):
-        return None
-    for entry in ratings:
-        if isinstance(entry, dict):
-            value = _as_str(entry.get("cra_rating"))
-            if value:
-                return value
-    return None
+def _first_rating(ratings: Any) -> tuple[str | None, str | None, str | None]:
+    """Return ``(rating, agency, date)`` from the first entry with a non-null ``cra_rating``."""
+    if isinstance(ratings, list):
+        for entry in ratings:
+            if isinstance(entry, dict):
+                value = _as_str(entry.get("cra_rating"))
+                if value:
+                    return (
+                        value,
+                        _as_str(entry.get("credit_rating_agency_name")),
+                        _as_str(entry.get("date_of_credit_rating")),
+                    )
+    return None, None, None
 
 
 def _as_str(value: Any) -> str | None:

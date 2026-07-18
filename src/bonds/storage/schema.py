@@ -12,7 +12,10 @@ from __future__ import annotations
 import datetime as dt
 
 from sqlalchemy import (
+    DDL,
     BigInteger,
+    Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     Float,
@@ -20,6 +23,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
     func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -29,16 +33,47 @@ class Base(DeclarativeBase):
     """Declarative base for all ORM models."""
 
 
+ACTIVE_SECURITIES_VIEW = "active_securities"
+
+# The ladder must never select a matured or dead security. This view is the canonical
+# "investable now" universe: not past maturity, and (where a status is known) still ACTIVE.
+# For a point-in-time backtest, filter securities/valuations by the as-of date directly instead.
+_ACTIVE_SECURITIES_DDL = f"""
+CREATE OR REPLACE VIEW {ACTIVE_SECURITIES_VIEW} AS
+SELECT s.*
+FROM securities s
+LEFT JOIN LATERAL (
+    SELECT value FROM security_attribute_history h
+    WHERE h.isin = s.isin AND h.attribute = 'security_status' AND h.valid_to IS NULL
+    LIMIT 1
+) st ON true
+WHERE (s.maturity_date IS NULL OR s.maturity_date >= CURRENT_DATE)
+  AND (st.value IS NULL OR upper(st.value) = 'ACTIVE')
+"""
+
+# Create the view after tables (so create_all in tests gets it); drop it before tables.
+event.listen(Base.metadata, "after_create", DDL(_ACTIVE_SECURITIES_DDL))  # type: ignore[no-untyped-call]
+event.listen(
+    Base.metadata,
+    "before_drop",
+    DDL(f"DROP VIEW IF EXISTS {ACTIVE_SECURITIES_VIEW}"),  # type: ignore[no-untyped-call]
+)
+
+
 class Security(Base):
     """Current identifying + reference attributes for a universe security (pillar 1)."""
 
     __tablename__ = "securities"
+    __table_args__ = (
+        CheckConstraint("coupon IS NULL OR coupon >= 0", name="ck_security_coupon_nonneg"),
+    )
 
     isin: Mapped[str] = mapped_column(String(12), primary_key=True)
     instrument_type: Mapped[str] = mapped_column(String(8), index=True)
     description: Mapped[str | None] = mapped_column(Text)
     issuer: Mapped[str | None] = mapped_column(Text, index=True)
     coupon: Mapped[float | None] = mapped_column(Float)
+    interest_type: Mapped[str | None] = mapped_column(String(24))
     maturity_date: Mapped[dt.date | None] = mapped_column(Date, index=True)
     face_value: Mapped[float | None] = mapped_column(Float)
     source: Mapped[str] = mapped_column(String(32))
@@ -80,6 +115,10 @@ class Valuation(Base):
     """One security's end-of-day price/YTM for one business date (pillar 3)."""
 
     __tablename__ = "valuations"
+    __table_args__ = (
+        CheckConstraint("price IS NULL OR price > 0", name="ck_valuation_price_positive"),
+        CheckConstraint("ytm IS NULL OR ytm >= 0", name="ck_valuation_ytm_nonneg"),
+    )
 
     isin: Mapped[str] = mapped_column(String(12), primary_key=True)
     quote_date: Mapped[dt.date] = mapped_column(Date, primary_key=True, index=True)
@@ -109,3 +148,27 @@ class IngestionRun(Base):
     message: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DataQualityCheck(Base):
+    """Result of one data-quality assertion for a dataset + business date.
+
+    Persisted every run so quality can be monitored over time (drift, null-rate creep, anomalies)
+    rather than inspected ad hoc. ``level`` is ``info``/``warn``/``error``; ``passed`` is the
+    boolean verdict; ``observed`` carries the measured value behind the verdict.
+    """
+
+    __tablename__ = "data_quality_checks"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(32), index=True)
+    dataset: Mapped[str] = mapped_column(String(48), index=True)
+    run_date: Mapped[dt.date] = mapped_column(Date, index=True)
+    check_name: Mapped[str] = mapped_column(String(48), index=True)
+    level: Mapped[str] = mapped_column(String(8))
+    passed: Mapped[bool] = mapped_column(Boolean)
+    observed: Mapped[float | None] = mapped_column(Float)
+    detail: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

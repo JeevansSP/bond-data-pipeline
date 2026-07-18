@@ -115,7 +115,9 @@ class FbilSource:
             header_index, headers = _find_header(rows)
             columns = _column_map(headers)
             records: list[SovereignValuation] = []
+            seen = 0
             for raw in rows:  # iterator continues *after* the header row
+                seen += 1
                 record = _row_to_valuation(raw, columns, date, instrument, self.name)
                 if record is not None:
                     records.append(record)
@@ -128,6 +130,7 @@ class FbilSource:
             date=date.isoformat(),
             header_row=header_index,
             records=len(records),
+            dropped=seen - len(records),
         )
         return records
 

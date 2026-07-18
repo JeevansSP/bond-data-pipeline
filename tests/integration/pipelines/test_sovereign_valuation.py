@@ -149,3 +149,30 @@ def test_scd2_attribute_history_records_only_changes(database: Database) -> None
         ("AAA", DATE + dt.timedelta(days=4)),
         ("AA+", None),
     ]
+
+
+def test_sovereign_securities_are_enriched(database: Database) -> None:
+    SovereignValuationPipeline(database, source=FakeFetcher(), products=["gsec"]).run_date(DATE)
+    with database.session() as s:
+        sec = s.execute(select(Security).where(Security.isin == ISIN_A)).scalar_one()
+    assert sec.face_value == 100.0  # sovereign default
+    assert sec.issuer == "Government of India"
+    assert sec.interest_type == "Fixed"  # non-zero coupon
+
+
+def test_check_constraint_rejects_nonpositive_price(database: Database) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    from bonds.models import SovereignValuation
+    from bonds.storage.repositories import ValuationRepository
+
+    bad = SovereignValuation(
+        isin=ISIN_A,
+        quote_date=DATE,
+        instrument_type=InstrumentType.GSEC,
+        source=SOURCE,
+        price=-1.0,
+        ytm=5.0,
+    )
+    with pytest.raises(IntegrityError), database.session() as s:
+        ValuationRepository(s).upsert_many([bad])

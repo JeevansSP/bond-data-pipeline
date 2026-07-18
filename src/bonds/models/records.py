@@ -53,6 +53,7 @@ class SecurityRecord(BaseModel):
     description: str | None = None
     issuer: str | None = None
     coupon: float | None = None
+    interest_type: str | None = None
     maturity_date: dt.date | None = None
     face_value: float | None = None
     attributes: dict[str, str | None] = Field(default_factory=dict)

@@ -3,6 +3,7 @@
 from bonds.storage.database import Database
 from bonds.storage.schema import (
     Base,
+    DataQualityCheck,
     IngestionRun,
     Security,
     SecurityAttributeHistory,
@@ -11,6 +12,7 @@ from bonds.storage.schema import (
 
 __all__ = [
     "Base",
+    "DataQualityCheck",
     "Database",
     "IngestionRun",
     "Security",
