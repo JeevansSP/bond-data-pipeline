@@ -18,6 +18,7 @@ import io
 from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Final
+from zipfile import BadZipFile
 
 import httpx
 import openpyxl
@@ -120,8 +121,17 @@ class FbilSource(MetricsCollector):
 
         The header row is located by content (the row whose first cell is ``ISIN``) so we are
         resilient to leading title/branding rows, rather than hard-coding row offsets.
+
+        For dates outside its published range, FBIL serves an HTML page with HTTP 200 rather than a
+        workbook; that isn't a valid xlsx, so it is treated as no-data (``DataUnavailable`` -> the
+        pipeline records SKIPPED) rather than crashing a backfill.
         """
-        workbook = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        try:
+            workbook = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        except BadZipFile as exc:
+            raise DataUnavailable(
+                f"FBIL {instrument.value} returned a non-xlsx body for {date}"
+            ) from exc
         try:
             rows: Iterable[Sequence[object]] = workbook.active.iter_rows(values_only=True)
             header_index, headers = _find_header(rows)

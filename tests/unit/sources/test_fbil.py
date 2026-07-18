@@ -59,6 +59,14 @@ def test_parse_raises_without_header(tmp_path: Path) -> None:
         _source(tmp_path).parse(buf.getvalue(), date=DATE, instrument=InstrumentType.GSEC)
 
 
+def test_parse_non_xlsx_body_is_data_unavailable(tmp_path: Path) -> None:
+    # FBIL serves an HTML page (HTTP 200) for dates outside its published range; that must be
+    # treated as no-data (SKIPPED), not crash a backfill with BadZipFile.
+    html = b"<!DOCTYPE html><html><body>No data</body></html>"
+    with pytest.raises(DataUnavailable, match="non-xlsx"):
+        _source(tmp_path).parse(html, date=DATE, instrument=InstrumentType.GSEC)
+
+
 @respx.mock
 def test_download_lands_file_and_returns_bytes(tmp_path: Path, fbil_gsec_workbook: bytes) -> None:
     respx.get("https://www.fbil.org.in/wasdm/gsec/downloadPublished").mock(
