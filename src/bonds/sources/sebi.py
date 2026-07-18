@@ -19,6 +19,7 @@ from bonds.config import Settings, get_settings
 from bonds.http import ThrottledClient
 from bonds.logging import get_logger
 from bonds.models import PublicIssueRecord
+from bonds.quality.metrics import MetricsCollector
 from bonds.sources.base import SourceError
 
 logger = get_logger(__name__)
@@ -37,7 +38,7 @@ _COL_BASE: Final = 4
 _COL_FINAL: Final = 5
 
 
-class SebiSource:
+class SebiSource(MetricsCollector):
     """Fetches and parses the SEBI public-issue calendar."""
 
     name: Final = "sebi"
@@ -45,6 +46,7 @@ class SebiSource:
     def __init__(
         self, client: ThrottledClient | None = None, settings: Settings | None = None
     ) -> None:
+        self.reset_metrics()
         self._settings = settings or get_settings()
         self._client = client or ThrottledClient(self._settings.http)
 
@@ -55,13 +57,21 @@ class SebiSource:
 
     def fetch_public_issues(self, as_of: dt.date) -> list[PublicIssueRecord]:
         """Download the page (landing it) and parse all financial-year tables."""
+        self.reset_metrics()
         response = self._client.get(_URL, headers=_HEADERS)
         content = response.content
         path = self._raw_path(as_of)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
         logger.info("sebi.downloaded", bytes=len(content))
-        return parse_public_issues(content)
+        records = parse_public_issues(content)
+        self.add_metric(
+            "public_issues",
+            bytes_downloaded=len(content),
+            rows_extracted=len(records),
+            rows_parsed=len(records),
+        )
+        return records
 
 
 def parse_public_issues(content: bytes) -> list[PublicIssueRecord]:

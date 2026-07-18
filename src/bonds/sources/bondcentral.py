@@ -20,6 +20,7 @@ from bonds.config import Settings, get_settings
 from bonds.http import ThrottledClient
 from bonds.logging import get_logger
 from bonds.models import InstrumentType, SecurityRecord
+from bonds.quality.metrics import MetricsCollector
 
 logger = get_logger(__name__)
 
@@ -28,7 +29,7 @@ _ORIGIN: Final = "https://bondcentral.in"
 _MAX_PAGE_SIZE: Final = 100
 
 
-class BondCentralSource:
+class BondCentralSource(MetricsCollector):
     """Paginates the BondCentral securities master into :class:`SecurityRecord` objects."""
 
     name: Final = "bondcentral"
@@ -36,6 +37,7 @@ class BondCentralSource:
     def __init__(
         self, client: ThrottledClient | None = None, settings: Settings | None = None
     ) -> None:
+        self.reset_metrics()
         self._settings = settings or get_settings()
         self._client = client or ThrottledClient(self._settings.http)
 
@@ -48,8 +50,8 @@ class BondCentralSource:
             / f"page_{page:04d}.json"
         )
 
-    def _fetch_page(self, page: int, size: int, as_of: dt.date) -> dict[str, Any]:
-        """Fetch one page, landing the raw JSON in the data lake."""
+    def _fetch_page(self, page: int, size: int, as_of: dt.date) -> tuple[dict[str, Any], int]:
+        """Fetch one page (returns ``(payload, bytes)``), landing the raw JSON in the data lake."""
         response = self._client.get(
             _URL,
             params={"page": str(page), "size": str(size)},
@@ -59,7 +61,7 @@ class BondCentralSource:
         path = self._raw_path(as_of, page)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload), encoding="utf-8")
-        return payload
+        return payload, len(response.content)
 
     def iter_records(
         self, as_of: dt.date, *, size: int = _MAX_PAGE_SIZE, max_pages: int | None = None
@@ -75,9 +77,11 @@ class BondCentralSource:
             One :class:`SecurityRecord` per security.
         """
         size = min(size, _MAX_PAGE_SIZE)
+        self.reset_metrics()
         page = 1
+        total_bytes = total_items = total_kept = 0
         while True:
-            payload = self._fetch_page(page, size, as_of)
+            payload, page_bytes = self._fetch_page(page, size, as_of)
             items = payload.get("data") or []
             kept = 0
             for item in items:
@@ -85,6 +89,9 @@ class BondCentralSource:
                 if record is not None:
                     kept += 1
                     yield record
+            total_bytes += page_bytes
+            total_items += len(items)
+            total_kept += kept
             info = payload.get("pagination_info") or {}
             logger.info(
                 "bondcentral.page",
@@ -99,6 +106,13 @@ class BondCentralSource:
             if max_pages is not None and page >= max_pages:
                 break
             page += 1
+        self.add_metric(
+            "universe",
+            bytes_downloaded=total_bytes,
+            rows_extracted=total_items,
+            rows_parsed=total_kept,
+            rows_dropped=total_items - total_kept,
+        )
 
 
 # ---------------------------------------------------------------------- parsing

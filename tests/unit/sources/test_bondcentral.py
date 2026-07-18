@@ -116,3 +116,16 @@ def test_raw_pages_are_landed(tmp_path: Path) -> None:
     base = tmp_path / "raw" / "bondcentral" / AS_OF.isoformat()
     assert (base / "page_0001.json").exists()
     assert (base / "page_0002.json").exists()
+
+
+@respx.mock
+def test_collects_etl_metrics(tmp_path: Path) -> None:
+    _mock_pages()
+    source = _source(tmp_path)
+    list(source.iter_records(AS_OF))
+    assert len(source.metrics) == 1
+    metric = source.metrics[0]
+    assert metric.artifact == "universe"
+    assert metric.rows_parsed == 2  # two valid ISINs across the two pages
+    assert metric.rows_dropped == 1  # the invalid-length ISIN row
+    assert metric.bytes_downloaded > 0

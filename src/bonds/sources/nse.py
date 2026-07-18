@@ -19,6 +19,7 @@ from bonds.config import Settings, get_settings
 from bonds.http import ThrottledClient
 from bonds.logging import get_logger
 from bonds.models import TradeRecord
+from bonds.quality.metrics import MetricsCollector
 
 logger = get_logger(__name__)
 
@@ -40,7 +41,7 @@ _PAGE_HEADERS: Final = {
 _API_HEADERS: Final = {"Accept": "*/*", "Referer": _PAGE}
 
 
-class NseSource:
+class NseSource(MetricsCollector):
     """Fetches NSE corporate-bond trade summaries across all four CBM segments."""
 
     name: Final = "nse"
@@ -48,11 +49,13 @@ class NseSource:
     def __init__(
         self, client: ThrottledClient | None = None, settings: Settings | None = None
     ) -> None:
+        self.reset_metrics()
         self._settings = settings or get_settings()
         self._client = client or ThrottledClient(self._settings.http)
 
     def fetch_trades(self, as_of: dt.date) -> list[TradeRecord]:
         """Prime Akamai cookies, then fetch + parse every segment's trades."""
+        self.reset_metrics()
         self._client.get(_PAGE, headers=_PAGE_HEADERS)  # cookie priming
         records: list[TradeRecord] = []
         for segment in _SEGMENTS:
@@ -63,10 +66,19 @@ class NseSource:
             self._land(as_of, segment, payload)
             trade_date = _parse_timestamp(payload.get("timestamp")) or as_of
             rows = payload.get("data") or []
+            kept = 0
             for row in rows:
                 record = _to_record(row, segment, trade_date)
                 if record is not None:
+                    kept += 1
                     records.append(record)
+            self.add_metric(
+                segment,
+                bytes_downloaded=len(response.content),
+                rows_extracted=len(rows),
+                rows_parsed=kept,
+                rows_dropped=len(rows) - kept,
+            )
             logger.info(
                 "nse.segment", segment=segment, rows=len(rows), trade_date=trade_date.isoformat()
             )

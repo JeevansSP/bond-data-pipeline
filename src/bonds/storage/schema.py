@@ -217,6 +217,32 @@ class RbiAuction(Base):
     )
 
 
+class EtlFileMetric(Base):
+    """Per-artifact extract/transform funnel metrics for one dataset + run date.
+
+    The load stage (rows written) lives in ``ingestion_runs.rows_ingested``; together they describe
+    the full ETL funnel. Idempotent per ``(source, dataset, run_date, artifact)``.
+    """
+
+    __tablename__ = "etl_file_metrics"
+    __table_args__ = (
+        UniqueConstraint("source", "dataset", "run_date", "artifact", name="uq_etl_file_metric"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(32), index=True)
+    dataset: Mapped[str] = mapped_column(String(48), index=True)
+    run_date: Mapped[dt.date] = mapped_column(Date, index=True)
+    artifact: Mapped[str] = mapped_column(String(64))
+    bytes_downloaded: Mapped[int] = mapped_column(BigInteger, default=0)
+    rows_extracted: Mapped[int] = mapped_column(Integer, default=0)
+    rows_parsed: Mapped[int] = mapped_column(Integer, default=0)
+    rows_dropped: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class DataQualityCheck(Base):
     """Result of one data-quality assertion for a dataset + business date.
 

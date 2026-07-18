@@ -20,8 +20,10 @@ from bonds.models import (
     SovereignValuation,
     TradeRecord,
 )
+from bonds.quality.metrics import FileMetric
 from bonds.storage.schema import (
     DataQualityCheck,
+    EtlFileMetric,
     IngestionRun,
     PublicIssue,
     RbiAuction,
@@ -422,6 +424,45 @@ class RbiAuctionRepository:
             )
             self._session.execute(stmt)
         return len(rows)
+
+
+class EtlMetricsRepository:
+    """Persist per-artifact ETL funnel metrics (idempotent per source+dataset+run_date+artifact)."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def upsert(
+        self, *, source: str, dataset: str, run_date: dt.date, metrics: list[FileMetric]
+    ) -> None:
+        """Upsert the extract/transform funnel metrics for each artifact of a run."""
+        if not metrics:
+            return
+        rows = [
+            {
+                "source": source,
+                "dataset": dataset,
+                "run_date": run_date,
+                "artifact": m.artifact,
+                "bytes_downloaded": m.bytes_downloaded,
+                "rows_extracted": m.rows_extracted,
+                "rows_parsed": m.rows_parsed,
+                "rows_dropped": m.rows_dropped,
+            }
+            for m in metrics
+        ]
+        rows = list({r["artifact"]: r for r in rows}.values())
+        stmt = pg_insert(EtlFileMetric).values(rows)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["source", "dataset", "run_date", "artifact"],
+            set_={
+                "bytes_downloaded": stmt.excluded.bytes_downloaded,
+                "rows_extracted": stmt.excluded.rows_extracted,
+                "rows_parsed": stmt.excluded.rows_parsed,
+                "rows_dropped": stmt.excluded.rows_dropped,
+            },
+        )
+        self._session.execute(stmt)
 
 
 class DataQualityRepository:

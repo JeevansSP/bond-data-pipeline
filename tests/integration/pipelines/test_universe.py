@@ -215,6 +215,50 @@ def test_db_phase_failure_is_audited_and_returns_failed(database: Database) -> N
     assert status == "failed"  # audit row survives the rolled-back work transaction
 
 
+def test_pipeline_persists_etl_file_metrics(database: Database) -> None:
+    from bonds.quality.metrics import MetricsCollector
+
+    src_name = "metrictest"
+
+    class MetricFake(MetricsCollector):
+        name = src_name
+
+        def __init__(self) -> None:
+            self.reset_metrics()
+
+        def iter_records(
+            self, as_of: dt.date, *, size: int = 100, max_pages: int | None = None
+        ) -> Iterator[SecurityRecord]:
+            self.add_metric("art1", bytes_downloaded=123, rows_extracted=1, rows_parsed=1)
+            yield SecurityRecord(
+                isin="INUNIV000007", instrument_type=InstrumentType.CORP, source=src_name
+            )
+
+    try:
+        UniversePipeline(database, source=MetricFake()).run(DAY1)
+        with database.session() as s:
+            row = s.execute(
+                text(
+                    "SELECT artifact, bytes_downloaded, rows_parsed "
+                    "FROM etl_file_metrics WHERE source=:x"
+                ),
+                {"x": src_name},
+            ).one()
+        assert row.artifact == "art1"
+        assert row.bytes_downloaded == 123
+        assert row.rows_parsed == 1
+    finally:
+        with database.session() as s:
+            for tbl in (
+                "etl_file_metrics",
+                "data_quality_checks",
+                "ingestion_runs",
+                "security_attribute_history",
+                "securities",
+            ):
+                s.execute(text(f"DELETE FROM {tbl} WHERE source=:x"), {"x": src_name})
+
+
 def test_cross_source_reconciliation_flags_coupon_mismatch(database: Database) -> None:
     src_a, src_b, isin = "reconA", "reconB", "INUNIV000009"
 

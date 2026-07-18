@@ -26,6 +26,7 @@ from bonds.config import Settings, get_settings
 from bonds.http import ThrottledClient
 from bonds.logging import get_logger
 from bonds.models import InstrumentType, SovereignValuation
+from bonds.quality.metrics import MetricsCollector
 from bonds.sources.base import DataUnavailable, SourceError
 
 logger = get_logger(__name__)
@@ -40,7 +41,7 @@ _PRODUCT_INSTRUMENT: Final[dict[str, InstrumentType]] = {
 }
 
 
-class FbilSource:
+class FbilSource(MetricsCollector):
     """Fetches and parses FBIL published sovereign valuation files."""
 
     name: Final = "fbil"
@@ -48,6 +49,7 @@ class FbilSource:
     def __init__(
         self, client: ThrottledClient | None = None, settings: Settings | None = None
     ) -> None:
+        self.reset_metrics()
         self._settings = settings or get_settings()
         self._client = client or ThrottledClient(self._settings.http)
 
@@ -100,8 +102,16 @@ class FbilSource:
         instrument = _PRODUCT_INSTRUMENT.get(product)
         if instrument is None:
             raise ValueError(f"unsupported FBIL valuation product: {product!r}")
+        self.reset_metrics()
         content = self.download(product, date)
-        return self.parse(content, date=date, instrument=instrument)
+        records = self.parse(content, date=date, instrument=instrument)
+        self.add_metric(
+            f"{product}/{date.isoformat()}",
+            bytes_downloaded=len(content),
+            rows_extracted=len(records),
+            rows_parsed=len(records),
+        )
+        return records
 
     def parse(
         self, content: bytes, *, date: dt.date, instrument: InstrumentType

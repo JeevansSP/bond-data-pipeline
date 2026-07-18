@@ -4,6 +4,7 @@ from bonds.storage.database import Database
 from bonds.storage.schema import (
     Base,
     DataQualityCheck,
+    EtlFileMetric,
     IngestionRun,
     PublicIssue,
     RbiAuction,
@@ -17,6 +18,7 @@ __all__ = [
     "Base",
     "DataQualityCheck",
     "Database",
+    "EtlFileMetric",
     "IngestionRun",
     "PublicIssue",
     "RbiAuction",

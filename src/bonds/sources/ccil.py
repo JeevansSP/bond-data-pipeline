@@ -29,6 +29,7 @@ from bonds.config import Settings, get_settings
 from bonds.http import ThrottledClient
 from bonds.logging import get_logger
 from bonds.models import TradeRecord
+from bonds.quality.metrics import MetricsCollector
 
 logger = get_logger(__name__)
 
@@ -55,7 +56,7 @@ _PRICE_KEYS: Final = ("price", "Price", "tradePrice", "ltp", "rate", "Rate")
 _YIELD_KEYS: Final = ("yield", "Yield", "ytm", "YTM", "tradeYield")
 
 
-class CcilSource:
+class CcilSource(MetricsCollector):
     """Fetches NDS-OM individual trades (market-hours only; empty when the market is closed)."""
 
     name: Final = "ccil"
@@ -63,11 +64,13 @@ class CcilSource:
     def __init__(
         self, client: ThrottledClient | None = None, settings: Settings | None = None
     ) -> None:
+        self.reset_metrics()
         self._settings = settings or get_settings()
         self._client = client or ThrottledClient(self._settings.http)
 
     def fetch_trades(self, as_of: dt.date) -> list[TradeRecord]:
         """Prime cookies, gate on market status, then fetch + parse trades per Sec Type."""
+        self.reset_metrics()
         self._client.get(_PAGE, headers=_PAGE_HEADERS)  # cookie priming
         if not self._market_open():
             logger.info("ccil.market_closed", as_of=as_of.isoformat())
@@ -86,7 +89,14 @@ class CcilSource:
                 headers=_POST_HEADERS,
             )
             self._land(as_of, sec_type, response.text)
-            records.extend(parse_main(response.text, sec_type, as_of))
+            parsed = parse_main(response.text, sec_type, as_of)
+            self.add_metric(
+                sec_type,
+                bytes_downloaded=len(response.content),
+                rows_extracted=len(parsed),
+                rows_parsed=len(parsed),
+            )
+            records.extend(parsed)
         return records
 
     def _market_open(self) -> bool:

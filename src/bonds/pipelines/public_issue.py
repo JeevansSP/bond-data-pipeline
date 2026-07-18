@@ -11,7 +11,7 @@ from typing import Protocol
 from sqlalchemy.orm import Session
 
 from bonds.models import PublicIssueRecord
-from bonds.pipelines.base import PipelineResult, execute_run
+from bonds.pipelines.base import PipelineResult, execute_run, persist_file_metrics
 from bonds.quality import QualityInspector
 from bonds.sources.sebi import SebiSource
 from bonds.storage import Database
@@ -47,7 +47,11 @@ class PublicIssuePipeline:
             QualityInspector(
                 session, source=self._source.name, dataset=dataset, run_date=as_of
             ).inspect_public_issues(issues)
-            return PublicIssueRepository(session).upsert_many(issues)
+            rows = PublicIssueRepository(session).upsert_many(issues)
+            persist_file_metrics(
+                session, self._source, source=self._source.name, dataset=dataset, run_date=as_of
+            )
+            return rows
 
         return execute_run(
             self._db, source=self._source.name, dataset=dataset, run_date=as_of, work=work

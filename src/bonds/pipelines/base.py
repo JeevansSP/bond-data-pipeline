@@ -10,11 +10,22 @@ from enum import StrEnum
 from sqlalchemy.orm import Session
 
 from bonds.logging import get_logger
+from bonds.quality import MetricsCollector
 from bonds.sources.base import DataUnavailable
 from bonds.storage import Database
-from bonds.storage.repositories import IngestionRunRepository
+from bonds.storage.repositories import EtlMetricsRepository, IngestionRunRepository
 
 logger = get_logger(__name__)
+
+
+def persist_file_metrics(
+    session: Session, source_obj: object, *, source: str, dataset: str, run_date: dt.date
+) -> None:
+    """Persist a connector's per-artifact ETL funnel metrics, if it collects any."""
+    if isinstance(source_obj, MetricsCollector):
+        EtlMetricsRepository(session).upsert(
+            source=source, dataset=dataset, run_date=run_date, metrics=source_obj.metrics
+        )
 
 
 class RunStatus(StrEnum):

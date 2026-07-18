@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from bonds.logging import get_logger
 from bonds.models import SecurityRecord
-from bonds.pipelines.base import PipelineResult, execute_run
+from bonds.pipelines.base import PipelineResult, execute_run, persist_file_metrics
 from bonds.quality import QualityInspector
 from bonds.sources.bondcentral import BondCentralSource
 from bonds.storage import Database
@@ -82,6 +82,9 @@ class UniversePipeline:
             securities = SecurityRepository(session)
             rows = securities.upsert_many(records, seen_on=as_of)
             self._record_attributes(securities, records, effective=as_of)
+            persist_file_metrics(
+                session, self._source, source=self._source.name, dataset=dataset, run_date=as_of
+            )
             return rows
 
         return execute_run(

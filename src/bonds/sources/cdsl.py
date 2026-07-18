@@ -25,6 +25,7 @@ from bonds.config import Settings, get_settings
 from bonds.http import ThrottledClient
 from bonds.logging import get_logger
 from bonds.models import InstrumentType, SecurityRecord
+from bonds.quality.metrics import MetricsCollector
 from bonds.sources.base import SourceError
 
 logger = get_logger(__name__)
@@ -44,7 +45,7 @@ _COL_AMT_OUTSTANDING: Final = 9
 _MIN_COLS: Final = 10
 
 
-class CdslSource:
+class CdslSource(MetricsCollector):
     """Fetches and parses CDSL corporate-bond issuer/outstanding snapshots."""
 
     name: Final = "cdsl"
@@ -52,6 +53,7 @@ class CdslSource:
     def __init__(
         self, client: ThrottledClient | None = None, settings: Settings | None = None
     ) -> None:
+        self.reset_metrics()
         self._settings = settings or get_settings()
         self._client = client or ThrottledClient(self._settings.http)
 
@@ -80,8 +82,16 @@ class CdslSource:
         ``size``/``max_pages`` are accepted for :class:`UniverseFetcher` compatibility and ignored
         (the report is a single whole-file table).
         """
+        self.reset_metrics()
         content = self.fetch_snapshot(as_of)
-        yield from parse_snapshot(content)
+        records = list(parse_snapshot(content))
+        self.add_metric(
+            as_of.isoformat(),
+            bytes_downloaded=len(content),
+            rows_extracted=len(records),
+            rows_parsed=len(records),
+        )
+        yield from records
 
 
 def parse_snapshot(content: bytes) -> Iterator[SecurityRecord]:

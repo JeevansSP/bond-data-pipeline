@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from bonds.calendar import business_days
 from bonds.models import InstrumentType, SecurityRecord, SovereignValuation
-from bonds.pipelines.base import PipelineResult, execute_run
+from bonds.pipelines.base import PipelineResult, execute_run, persist_file_metrics
 from bonds.quality import QualityInspector
 from bonds.sources.fbil import FbilSource
 from bonds.storage import Database
@@ -77,6 +77,9 @@ class SovereignValuationPipeline:
             QualityInspector(
                 session, source=self._source.name, dataset=dataset, run_date=date
             ).inspect_valuations(valuations)
+            persist_file_metrics(
+                session, self._source, source=self._source.name, dataset=dataset, run_date=date
+            )
             return rows
 
         return execute_run(

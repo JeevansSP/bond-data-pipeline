@@ -25,6 +25,7 @@ from bonds.config import Settings, get_settings
 from bonds.http import ThrottledClient
 from bonds.logging import get_logger
 from bonds.models import RbiAuctionRecord
+from bonds.quality.metrics import MetricsCollector
 from bonds.sources.base import SourceError
 
 logger = get_logger(__name__)
@@ -50,7 +51,7 @@ _TYPES: Final[tuple[tuple[str, str], ...]] = (
 _AUCTION_KEYWORDS: Final = ("auction", "treasury bill", "government stock", "state government")
 
 
-class RbiSource:
+class RbiSource(MetricsCollector):
     """Fetches and parses the RBI sovereign auction calendar."""
 
     name: Final = "rbi"
@@ -58,6 +59,7 @@ class RbiSource:
     def __init__(
         self, client: ThrottledClient | None = None, settings: Settings | None = None
     ) -> None:
+        self.reset_metrics()
         self._settings = settings or get_settings()
         self._client = client or ThrottledClient(self._settings.http)
 
@@ -66,6 +68,7 @@ class RbiSource:
 
     def fetch_auctions(self, as_of: dt.date) -> list[RbiAuctionRecord]:
         """Parse the auction index, then enrich each with its date from the detail page."""
+        self.reset_metrics()
         response = self._client.get(_INDEX_URL, headers=_HEADERS)
         content = response.content
         path = self._raw_path(as_of)
@@ -76,6 +79,12 @@ class RbiSource:
         records = parse_index(content, source=self.name)
         enriched = [r.model_copy(update={"auction_date": self._detail_date(r)}) for r in records]
         dated = sum(1 for r in enriched if r.auction_date is not None)
+        self.add_metric(
+            "auction_index",
+            bytes_downloaded=len(content),
+            rows_extracted=len(records),
+            rows_parsed=len(enriched),
+        )
         logger.info("rbi.parsed", auctions=len(enriched), with_date=dated)
         return enriched
 

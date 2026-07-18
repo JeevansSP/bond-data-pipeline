@@ -12,7 +12,7 @@ from typing import Protocol
 from sqlalchemy.orm import Session
 
 from bonds.models import TradeRecord
-from bonds.pipelines.base import PipelineResult, execute_run
+from bonds.pipelines.base import PipelineResult, execute_run, persist_file_metrics
 from bonds.quality import QualityInspector
 from bonds.sources.nse import NseSource
 from bonds.storage import Database
@@ -48,7 +48,11 @@ class TradePipeline:
             QualityInspector(
                 session, source=self._source.name, dataset=dataset, run_date=as_of
             ).inspect_trades(trades)
-            return TradeRepository(session).upsert_many(trades)
+            rows = TradeRepository(session).upsert_many(trades)
+            persist_file_metrics(
+                session, self._source, source=self._source.name, dataset=dataset, run_date=as_of
+            )
+            return rows
 
         return execute_run(
             self._db, source=self._source.name, dataset=dataset, run_date=as_of, work=work
