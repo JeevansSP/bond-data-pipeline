@@ -9,7 +9,7 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import Iterator, Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import CursorResult, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -177,6 +177,44 @@ class SecurityRepository:
             )
             self._session.execute(stmt)
         return len(rows)
+
+    def insert_missing(self, records: list[SecurityRecord], *, seen_on: dt.date) -> int:
+        """Insert only securities whose ISIN is not already present (``ON CONFLICT DO NOTHING``).
+
+        Used to fill the master with instruments seen only in trade data (T-Bills, STRIPS, SGBs,
+        matured G-Secs/SDLs) without overwriting the richer rows an authoritative universe source
+        (FBIL/BondCentral) already wrote. Returns the number of rows actually inserted.
+        """
+        if not records:
+            return 0
+        rows = [
+            {
+                "isin": r.isin,
+                "instrument_type": r.instrument_type.value,
+                "description": r.description,
+                "issuer": r.issuer,
+                "coupon": r.coupon,
+                "interest_type": r.interest_type,
+                "maturity_date": r.maturity_date,
+                "face_value": r.face_value,
+                "source": r.source,
+                "first_seen": seen_on,
+                "last_seen": seen_on,
+            }
+            for r in records
+        ]
+        rows = list({r["isin"]: r for r in rows}.values())
+        inserted = 0
+        for chunk in _chunks(rows):
+            stmt = (
+                pg_insert(Security)
+                .values(list(chunk))
+                .on_conflict_do_nothing(index_elements=["isin"])
+            )
+            result = self._session.execute(stmt)
+            if isinstance(result, CursorResult):
+                inserted += max(result.rowcount, 0)  # rowcount is -1 when the driver can't report
+        return inserted
 
     def load_reference(
         self, isins: list[str]

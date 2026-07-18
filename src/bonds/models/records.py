@@ -19,6 +19,8 @@ class InstrumentType(StrEnum):
     """Treasury Bill (91/182/364-day)."""
     STRIPS = "STRIPS"
     """Separately traded G-Sec principal/interest STRIP."""
+    SGB = "SGB"
+    """Sovereign Gold Bond (gold-linked, quoted per gram)."""
     CORP = "CORP"
     """Corporate bond / debenture."""
 

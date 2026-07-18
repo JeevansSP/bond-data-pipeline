@@ -36,7 +36,7 @@ from bonds.pipelines.catchup import DEFAULT_MAX_GAP_DAYS, catch_up
 from bonds.pipelines.suite import StepOutcome, default_suite, summarize
 from bonds.pipelines.universe import UniverseFetcher
 from bonds.sources.bondcentral import BondCentralSource
-from bonds.sources.ccil_historical import CcilHistoricalTradesSource
+from bonds.sources.ccil_historical import CcilHistoricalTradesSource, derive_securities
 from bonds.sources.cdsl import CdslSource
 from bonds.sources.nse import NseSource
 from bonds.storage import Database
@@ -247,7 +247,9 @@ def ingest_ccil_trades(
     """Ingest CCIL NDS-OM historical trades (G-Sec/SDL/T-Bill) for a date."""
     _init_logging()
     day = (as_of or dt.datetime.now(dt.UTC)).date()
-    result = TradePipeline(Database(), source=CcilHistoricalTradesSource()).run(day)
+    result = TradePipeline(
+        Database(), source=CcilHistoricalTradesSource(), derive_securities=derive_securities
+    ).run(day)
     _summarise([result], label=f"ccil-trades {day.isoformat()}")
 
 
@@ -260,7 +262,7 @@ def ingest_ccil_trades_backfill(
     _init_logging()
     db = Database()
     source = CcilHistoricalTradesSource()
-    pipeline = TradePipeline(db, source=source)
+    pipeline = TradePipeline(db, source=source, derive_securities=derive_securities)
     results = [pipeline.run(day) for day in business_days(start.date(), end.date())]
     _summarise(results, label=f"ccil-backfill {start.date()}..{end.date()}")
 

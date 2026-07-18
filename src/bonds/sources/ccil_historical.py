@@ -36,7 +36,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from bonds.config import Settings, get_settings
 from bonds.http import ThrottledClient
 from bonds.logging import get_logger
-from bonds.models import TradeRecord
+from bonds.models import InstrumentType, SecurityRecord, TradeRecord
 from bonds.quality.metrics import MetricsCollector
 from bonds.sources.base import SourceError
 
@@ -281,6 +281,84 @@ def _instrument_segment(desc: str | None, isin: str) -> str:
     if _STRIP_RE.search(up):
         return "STRIPS"
     return "GSEC"
+
+
+# ---------------------------------------------------------- securities-master derivation
+# CCIL is the only source for T-Bills, STRIPS, SGBs and many matured/historical G-Secs and SDLs,
+# so we derive a reference `securities` row from each traded ISIN (best-effort maturity/coupon
+# parsed from the description) to fill gaps the FBIL/BondCentral universe never covers.
+_SEGMENT_TYPE: Final = {
+    "GSEC": InstrumentType.GSEC,
+    "SDL": InstrumentType.SDL,
+    "TBILL": InstrumentType.TBILL,
+    "STRIPS": InstrumentType.STRIPS,
+    "SGB": InstrumentType.SGB,
+}
+_CENTRAL_SEGMENTS: Final = frozenset({"GSEC", "TBILL", "STRIPS", "SGB"})
+_ZERO_COUPON_SEGMENTS: Final = frozenset({"TBILL", "STRIPS"})
+_LEAD_COUPON_RE: Final = re.compile(r"^\s*(\d{1,2}\.\d{1,3})\b")
+_SLASH_DATE_RE: Final = re.compile(r"\b(\d{2})/(\d{2})/(\d{4})\b")  # DD/MM/YYYY
+_COMPACT_DATE_RE: Final = re.compile(r"\b(\d{2})(\d{2})(\d{4})\b")  # DDMMYYYY, e.g. DTB 15012027
+_DMMMY_RE: Final = re.compile(r"\b(\d{2})([A-Z]{3})(\d{4})")  # DDMMMYYYY, e.g. 12DEC2041
+_MONTHS: Final = {
+    m: i
+    for i, m in enumerate(
+        ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"), 1
+    )
+}
+
+
+def _safe_date(year: int, month: int, day: int) -> dt.date | None:
+    try:
+        return dt.date(year, month, day)
+    except ValueError:
+        return None
+
+
+def _parse_maturity(desc: str | None, segment: str) -> dt.date | None:
+    """Best-effort maturity from a CCIL description; only exact dates (not year-only)."""
+    up = (desc or "").upper()
+    if segment == "TBILL":  # "091 DTB MATURING 07/06/2002" or "DTB 15012027"
+        m = _SLASH_DATE_RE.search(up) or _COMPACT_DATE_RE.search(up)
+        return _safe_date(int(m.group(3)), int(m.group(2)), int(m.group(1))) if m else None
+    m = _DMMMY_RE.search(up)  # STRIPS / dated stock: "12DEC2041"
+    if m and m.group(2) in _MONTHS:
+        return _safe_date(int(m.group(3)), _MONTHS[m.group(2)], int(m.group(1)))
+    return None  # G-Sec/SDL/SGB carry only a maturity year in the feed -> left unknown
+
+
+def _parse_coupon(desc: str | None, segment: str) -> float | None:
+    if segment in _ZERO_COUPON_SEGMENTS:
+        return 0.0
+    m = _LEAD_COUPON_RE.match((desc or "").strip())
+    return float(m.group(1)) if m else None
+
+
+def derive_security(isin: str, descriptor: str | None, segment: str) -> SecurityRecord | None:
+    """Build a reference :class:`SecurityRecord` from one traded CCIL instrument."""
+    itype = _SEGMENT_TYPE.get(segment)
+    if itype is None:
+        return None
+    return SecurityRecord(
+        isin=isin,
+        instrument_type=itype,
+        source="ccil",
+        description=descriptor,
+        issuer="Government of India" if segment in _CENTRAL_SEGMENTS else None,
+        coupon=_parse_coupon(descriptor, segment),
+        interest_type="ZERO_COUPON" if segment in _ZERO_COUPON_SEGMENTS else "FIXED",
+        maturity_date=_parse_maturity(descriptor, segment),
+    )
+
+
+def derive_securities(trades: list[TradeRecord]) -> list[SecurityRecord]:
+    """Reference securities for a batch of CCIL trades (one per ISIN, last descriptor wins)."""
+    by_isin: dict[str, SecurityRecord] = {}
+    for t in trades:
+        sec = derive_security(t.isin, t.descriptor, t.segment)
+        if sec is not None:
+            by_isin[t.isin] = sec
+    return list(by_isin.values())
 
 
 def _as_float(value: str) -> float | None:

@@ -16,7 +16,7 @@ from bonds.pipelines.rbi_auction import RbiAuctionPipeline
 from bonds.pipelines.sovereign_valuation import SovereignValuationPipeline
 from bonds.pipelines.trade import TradePipeline
 from bonds.pipelines.universe import UniversePipeline
-from bonds.sources.ccil_historical import CcilHistoricalTradesSource
+from bonds.sources.ccil_historical import CcilHistoricalTradesSource, derive_securities
 from bonds.sources.nse import NseSource
 from bonds.storage import Database
 
@@ -81,6 +81,12 @@ def default_suite(
         ),
         IngestStep(
             "G-Sec/T-Bill trades · CCIL",
-            lambda: [TradePipeline(database, source=CcilHistoricalTradesSource()).run(as_of)],
+            lambda: [
+                TradePipeline(
+                    database,
+                    source=CcilHistoricalTradesSource(),
+                    derive_securities=derive_securities,
+                ).run(as_of)
+            ],
         ),
     ]

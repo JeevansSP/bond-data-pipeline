@@ -11,6 +11,7 @@ import respx
 
 from bonds.config import HttpSettings, Settings
 from bonds.http import ThrottledClient
+from bonds.models import InstrumentType, TradeRecord
 from bonds.sources import SourceError
 from bonds.sources.ccil_historical import (
     CcilHistoricalTradesSource,
@@ -19,6 +20,8 @@ from bonds.sources.ccil_historical import (
     _parse_row,
     _time_key,
     aggregate_trades,
+    derive_securities,
+    derive_security,
     encrypt_date,
 )
 
@@ -167,6 +170,56 @@ def test_parse_row_rejects_short_and_bad_isin() -> None:
     assert (
         _parse_row(["17-07-2026", "16:00:00", "NOTANISIN", "d", "1000", "100", "6", "NRML"]) is None
     )  # ISIN doesn't start with IN / wrong length
+
+
+def test_derive_security_tbill_parses_maturity_and_zero_coupon() -> None:
+    sec = derive_security("IN0020260099", "DTB 15012027", "TBILL")
+    assert sec is not None
+    assert sec.instrument_type is InstrumentType.TBILL
+    assert sec.coupon == 0.0 and sec.interest_type == "ZERO_COUPON"
+    assert sec.maturity_date == dt.date(2027, 1, 15)
+    assert sec.issuer == "Government of India" and sec.source == "ccil"
+
+
+def test_derive_security_old_tbill_slash_date() -> None:
+    sec = derive_security("IN002001X019", "091 DTB MATURING 07/06/2002", "TBILL")
+    assert sec is not None and sec.maturity_date == dt.date(2002, 6, 7)
+
+
+def test_derive_security_strip_and_gsec_coupon() -> None:
+    strip = derive_security("IN001241C032", "GOVT. STOCK 12DEC2041C", "STRIPS")
+    assert strip is not None
+    assert strip.instrument_type is InstrumentType.STRIPS
+    assert strip.coupon == 0.0 and strip.maturity_date == dt.date(2041, 12, 12)
+
+    gsec = derive_security("IN0020260025", "06.94 GOVT. STOCK 2036", "GSEC")
+    assert gsec is not None
+    assert gsec.coupon == pytest.approx(6.94)
+    assert gsec.maturity_date is None  # year-only in the feed -> left unknown
+
+
+def test_derive_security_sdl_issuer_none_and_sgb() -> None:
+    sdl = derive_security("IN2220190127", "06.97 MAHARASHTRA SGS 2028", "SDL")
+    assert sdl is not None and sdl.instrument_type is InstrumentType.SDL and sdl.issuer is None
+    sgb = derive_security("IN0020210228", "02.50 SGB 2029 SERIES VIII", "SGB")
+    assert sgb is not None and sgb.instrument_type is InstrumentType.SGB
+    assert sgb.coupon == pytest.approx(2.50)
+
+
+def test_derive_securities_dedupes_by_isin() -> None:
+    def _t(isin: str, desc: str, seg: str) -> TradeRecord:
+        return TradeRecord(
+            isin=isin, trade_date=dt.date(2026, 7, 17), source="ccil", segment=seg, descriptor=desc
+        )
+
+    secs = derive_securities(
+        [
+            _t("IN0020260099", "DTB 15012027", "TBILL"),
+            _t("IN0020260099", "DTB 15012027", "TBILL"),  # dup ISIN
+            _t("IN0020260025", "06.94 GOVT. STOCK 2036", "GSEC"),
+        ]
+    )
+    assert {s.isin for s in secs} == {"IN0020260099", "IN0020260025"}
 
 
 @respx.mock

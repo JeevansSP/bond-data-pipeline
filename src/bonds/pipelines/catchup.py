@@ -26,7 +26,7 @@ from bonds.pipelines.rbi_auction import RbiAuctionPipeline
 from bonds.pipelines.sovereign_valuation import SovereignValuationPipeline
 from bonds.pipelines.trade import TradePipeline
 from bonds.pipelines.universe import UniversePipeline
-from bonds.sources.ccil_historical import CcilHistoricalTradesSource
+from bonds.sources.ccil_historical import CcilHistoricalTradesSource, derive_securities
 from bonds.sources.nse import NseSource
 from bonds.storage import Database
 from bonds.storage.repositories import IngestionRunRepository
@@ -83,7 +83,9 @@ def catch_up(
     )
 
     ccil_start = series_start(database, "ccil", as_of=as_of, max_gap_days=max_gap_days)
-    ccil_pipeline = TradePipeline(database, source=CcilHistoricalTradesSource())
+    ccil_pipeline = TradePipeline(
+        database, source=CcilHistoricalTradesSource(), derive_securities=derive_securities
+    )
     ccil_days = list(business_days(ccil_start, as_of)) if ccil_start <= as_of else []
     logger.info("catchup.ccil", start=ccil_start.isoformat(), n=len(ccil_days))
     groups["G-Sec/T-Bill trades · CCIL"] = [ccil_pipeline.run(day) for day in ccil_days]
