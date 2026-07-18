@@ -9,7 +9,7 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import Iterator, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -329,6 +329,20 @@ class IngestionRunRepository:
             )
             .order_by(IngestionRun.run_date.desc())
             .limit(1)
+        ).scalar_one_or_none()
+
+    def last_processed_date(self, source: str) -> dt.date | None:
+        """Most recent ``run_date`` for ``source`` that reached a terminal success or skip.
+
+        This is the anchor for gap-fill catch-up: skips (holidays/no-data days) count as processed
+        so they are not retried forever, while failed days are excluded so they get re-attempted.
+        Returns ``None`` if the source has never been ingested.
+        """
+        return self._session.execute(
+            select(func.max(IngestionRun.run_date)).where(
+                IngestionRun.source == source,
+                IngestionRun.status.in_(("success", "skipped")),
+            )
         ).scalar_one_or_none()
 
 

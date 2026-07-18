@@ -32,6 +32,7 @@ from bonds.pipelines import (
     TradePipeline,
     UniversePipeline,
 )
+from bonds.pipelines.catchup import DEFAULT_MAX_GAP_DAYS, catch_up
 from bonds.pipelines.suite import StepOutcome, default_suite, summarize
 from bonds.pipelines.universe import UniverseFetcher
 from bonds.sources.bondcentral import BondCentralSource
@@ -145,6 +146,30 @@ def ingest_all(
             progress.update(tid, completed=1, status=_status_text(outcome))
 
     _print_summary(console, day, outcomes)
+    if any(o.has_failure for o in outcomes.values()):
+        raise typer.Exit(code=1)
+
+
+@ingest_app.command("catch-up")
+def ingest_catch_up(
+    as_of: Annotated[
+        dt.datetime | None,
+        typer.Option(formats=["%Y-%m-%d"], help="Target date (default: today)."),
+    ] = None,
+    max_gap_days: Annotated[
+        int,
+        typer.Option(help="Cap how many days back a gap-fill reaches (runaway-backfill guard)."),
+    ] = DEFAULT_MAX_GAP_DAYS,
+) -> None:
+    """Self-healing daily run for schedulers: gap-fill missed date-series days + refresh snapshots.
+
+    Idempotent — safe to run twice a day or after the machine was offline for several days.
+    """
+    _init_logging()
+    day = (as_of or dt.datetime.now(dt.UTC)).date()
+    report = catch_up(Database(), as_of=day, max_gap_days=max_gap_days)
+    outcomes = {label: summarize(results) for label, results in report.groups.items()}
+    _print_summary(Console(), day, outcomes)
     if any(o.has_failure for o in outcomes.values()):
         raise typer.Exit(code=1)
 

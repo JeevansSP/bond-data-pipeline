@@ -1,0 +1,16 @@
+# systemd timer for the daily bonds ingest (Linux).
+#
+# Persistent=true is the key line: if the machine was off/asleep at the scheduled time, systemd
+# runs the missed job as soon as it boots. That single run's `catch-up` command then gap-fills
+# every business day that was missed. See scripts/README.md to install.
+
+[Unit]
+Description=Run bonds ingest daily (catches up if a run was missed)
+
+[Timer]
+OnCalendar=*-*-* 21:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

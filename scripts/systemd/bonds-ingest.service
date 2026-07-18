@@ -1,0 +1,16 @@
+# systemd service for the daily bonds ingest (Linux).
+# Paired with bonds-ingest.timer. Type=oneshot: the timer schedules it; the service just runs once.
+# See scripts/README.md to install. Adjust WorkingDirectory, ExecStart path and User for your host.
+
+[Unit]
+Description=Bonds pipeline daily ingest (idempotent catch-up)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=bonds
+WorkingDirectory=/opt/bonds-research
+ExecStart=/usr/bin/bash /opt/bonds-research/scripts/run_daily_ingest.sh
+TimeoutStartSec=3600

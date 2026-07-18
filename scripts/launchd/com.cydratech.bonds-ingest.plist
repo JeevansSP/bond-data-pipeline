@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd agent for the daily bonds ingest.
+
+  StartCalendarInterval fires at 21:00 local. If the Mac is asleep or powered off at that time,
+  launchd runs the missed job once when the machine next wakes/boots — that single run's
+  `catch-up` command then gap-fills every business day that was missed. RunAtLoad also triggers
+  a run at login, so a freshly-booted machine catches up immediately.
+
+  Edit the absolute paths below if you move the repo. See scripts/README.md to install.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.cydratech.bonds-ingest</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/jeevanprakash/Desktop/work/cydratech/bonds-research/scripts/run_daily_ingest.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/jeevanprakash/Desktop/work/cydratech/bonds-research</string>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>21</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/jeevanprakash/Desktop/work/cydratech/bonds-research/data/logs/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/jeevanprakash/Desktop/work/cydratech/bonds-research/data/logs/launchd.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
