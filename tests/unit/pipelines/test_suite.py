@@ -46,5 +46,5 @@ def test_default_suite_covers_every_daily_source() -> None:
         "Public issues · SEBI",
         "Auctions · RBI",
         "Corp trades · NSE",
-        "G-Sec trades · CCIL",
+        "G-Sec/T-Bill trades · CCIL",
     ]

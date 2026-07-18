@@ -20,6 +20,7 @@ from rich.progress import (
 from rich.table import Table
 
 from bonds import __version__
+from bonds.calendar import business_days
 from bonds.config import get_settings
 from bonds.logging import configure_logging, get_logger
 from bonds.pipelines import (
@@ -34,7 +35,7 @@ from bonds.pipelines import (
 from bonds.pipelines.suite import StepOutcome, default_suite, summarize
 from bonds.pipelines.universe import UniverseFetcher
 from bonds.sources.bondcentral import BondCentralSource
-from bonds.sources.ccil import CcilSource
+from bonds.sources.ccil_historical import CcilHistoricalTradesSource
 from bonds.sources.cdsl import CdslSource
 from bonds.sources.nse import NseSource
 from bonds.storage import Database
@@ -215,14 +216,28 @@ def ingest_nse_trades(
 def ingest_ccil_trades(
     as_of: Annotated[
         dt.datetime | None,
-        typer.Option(formats=["%Y-%m-%d"], help="Snapshot date (default: today)."),
+        typer.Option(formats=["%Y-%m-%d"], help="Trade date (default: today)."),
     ] = None,
 ) -> None:
-    """Ingest CCIL NDS-OM G-Sec trades (market-hours only; empty when closed)."""
+    """Ingest CCIL NDS-OM historical trades (G-Sec/SDL/T-Bill) for a date."""
     _init_logging()
     day = (as_of or dt.datetime.now(dt.UTC)).date()
-    result = TradePipeline(Database(), source=CcilSource()).run(day)
+    result = TradePipeline(Database(), source=CcilHistoricalTradesSource()).run(day)
     _summarise([result], label=f"ccil-trades {day.isoformat()}")
+
+
+@ingest_app.command("ccil-trades-backfill")
+def ingest_ccil_trades_backfill(
+    start: Annotated[dt.datetime, typer.Option(formats=["%Y-%m-%d"], help="Start (inclusive).")],
+    end: Annotated[dt.datetime, typer.Option(formats=["%Y-%m-%d"], help="End (inclusive).")],
+) -> None:
+    """Backfill CCIL NDS-OM trades across a date range (weekdays; holidays return 0 rows)."""
+    _init_logging()
+    db = Database()
+    source = CcilHistoricalTradesSource()
+    pipeline = TradePipeline(db, source=source)
+    results = [pipeline.run(day) for day in business_days(start.date(), end.date())]
+    _summarise(results, label=f"ccil-backfill {start.date()}..{end.date()}")
 
 
 @ingest_app.command("rbi-auctions")

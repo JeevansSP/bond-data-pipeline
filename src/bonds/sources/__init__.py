@@ -12,6 +12,8 @@ Implemented:
     rbi         Sovereign auction calendar (announcements + dates + links).
     nse         Exchange corporate-bond trade feed (Akamai cookie-primed).
     ccil        G-Sec / NDS-OM individual trades (Liferay portlet; market-hours only).
+    ccil_historical  CCIL G-Sec Historical Trades — downloadable trade-by-trade CSV
+                     (G-Sec/SDL/T-Bill), any date range. The active CCIL trade source.
 """
 
 from bonds.sources.base import DataUnavailable, Source, SourceError
