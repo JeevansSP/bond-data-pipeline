@@ -173,6 +173,48 @@ def test_active_securities_view_excludes_matured_and_dead(database: Database) ->
     assert ISIN_B not in active  # matured is filtered out of the investable universe
 
 
+def test_same_day_attribute_change_is_idempotent(database: Database) -> None:
+    # Two runs on the SAME day where the rating changes must not crash (was IntegrityError).
+    UniversePipeline(database, source=FakeUniverseSource([_rec(ISIN_A, "AAA")])).run(DAY1)
+    UniversePipeline(database, source=FakeUniverseSource([_rec(ISIN_A, "AA")])).run(DAY1)
+    assert _rating_history(database, ISIN_A) == [("AA", None)]  # updated in place, one open row
+
+
+def test_multiple_runs_in_a_day_stay_idempotent(database: Database) -> None:
+    src = FakeUniverseSource([_rec(ISIN_A, "AAA"), _rec(ISIN_B, "AA+")])
+    UniversePipeline(database, source=src).run(DAY1)
+    UniversePipeline(database, source=src).run(DAY1)  # re-run same day
+    with database.session() as s:
+        runs = s.execute(
+            text("SELECT count(*) FROM ingestion_runs WHERE source=:x AND run_date=:d"),
+            {"x": SOURCE, "d": DAY1},
+        ).scalar_one()
+        checks = s.execute(
+            text(
+                "SELECT count(*) FROM data_quality_checks "
+                "WHERE source=:x AND run_date=:d AND check_name='row_count'"
+            ),
+            {"x": SOURCE, "d": DAY1},
+        ).scalar_one()
+    assert runs == 1  # upserted, not appended
+    assert checks == 1
+
+
+def test_db_phase_failure_is_audited_and_returns_failed(database: Database) -> None:
+    # A coupon < 0 violates ck_security_coupon_nonneg during the load phase (after fetch).
+    bad = SecurityRecord(
+        isin=ISIN_A, instrument_type=InstrumentType.CORP, source=SOURCE, coupon=-5.0
+    )
+    result = UniversePipeline(database, source=FakeUniverseSource([bad])).run(DAY1)
+    assert result.status is RunStatus.FAILED  # returned, not raised
+    with database.session() as s:
+        status = s.execute(
+            text("SELECT status FROM ingestion_runs WHERE source=:x AND run_date=:d"),
+            {"x": SOURCE, "d": DAY1},
+        ).scalar_one()
+    assert status == "failed"  # audit row survives the rolled-back work transaction
+
+
 def test_cross_source_reconciliation_flags_coupon_mismatch(database: Database) -> None:
     src_a, src_b, isin = "reconA", "reconB", "INUNIV000009"
 

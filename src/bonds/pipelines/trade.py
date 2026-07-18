@@ -9,15 +9,14 @@ from __future__ import annotations
 import datetime as dt
 from typing import Protocol
 
-from bonds.logging import get_logger
+from sqlalchemy.orm import Session
+
 from bonds.models import TradeRecord
-from bonds.pipelines.base import PipelineResult, RunStatus
+from bonds.pipelines.base import PipelineResult, execute_run
 from bonds.quality import QualityInspector
 from bonds.sources.nse import NseSource
 from bonds.storage import Database
-from bonds.storage.repositories import IngestionRunRepository, TradeRepository
-
-logger = get_logger(__name__)
+from bonds.storage.repositories import TradeRepository
 
 
 class TradeFetcher(Protocol):
@@ -43,20 +42,14 @@ class TradePipeline:
     def run(self, as_of: dt.date) -> PipelineResult:
         """Fetch + upsert the latest trades as of ``as_of``."""
         dataset = f"{self._source.name}.trades"
-        with self._db.session() as session:
-            runs = IngestionRunRepository(session)
-            run = runs.start(source=self._source.name, dataset=dataset, run_date=as_of)
-            try:
-                trades = self._source.fetch_trades(as_of)
-            except Exception as exc:  # audit then surface as FAILED result
-                runs.finish(run, status=RunStatus.FAILED, message=repr(exc))
-                logger.error("trade.failed", dataset=dataset, error=repr(exc))
-                return PipelineResult(as_of, dataset, RunStatus.FAILED, message=repr(exc))
 
+        def work(session: Session) -> int:
+            trades = self._source.fetch_trades(as_of)
             QualityInspector(
                 session, source=self._source.name, dataset=dataset, run_date=as_of
             ).inspect_trades(trades)
-            rows = TradeRepository(session).upsert_many(trades)
-            runs.finish(run, status=RunStatus.SUCCESS, rows=rows)
-            logger.info("trade.success", dataset=dataset, rows=rows)
-            return PipelineResult(as_of, dataset, RunStatus.SUCCESS, rows=rows)
+            return TradeRepository(session).upsert_many(trades)
+
+        return execute_run(
+            self._db, source=self._source.name, dataset=dataset, run_date=as_of, work=work
+        )

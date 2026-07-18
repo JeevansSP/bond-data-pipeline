@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Final, cast
 from urllib.parse import urljoin
 
+import httpx
 from lxml.html import HtmlElement, fromstring
 
 from bonds.config import Settings, get_settings
@@ -83,7 +84,9 @@ class RbiSource:
             return None
         try:
             detail = self._client.get(record.detail_url, headers=_HEADERS)
-        except SourceError:
+        except (httpx.HTTPError, SourceError):
+            # A single flaky/404 detail page must not abort the whole auction ingest.
+            logger.warning("rbi.detail_fetch_failed", prid=record.prid)
             return None
         return parse_detail_date(detail.content)
 

@@ -55,3 +55,28 @@ def test_parse_detail_date() -> None:
 
 def test_parse_detail_date_absent_returns_none() -> None:
     assert parse_detail_date(b"<html><body>no date here</body></html>") is None
+
+
+def test_detail_date_survives_http_error() -> None:
+    # A failing detail page (404/timeout) must NOT abort the whole auction ingest.
+    from unittest.mock import MagicMock
+
+    import httpx
+
+    from bonds.models import RbiAuctionRecord
+    from bonds.sources.rbi import RbiSource
+
+    src = RbiSource.__new__(RbiSource)
+    src._client = MagicMock()
+    req = httpx.Request("GET", "https://www.rbi.org.in/x")
+    src._client.get.side_effect = httpx.HTTPStatusError(
+        "404", request=req, response=httpx.Response(404, request=req)
+    )
+    rec = RbiAuctionRecord(
+        prid="1",
+        title="Auction",
+        auction_type="G-Sec",
+        source="rbi",
+        detail_url="https://www.rbi.org.in/scripts/FS_PressRelease.aspx?prid=1",
+    )
+    assert src._detail_date(rec) is None  # gracefully skipped, not raised

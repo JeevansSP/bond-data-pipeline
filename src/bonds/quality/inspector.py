@@ -28,7 +28,6 @@ from bonds.storage.repositories import (
     IngestionRunRepository,
     SecurityRepository,
 )
-from bonds.storage.schema import DataQualityCheck
 
 logger = get_logger(__name__)
 
@@ -132,9 +131,13 @@ class QualityInspector:
         previous = IngestionRunRepository(self._session).previous_row_count(
             self._dataset, before=self._run_date
         )
-        if not previous:
+        if previous is None:
             return QualityCheck(
                 "row_count_drift", Level.INFO, passed=True, observed=0.0, detail="no prior run"
+            )
+        if previous == 0:
+            return QualityCheck(
+                "row_count_drift", Level.INFO, passed=True, observed=0.0, detail="prior run empty"
             )
         drop_rate = max(0.0, (previous - current_rows) / previous)
         return QualityCheck(
@@ -146,20 +149,20 @@ class QualityInspector:
         )
 
     def _persist(self, checks: list[QualityCheck]) -> None:
-        rows = [
-            DataQualityCheck(
-                source=self._source,
-                dataset=self._dataset,
-                run_date=self._run_date,
-                check_name=c.name,
-                level=c.level.value,
-                passed=c.passed,
-                observed=c.observed,
-                detail=c.detail,
-            )
+        rows: list[dict[str, object]] = [
+            {
+                "source": self._source,
+                "dataset": self._dataset,
+                "run_date": self._run_date,
+                "check_name": c.name,
+                "level": c.level.value,
+                "passed": c.passed,
+                "observed": c.observed,
+                "detail": c.detail,
+            }
             for c in checks
         ]
-        DataQualityRepository(self._session).record(rows)
+        DataQualityRepository(self._session).upsert(rows)
         for c in checks:
             if c.passed:
                 continue

@@ -160,12 +160,12 @@ def test_sovereign_securities_are_enriched(database: Database) -> None:
     assert sec.interest_type == "Fixed"  # non-zero coupon
 
 
-def test_check_constraint_rejects_nonpositive_price(database: Database) -> None:
-    from sqlalchemy.exc import IntegrityError
-
+def test_nonpositive_price_coerced_to_null_not_crash(database: Database) -> None:
     from bonds.models import SovereignValuation
     from bonds.storage.repositories import ValuationRepository
 
+    # A non-positive price is coerced to NULL by the model, so it lands as NULL (surfaced by the
+    # null-price DQ check) rather than violating ck_valuation_price_positive and killing the batch.
     bad = SovereignValuation(
         isin=ISIN_A,
         quote_date=DATE,
@@ -174,5 +174,9 @@ def test_check_constraint_rejects_nonpositive_price(database: Database) -> None:
         price=-1.0,
         ytm=5.0,
     )
-    with pytest.raises(IntegrityError), database.session() as s:
-        ValuationRepository(s).upsert_many([bad])
+    assert bad.price is None  # coerced by the model
+    with database.session() as s:
+        ValuationRepository(s).upsert_many([bad])  # no IntegrityError
+    with database.session() as s:
+        row = s.execute(select(Valuation).where(Valuation.isin == ISIN_A)).scalar_one()
+    assert row.price is None and row.ytm == 5.0

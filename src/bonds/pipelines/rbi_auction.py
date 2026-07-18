@@ -8,15 +8,14 @@ from __future__ import annotations
 import datetime as dt
 from typing import Protocol
 
-from bonds.logging import get_logger
+from sqlalchemy.orm import Session
+
 from bonds.models import RbiAuctionRecord
-from bonds.pipelines.base import PipelineResult, RunStatus
+from bonds.pipelines.base import PipelineResult, execute_run
 from bonds.quality import QualityInspector
 from bonds.sources.rbi import RbiSource
 from bonds.storage import Database
-from bonds.storage.repositories import IngestionRunRepository, RbiAuctionRepository
-
-logger = get_logger(__name__)
+from bonds.storage.repositories import RbiAuctionRepository
 
 
 class AuctionFetcher(Protocol):
@@ -42,20 +41,14 @@ class RbiAuctionPipeline:
     def run(self, as_of: dt.date) -> PipelineResult:
         """Fetch + upsert the auction calendar as of ``as_of``."""
         dataset = f"{self._source.name}.auctions"
-        with self._db.session() as session:
-            runs = IngestionRunRepository(session)
-            run = runs.start(source=self._source.name, dataset=dataset, run_date=as_of)
-            try:
-                auctions = self._source.fetch_auctions(as_of)
-            except Exception as exc:  # audit then surface as FAILED result
-                runs.finish(run, status=RunStatus.FAILED, message=repr(exc))
-                logger.error("rbi_auction.failed", dataset=dataset, error=repr(exc))
-                return PipelineResult(as_of, dataset, RunStatus.FAILED, message=repr(exc))
 
+        def work(session: Session) -> int:
+            auctions = self._source.fetch_auctions(as_of)
             QualityInspector(
                 session, source=self._source.name, dataset=dataset, run_date=as_of
             ).inspect_rbi_auctions(auctions)
-            rows = RbiAuctionRepository(session).upsert_many(auctions, seen_on=as_of)
-            runs.finish(run, status=RunStatus.SUCCESS, rows=rows)
-            logger.info("rbi_auction.success", dataset=dataset, rows=rows)
-            return PipelineResult(as_of, dataset, RunStatus.SUCCESS, rows=rows)
+            return RbiAuctionRepository(session).upsert_many(auctions, seen_on=as_of)
+
+        return execute_run(
+            self._db, source=self._source.name, dataset=dataset, run_date=as_of, work=work
+        )

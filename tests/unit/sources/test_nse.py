@@ -11,7 +11,7 @@ import respx
 
 from bonds.config import HttpSettings, Settings
 from bonds.http import ThrottledClient
-from bonds.sources.nse import NseSource, _parse_timestamp, _to_record
+from bonds.sources.nse import NseSource, _as_float, _parse_timestamp, _to_record
 
 _ROW = {
     "descriptor": "RELIANCE 7.79 NCD 10NV33\r",
@@ -48,6 +48,12 @@ def test_to_record_maps_fields_and_strips_descriptor() -> None:
 
 def test_to_record_skips_bad_isin() -> None:
     assert _to_record({"isin": "BAD"}, "otctrades_listed", dt.date(2026, 7, 17)) is None
+
+
+def test_as_float_handles_indian_grouped_numbers() -> None:
+    assert _as_float("1,23,456.50") == pytest.approx(123456.50)  # was silently nulled before
+    assert _as_float("100") == pytest.approx(100.0)
+    assert _as_float("") is None
 
 
 @respx.mock

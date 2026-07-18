@@ -13,16 +13,15 @@ import datetime as dt
 from collections.abc import Iterator
 from typing import Protocol
 
+from sqlalchemy.orm import Session
+
 from bonds.logging import get_logger
 from bonds.models import SecurityRecord
-from bonds.pipelines.base import PipelineResult, RunStatus
+from bonds.pipelines.base import PipelineResult, execute_run
 from bonds.quality import QualityInspector
 from bonds.sources.bondcentral import BondCentralSource
 from bonds.storage import Database
-from bonds.storage.repositories import (
-    IngestionRunRepository,
-    SecurityRepository,
-)
+from bonds.storage.repositories import SecurityRepository
 
 logger = get_logger(__name__)
 
@@ -72,16 +71,9 @@ class UniversePipeline:
             max_pages: Optional page cap passed through to the source (smoke runs).
         """
         dataset = f"{self._source.name}.universe"
-        with self._db.session() as session:
-            runs = IngestionRunRepository(session)
-            run = runs.start(source=self._source.name, dataset=dataset, run_date=as_of)
-            try:
-                records = list(self._source.iter_records(as_of, max_pages=max_pages))
-            except Exception as exc:  # audit then surface as FAILED result
-                runs.finish(run, status=RunStatus.FAILED, message=repr(exc))
-                logger.error("universe.failed", dataset=dataset, error=repr(exc))
-                return PipelineResult(as_of, dataset, RunStatus.FAILED, message=repr(exc))
 
+        def work(session: Session) -> int:
+            records = list(self._source.iter_records(as_of, max_pages=max_pages))
             # Quality + reconciliation run first: reconciliation compares against the row a
             # *different* source last wrote, before this upsert overwrites it.
             QualityInspector(
@@ -89,10 +81,12 @@ class UniversePipeline:
             ).inspect_universe(records)
             securities = SecurityRepository(session)
             rows = securities.upsert_many(records, seen_on=as_of)
-            changes = self._record_attributes(securities, records, effective=as_of)
-            runs.finish(run, status=RunStatus.SUCCESS, rows=rows, message=f"{changes} attr changes")
-            logger.info("universe.success", dataset=dataset, rows=rows, attr_changes=changes)
-            return PipelineResult(as_of, dataset, RunStatus.SUCCESS, rows=rows)
+            self._record_attributes(securities, records, effective=as_of)
+            return rows
+
+        return execute_run(
+            self._db, source=self._source.name, dataset=dataset, run_date=as_of, work=work
+        )
 
     def _record_attributes(
         self, repo: SecurityRepository, records: list[SecurityRecord], *, effective: dt.date

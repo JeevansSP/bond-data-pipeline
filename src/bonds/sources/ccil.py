@@ -158,6 +158,6 @@ def _as_float(value: Any) -> float | None:
     if value is None or value == "":
         return None
     try:
-        return float(value)
+        return float(str(value).replace(",", ""))  # NDS-OM may return grouped numbers
     except (TypeError, ValueError):
         return None

@@ -75,6 +75,8 @@ class FbilSource:
                 url,
                 params={"date": date.isoformat()},
                 headers={"Accept": "*/*", "Referer": _REFERER},
+                # 500 = non-publishing day (expected); don't burn the retry/backoff budget on it.
+                no_retry_statuses=frozenset({httpx.codes.INTERNAL_SERVER_ERROR}),
             )
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == httpx.codes.INTERNAL_SERVER_ERROR:

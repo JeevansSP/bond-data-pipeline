@@ -157,9 +157,14 @@ class Trade(Base):
 
 
 class IngestionRun(Base):
-    """Audit record for a single pipeline execution against one dataset + business date."""
+    """Audit record for a pipeline execution against one dataset + business date.
+
+    Idempotent per ``(source, dataset, run_date)``: re-running a day updates the record rather
+    than appending, so multiple runs in a day converge to one row.
+    """
 
     __tablename__ = "ingestion_runs"
+    __table_args__ = (UniqueConstraint("source", "dataset", "run_date", name="uq_ingestion_run"),)
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     source: Mapped[str] = mapped_column(String(32), index=True)
@@ -221,6 +226,9 @@ class DataQualityCheck(Base):
     """
 
     __tablename__ = "data_quality_checks"
+    __table_args__ = (
+        UniqueConstraint("dataset", "run_date", "check_name", name="uq_data_quality_check"),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     source: Mapped[str] = mapped_column(String(32), index=True)

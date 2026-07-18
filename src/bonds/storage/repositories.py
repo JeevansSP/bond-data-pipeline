@@ -170,6 +170,11 @@ class SecurityRepository:
 
         if current is not None and current.value == value:
             return False
+        if current is not None and effective <= current.valid_from:
+            # Same-day (or earlier) change: overwrite the open row in place. Closing it would
+            # make valid_to < valid_from and collide with uq_attr_history_point on valid_from.
+            current.value = value
+            return True
         if current is not None:
             current.valid_to = effective - dt.timedelta(days=1)
 
@@ -216,6 +221,12 @@ class SecurityRepository:
             existing = current.get(isin)
             if existing is not None and existing.value == value:
                 continue
+            if existing is not None and effective <= existing.valid_from:
+                # Same-day (or earlier) change: overwrite in place so a same-day re-run stays
+                # idempotent instead of colliding on uq_attr_history_point / inverting the interval.
+                existing.value = value
+                changes += 1
+                continue
             if existing is not None:
                 existing.valid_to = effective - dt.timedelta(days=1)
             self._session.add(
@@ -233,34 +244,44 @@ class SecurityRepository:
 
 
 class IngestionRunRepository:
-    """Create and finalise ingestion audit records."""
+    """Idempotent ingestion audit records (one row per source+dataset+run_date)."""
 
     def __init__(self, session: Session) -> None:
         self._session = session
 
-    def start(self, *, source: str, dataset: str, run_date: dt.date) -> IngestionRun:
-        """Open an ingestion run in ``running`` state and return it."""
-        run = IngestionRun(
+    def record(
+        self,
+        *,
+        source: str,
+        dataset: str,
+        run_date: dt.date,
+        status: str,
+        rows: int,
+        started_at: dt.datetime,
+        message: str | None = None,
+    ) -> None:
+        """Upsert the terminal audit record for a run (re-running a day overwrites it)."""
+        stmt = pg_insert(IngestionRun).values(
             source=source,
             dataset=dataset,
             run_date=run_date,
-            status="running",
-            rows_ingested=0,
-            started_at=dt.datetime.now(dt.UTC),
+            status=status,
+            rows_ingested=rows,
+            message=message,
+            started_at=started_at,
+            finished_at=dt.datetime.now(dt.UTC),
         )
-        self._session.add(run)
-        self._session.flush()
-        return run
-
-    def finish(
-        self, run: IngestionRun, *, status: str, rows: int = 0, message: str | None = None
-    ) -> None:
-        """Close an ingestion run with a terminal ``status`` and row count."""
-        run.status = status
-        run.rows_ingested = rows
-        run.message = message
-        run.finished_at = dt.datetime.now(dt.UTC)
-        self._session.add(run)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["source", "dataset", "run_date"],
+            set_={
+                "status": stmt.excluded.status,
+                "rows_ingested": stmt.excluded.rows_ingested,
+                "message": stmt.excluded.message,
+                "started_at": stmt.excluded.started_at,
+                "finished_at": stmt.excluded.finished_at,
+            },
+        )
+        self._session.execute(stmt)
 
     def previous_row_count(self, dataset: str, *, before: dt.date) -> int | None:
         """Rows ingested by the most recent successful run of ``dataset`` before ``before``."""
@@ -404,14 +425,24 @@ class RbiAuctionRepository:
 
 
 class DataQualityRepository:
-    """Persist data-quality check results."""
+    """Persist data-quality check results (idempotent per dataset+run_date+check_name)."""
 
     def __init__(self, session: Session) -> None:
         self._session = session
 
-    def record(
-        self,
-        checks: list[DataQualityCheck],
-    ) -> None:
-        """Persist a batch of already-constructed :class:`DataQualityCheck` rows."""
-        self._session.add_all(checks)
+    def upsert(self, rows: list[dict[str, object]]) -> None:
+        """Upsert check results so a same-day re-run overwrites rather than duplicates."""
+        if not rows:
+            return
+        stmt = pg_insert(DataQualityCheck).values(rows)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["dataset", "run_date", "check_name"],
+            set_={
+                "source": stmt.excluded.source,
+                "level": stmt.excluded.level,
+                "passed": stmt.excluded.passed,
+                "observed": stmt.excluded.observed,
+                "detail": stmt.excluded.detail,
+            },
+        )
+        self._session.execute(stmt)

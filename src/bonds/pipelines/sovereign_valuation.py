@@ -19,20 +19,12 @@ from typing import Protocol
 from sqlalchemy.orm import Session
 
 from bonds.calendar import business_days
-from bonds.logging import get_logger
 from bonds.models import InstrumentType, SecurityRecord, SovereignValuation
-from bonds.pipelines.base import PipelineResult, RunStatus
+from bonds.pipelines.base import PipelineResult, execute_run
 from bonds.quality import QualityInspector
-from bonds.sources.base import DataUnavailable
 from bonds.sources.fbil import FbilSource
 from bonds.storage import Database
-from bonds.storage.repositories import (
-    IngestionRunRepository,
-    SecurityRepository,
-    ValuationRepository,
-)
-
-logger = get_logger(__name__)
+from bonds.storage.repositories import SecurityRepository, ValuationRepository
 
 DEFAULT_PRODUCTS: tuple[str, ...] = ("gsec", "sdl")
 
@@ -77,29 +69,19 @@ class SovereignValuationPipeline:
     # ------------------------------------------------------------------ internals
     def _run_product(self, product: str, date: dt.date) -> PipelineResult:
         dataset = f"{self._source.name}.{product}"
-        with self._db.session() as session:
-            runs = IngestionRunRepository(session)
-            run = runs.start(source=self._source.name, dataset=dataset, run_date=date)
-            try:
-                valuations = self._source.fetch_valuations(product, date)
-            except DataUnavailable as exc:
-                runs.finish(run, status=RunStatus.SKIPPED, message=str(exc))
-                logger.info("pipeline.skipped", dataset=dataset, date=date.isoformat())
-                return PipelineResult(date, dataset, RunStatus.SKIPPED, message=str(exc))
-            except Exception as exc:
-                runs.finish(run, status=RunStatus.FAILED, message=repr(exc))
-                logger.error(
-                    "pipeline.failed", dataset=dataset, date=date.isoformat(), error=repr(exc)
-                )
-                return PipelineResult(date, dataset, RunStatus.FAILED, message=repr(exc))
 
+        def work(session: Session) -> int:
+            # fetch_valuations raises DataUnavailable on a holiday -> execute_run -> SKIPPED.
+            valuations = self._source.fetch_valuations(product, date)
             rows = self._persist(session, valuations, seen_on=date)
             QualityInspector(
                 session, source=self._source.name, dataset=dataset, run_date=date
             ).inspect_valuations(valuations)
-            runs.finish(run, status=RunStatus.SUCCESS, rows=rows)
-            logger.info("pipeline.success", dataset=dataset, date=date.isoformat(), rows=rows)
-            return PipelineResult(date, dataset, RunStatus.SUCCESS, rows=rows)
+            return rows
+
+        return execute_run(
+            self._db, source=self._source.name, dataset=dataset, run_date=date, work=work
+        )
 
     @staticmethod
     def _persist(

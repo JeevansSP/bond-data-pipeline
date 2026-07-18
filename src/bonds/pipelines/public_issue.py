@@ -8,15 +8,14 @@ from __future__ import annotations
 import datetime as dt
 from typing import Protocol
 
-from bonds.logging import get_logger
+from sqlalchemy.orm import Session
+
 from bonds.models import PublicIssueRecord
-from bonds.pipelines.base import PipelineResult, RunStatus
+from bonds.pipelines.base import PipelineResult, execute_run
 from bonds.quality import QualityInspector
 from bonds.sources.sebi import SebiSource
 from bonds.storage import Database
-from bonds.storage.repositories import IngestionRunRepository, PublicIssueRepository
-
-logger = get_logger(__name__)
+from bonds.storage.repositories import PublicIssueRepository
 
 
 class PublicIssueFetcher(Protocol):
@@ -42,20 +41,14 @@ class PublicIssuePipeline:
     def run(self, as_of: dt.date) -> PipelineResult:
         """Fetch + upsert the full public-issue calendar as of ``as_of``."""
         dataset = f"{self._source.name}.public_issues"
-        with self._db.session() as session:
-            runs = IngestionRunRepository(session)
-            run = runs.start(source=self._source.name, dataset=dataset, run_date=as_of)
-            try:
-                issues = self._source.fetch_public_issues(as_of)
-            except Exception as exc:  # audit then surface as FAILED result
-                runs.finish(run, status=RunStatus.FAILED, message=repr(exc))
-                logger.error("public_issue.failed", dataset=dataset, error=repr(exc))
-                return PipelineResult(as_of, dataset, RunStatus.FAILED, message=repr(exc))
 
+        def work(session: Session) -> int:
+            issues = self._source.fetch_public_issues(as_of)
             QualityInspector(
                 session, source=self._source.name, dataset=dataset, run_date=as_of
             ).inspect_public_issues(issues)
-            rows = PublicIssueRepository(session).upsert_many(issues)
-            runs.finish(run, status=RunStatus.SUCCESS, rows=rows)
-            logger.info("public_issue.success", dataset=dataset, rows=rows)
-            return PipelineResult(as_of, dataset, RunStatus.SUCCESS, rows=rows)
+            return PublicIssueRepository(session).upsert_many(issues)
+
+        return execute_run(
+            self._db, source=self._source.name, dataset=dataset, run_date=as_of, work=work
+        )

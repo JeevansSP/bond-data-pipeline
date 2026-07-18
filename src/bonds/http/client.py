@@ -81,9 +81,14 @@ class ThrottledClient:
         *,
         params: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
+        no_retry_statuses: frozenset[int] = frozenset(),
     ) -> httpx.Response:
-        """GET ``url`` with throttling and retries; raise on non-2xx after retries."""
-        return self._send("GET", url, params=params, headers=headers)
+        """GET ``url`` with throttling and retries; raise on non-2xx after retries.
+
+        ``no_retry_statuses`` opts specific codes out of retrying — e.g. FBIL returns 500 for every
+        non-publishing day, an expected case that shouldn't burn the backoff budget.
+        """
+        return self._send("GET", url, params=params, headers=headers, no_retry=no_retry_statuses)
 
     def post(
         self,
@@ -104,6 +109,7 @@ class ThrottledClient:
         params: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
         data: dict[str, str] | None = None,
+        no_retry: frozenset[int] = frozenset(),
     ) -> httpx.Response:
         @retry(
             retry=retry_if_exception_type((httpx.TransportError, RetryableStatusError)),
@@ -114,7 +120,7 @@ class ThrottledClient:
         def _do() -> httpx.Response:
             self._throttle()
             response = self._client.request(method, url, params=params, headers=headers, data=data)
-            if response.status_code in _RETRYABLE_STATUS:
+            if response.status_code in _RETRYABLE_STATUS and response.status_code not in no_retry:
                 logger.warning("http.retryable_status", url=url, status=response.status_code)
                 raise RetryableStatusError(
                     f"retryable status {response.status_code}",

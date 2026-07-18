@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class InstrumentType(StrEnum):
@@ -41,6 +41,17 @@ class SovereignValuation(BaseModel):
     price: float | None = None
     ytm: float | None = None
 
+    @field_validator("price")
+    @classmethod
+    def _price_positive_or_none(cls, v: float | None) -> float | None:
+        # Match ck_valuation_price_positive: a non-positive price is bad data -> null (DQ flags it).
+        return v if v is None or v > 0 else None
+
+    @field_validator("ytm")
+    @classmethod
+    def _ytm_nonneg_or_none(cls, v: float | None) -> float | None:
+        return v if v is None or v >= 0 else None
+
 
 class TradeRecord(BaseModel):
     """A per-ISIN secondary-market trade summary for one session (e.g. NSE corporate bonds)."""
@@ -62,6 +73,12 @@ class TradeRecord(BaseModel):
     """Weighted-average price."""
     way: float | None = None
     """Weighted-average yield."""
+
+    @field_validator("ltp")
+    @classmethod
+    def _ltp_positive_or_none(cls, v: float | None) -> float | None:
+        # Match ck_trade_ltp_positive: an untraded row's ltp=0 becomes null instead of crashing.
+        return v if v is None or v > 0 else None
 
 
 class RbiAuctionRecord(BaseModel):
