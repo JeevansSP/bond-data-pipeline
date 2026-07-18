@@ -82,20 +82,29 @@ class ThrottledClient:
         params: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
     ) -> httpx.Response:
-        """GET ``url`` with throttling and retries; raise on non-2xx after retries.
+        """GET ``url`` with throttling and retries; raise on non-2xx after retries."""
+        return self._send("GET", url, params=params, headers=headers)
 
-        Args:
-            url: Absolute URL to fetch.
-            params: Optional query parameters.
-            headers: Optional per-request headers merged over the client defaults.
+    def post(
+        self,
+        url: str,
+        *,
+        data: dict[str, str] | None = None,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        """POST ``url`` with a form body, throttling and retries (e.g. Liferay portlet calls)."""
+        return self._send("POST", url, params=params, headers=headers, data=data)
 
-        Returns:
-            The successful :class:`httpx.Response`.
-
-        Raises:
-            httpx.HTTPStatusError: On a non-retryable 4xx, or after exhausting retries.
-        """
-
+    def _send(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        data: dict[str, str] | None = None,
+    ) -> httpx.Response:
         @retry(
             retry=retry_if_exception_type((httpx.TransportError, RetryableStatusError)),
             wait=wait_exponential(multiplier=1, min=1, max=30),
@@ -104,7 +113,7 @@ class ThrottledClient:
         )
         def _do() -> httpx.Response:
             self._throttle()
-            response = self._client.get(url, params=params, headers=headers)
+            response = self._client.request(method, url, params=params, headers=headers, data=data)
             if response.status_code in _RETRYABLE_STATUS:
                 logger.warning("http.retryable_status", url=url, status=response.status_code)
                 raise RetryableStatusError(

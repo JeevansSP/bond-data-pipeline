@@ -104,9 +104,7 @@ omit = [
     "src/bonds/pipelines/rbi_auction.py",
     "src/bonds/pipelines/trade.py",
     "src/bonds/quality/inspector.py",
-    "src/bonds/sources/ccil.py",
-    "src/bonds/sources/sebi.py",
-    "src/bonds/sources/rbi.py",
+    "src/bonds/sources/rbi.py",  # fetch_auctions does per-auction detail fetches (integration path)
 ]
 
 [tool.coverage.report]

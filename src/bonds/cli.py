@@ -23,7 +23,9 @@ from bonds.pipelines import (
 )
 from bonds.pipelines.universe import UniverseFetcher
 from bonds.sources.bondcentral import BondCentralSource
+from bonds.sources.ccil import CcilSource
 from bonds.sources.cdsl import CdslSource
+from bonds.sources.nse import NseSource
 from bonds.storage import Database
 
 app = typer.Typer(add_completion=False, help="Indian bond market data pipelines.")
@@ -125,8 +127,22 @@ def ingest_nse_trades(
     """Ingest NSE corporate-bond trades (latest session; forward capture)."""
     _init_logging()
     day = (as_of or dt.datetime.now(dt.UTC)).date()
-    result = TradePipeline(Database()).run(day)
+    result = TradePipeline(Database(), source=NseSource()).run(day)
     _summarise([result], label=f"nse-trades {day.isoformat()}")
+
+
+@ingest_app.command("ccil-trades")
+def ingest_ccil_trades(
+    as_of: Annotated[
+        dt.datetime | None,
+        typer.Option(formats=["%Y-%m-%d"], help="Snapshot date (default: today)."),
+    ] = None,
+) -> None:
+    """Ingest CCIL NDS-OM G-Sec trades (market-hours only; empty when closed)."""
+    _init_logging()
+    day = (as_of or dt.datetime.now(dt.UTC)).date()
+    result = TradePipeline(Database(), source=CcilSource()).run(day)
+    _summarise([result], label=f"ccil-trades {day.isoformat()}")
 
 
 @ingest_app.command("rbi-auctions")

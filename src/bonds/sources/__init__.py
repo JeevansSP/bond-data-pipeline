@@ -11,9 +11,7 @@ Implemented:
     sebi        Corporate-bond public-issue calendar (primary market).
     rbi         Sovereign auction calendar (announcements + dates + links).
     nse         Exchange corporate-bond trade feed (Akamai cookie-primed).
-
-Planned (typed stubs — see each module's docstring for the documented endpoints):
-    ccil        G-Sec / NDS-OM secondary trades & settlement.
+    ccil        G-Sec / NDS-OM individual trades (Liferay portlet; market-hours only).
 """
 
 from bonds.sources.base import DataUnavailable, Source, SourceError
