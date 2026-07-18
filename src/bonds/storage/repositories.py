@@ -171,8 +171,10 @@ class SecurityRepository:
                     "maturity_date": stmt.excluded.maturity_date,
                     "face_value": stmt.excluded.face_value,
                     "source": stmt.excluded.source,
-                    # first_seen is preserved (only set on insert); last_seen advances.
-                    "last_seen": stmt.excluded.last_seen,
+                    # Track the true observation window even when dates arrive out of order
+                    # (e.g. backfilling an older snapshot after a newer one).
+                    "first_seen": func.least(Security.first_seen, stmt.excluded.first_seen),
+                    "last_seen": func.greatest(Security.last_seen, stmt.excluded.last_seen),
                 },
             )
             self._session.execute(stmt)
@@ -504,7 +506,8 @@ class RbiAuctionRepository:
                     "auction_date": stmt.excluded.auction_date,
                     "detail_url": stmt.excluded.detail_url,
                     "pdf_url": stmt.excluded.pdf_url,
-                    "last_seen": stmt.excluded.last_seen,
+                    "first_seen": func.least(RbiAuction.first_seen, stmt.excluded.first_seen),
+                    "last_seen": func.greatest(RbiAuction.last_seen, stmt.excluded.last_seen),
                 },
             )
             self._session.execute(stmt)

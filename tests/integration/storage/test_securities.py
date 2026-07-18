@@ -36,6 +36,20 @@ def _sec(source: str, itype: InstrumentType, coupon: float | None) -> SecurityRe
     return SecurityRecord(isin=ISIN, instrument_type=itype, source=source, coupon=coupon)
 
 
+def test_upsert_out_of_order_keeps_true_seen_window(db: Database) -> None:
+    # Insert as of a later date, then re-ingest an OLDER snapshot; first_seen must move to the
+    # earliest date and last_seen stay at the latest (GREATEST/LEAST), never regressing.
+    rec = _sec("fbil", InstrumentType.GSEC, 6.94)
+    with db.session() as s:
+        SecurityRepository(s).upsert_many([rec], seen_on=dt.date(2026, 7, 18))
+    with db.session() as s:
+        SecurityRepository(s).upsert_many([rec], seen_on=dt.date(2026, 7, 10))  # older, second
+    with db.session() as s:
+        row = s.execute(select(Security).where(Security.isin == ISIN)).scalar_one()
+        assert row.first_seen == dt.date(2026, 7, 10)  # earliest
+        assert row.last_seen == dt.date(2026, 7, 18)  # latest, did not regress
+
+
 def test_insert_missing_inserts_then_does_not_overwrite(db: Database) -> None:
     # First insert (as if from FBIL) writes the row.
     with db.session() as s:
