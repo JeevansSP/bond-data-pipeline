@@ -10,7 +10,7 @@ import datetime as dt
 from dataclasses import dataclass
 from enum import StrEnum
 
-from bonds.models import SecurityRecord, SovereignValuation
+from bonds.models import PublicIssueRecord, SecurityRecord, SovereignValuation
 from bonds.quality.isin import is_valid_isin
 
 # --- thresholds (tunable) -------------------------------------------------------------------
@@ -122,6 +122,33 @@ def check_universe(records: list[SecurityRecord], *, as_of: dt.date) -> list[Qua
             passed=True,
             observed=float(matured),
             detail="carried securities already past maturity (exclude from active ladder)",
+        ),
+    ]
+    return checks
+
+
+def check_public_issues(issues: list[PublicIssueRecord]) -> list[QualityCheck]:
+    """Quality checks for a SEBI public-issue batch (row count, close>=open, size presence)."""
+    total = len(issues)
+    checks: list[QualityCheck] = [
+        QualityCheck("row_count", Level.ERROR, passed=total > 0, observed=float(total)),
+    ]
+    if total == 0:
+        return checks
+
+    bad_window = sum(
+        1 for i in issues if i.issue_close is not None and i.issue_close < i.issue_open
+    )
+    null_final = sum(1 for i in issues if i.final_size_cr is None)
+    checks += [
+        QualityCheck(
+            "close_before_open", Level.WARN, passed=bad_window == 0, observed=float(bad_window)
+        ),
+        QualityCheck(
+            "null_final_size_rate",
+            Level.WARN,
+            passed=True,
+            observed=_rate(null_final, total),
         ),
     ]
     return checks

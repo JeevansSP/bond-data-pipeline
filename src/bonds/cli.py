@@ -14,6 +14,7 @@ from bonds.config import get_settings
 from bonds.logging import configure_logging, get_logger
 from bonds.pipelines import (
     PipelineResult,
+    PublicIssuePipeline,
     RunStatus,
     SovereignValuationPipeline,
     UniversePipeline,
@@ -96,6 +97,20 @@ def ingest_universe(
     )
     result = UniversePipeline(Database(), source=connector).run(day, max_pages=max_pages)
     _summarise([result], label=f"universe[{source.value}] {day.isoformat()}")
+
+
+@ingest_app.command("public-issues")
+def ingest_public_issues(
+    as_of: Annotated[
+        dt.datetime | None,
+        typer.Option(formats=["%Y-%m-%d"], help="Snapshot date (default: today)."),
+    ] = None,
+) -> None:
+    """Ingest the SEBI corporate-bond public-issue calendar."""
+    _init_logging()
+    day = (as_of or dt.datetime.now(dt.UTC)).date()
+    result = PublicIssuePipeline(Database()).run(day)
+    _summarise([result], label=f"public-issues {day.isoformat()}")
 
 
 @ingest_app.command("sovereign-valuation")

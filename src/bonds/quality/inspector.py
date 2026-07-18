@@ -7,8 +7,14 @@ import datetime as dt
 from sqlalchemy.orm import Session
 
 from bonds.logging import get_logger
-from bonds.models import SecurityRecord, SovereignValuation
-from bonds.quality.checks import Level, QualityCheck, check_universe, check_valuations
+from bonds.models import PublicIssueRecord, SecurityRecord, SovereignValuation
+from bonds.quality.checks import (
+    Level,
+    QualityCheck,
+    check_public_issues,
+    check_universe,
+    check_valuations,
+)
 from bonds.storage.repositories import (
     DataQualityRepository,
     IngestionRunRepository,
@@ -49,6 +55,13 @@ class QualityInspector:
         checks = check_universe(records, as_of=self._run_date)
         checks.append(self._drift_check(len(records)))
         checks += self._reconcile(records)
+        self._persist(checks)
+        return checks
+
+    def inspect_public_issues(self, issues: list[PublicIssueRecord]) -> list[QualityCheck]:
+        """Run public-issue checks + drift, persist, and log."""
+        checks = check_public_issues(issues)
+        checks.append(self._drift_check(len(issues)))
         self._persist(checks)
         return checks
 

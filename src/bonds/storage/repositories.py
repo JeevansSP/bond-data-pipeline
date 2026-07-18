@@ -13,10 +13,11 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from bonds.models import SecurityRecord, SovereignValuation
+from bonds.models import PublicIssueRecord, SecurityRecord, SovereignValuation
 from bonds.storage.schema import (
     DataQualityCheck,
     IngestionRun,
+    PublicIssue,
     Security,
     SecurityAttributeHistory,
     Valuation,
@@ -265,6 +266,44 @@ class IngestionRunRepository:
             .order_by(IngestionRun.run_date.desc())
             .limit(1)
         ).scalar_one_or_none()
+
+
+class PublicIssueRepository:
+    """Persist SEBI public-issue records (idempotent per company + open date + source)."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def upsert_many(self, issues: list[PublicIssueRecord]) -> int:
+        """Insert or refresh a batch of public issues. Returns rows written."""
+        if not issues:
+            return 0
+        rows = [
+            {
+                "company": i.company,
+                "issue_open": i.issue_open,
+                "source": i.source,
+                "issue_close": i.issue_close,
+                "base_size_cr": i.base_size_cr,
+                "final_size_cr": i.final_size_cr,
+                "financial_year": i.financial_year,
+            }
+            for i in issues
+        ]
+        rows = list({(r["company"], r["issue_open"], r["source"]): r for r in rows}.values())
+        for chunk in _chunks(rows):
+            stmt = pg_insert(PublicIssue).values(list(chunk))
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["company", "issue_open", "source"],
+                set_={
+                    "issue_close": stmt.excluded.issue_close,
+                    "base_size_cr": stmt.excluded.base_size_cr,
+                    "final_size_cr": stmt.excluded.final_size_cr,
+                    "financial_year": stmt.excluded.financial_year,
+                },
+            )
+            self._session.execute(stmt)
+        return len(rows)
 
 
 class DataQualityRepository:

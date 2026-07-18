@@ -42,6 +42,20 @@ class SovereignValuation(BaseModel):
     ytm: float | None = None
 
 
+class PublicIssueRecord(BaseModel):
+    """A corporate-bond public issue (SEBI primary-market calendar; not per-ISIN)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    company: str
+    issue_open: dt.date
+    source: str
+    issue_close: dt.date | None = None
+    base_size_cr: float | None = None
+    final_size_cr: float | None = None
+    financial_year: str | None = None
+
+
 class SecurityRecord(BaseModel):
     """A universe security's identifying + reference attributes for upsert (pillar 1)."""
 

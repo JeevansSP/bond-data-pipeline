@@ -8,11 +8,11 @@ Implemented:
     fbil        Sovereign valuation price/yield (G-Sec, SDL, STRIPS, ZCYC) — the price engine.
     bondcentral Corporate securities-master universe (~25.5k ISINs) + credit rating.
     cdsl        Corporate issued/outstanding half-yearly snapshots.
+    sebi        Corporate-bond public-issue calendar (primary market).
 
 Planned (typed stubs — see each module's docstring for the documented endpoints):
     nse         Exchange corporate-bond trade feed.
     ccil        G-Sec / NDS-OM secondary trades & settlement.
-    sebi        NCD public-issue calendar.
     rbi         Sovereign primary-issuance auctions.
 """
 

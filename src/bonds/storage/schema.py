@@ -150,6 +150,25 @@ class IngestionRun(Base):
     finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class PublicIssue(Base):
+    """A corporate-bond public issue (SEBI primary-market calendar)."""
+
+    __tablename__ = "public_issues"
+    __table_args__ = (UniqueConstraint("company", "issue_open", "source", name="uq_public_issue"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    company: Mapped[str] = mapped_column(Text, index=True)
+    issue_open: Mapped[dt.date] = mapped_column(Date, index=True)
+    issue_close: Mapped[dt.date | None] = mapped_column(Date)
+    base_size_cr: Mapped[float | None] = mapped_column(Float)
+    final_size_cr: Mapped[float | None] = mapped_column(Float)
+    financial_year: Mapped[str | None] = mapped_column(String(9), index=True)
+    source: Mapped[str] = mapped_column(String(32))
+    loaded_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class DataQualityCheck(Base):
     """Result of one data-quality assertion for a dataset + business date.
 
