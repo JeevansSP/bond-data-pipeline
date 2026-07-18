@@ -1,0 +1,124 @@
+```
+Exploratory findings on bondcentral.in (OBPP Association) — its public FastAPI backend, the Indian bond securities-master universe (~25.5k ISINs), the /securities/ filter API, and the NSE/BSE per-bond link bridge into exchange trade/quote data.
+
+2026-07-18_112508 IST : Initial writeup — API surface, universe scale, filter reality-check, per-security schema, bulk-pull recipe.
+2026-07-18_112508 IST : Added NSE/BSE bridge section — /generate-bse-url ISIN→scrip_code resolver + live BSE market-data API path; NSE link is issuer-filings-only.
+```
+
+# BondCentral (bondcentral.in) — Exploratory Scraping Findings
+
+_Explored 2026-07-18. Site is a React SPA fronting a public FastAPI backend._
+
+## What this site is
+**Bond Central** is the public bond database of the **OBPP Association** (Online Bond Platform
+Providers, an SEBI-recognized industry body — obppindia.com). It is a **securities master /
+reference database** for Indian debt securities. It is **NOT a trading or transaction feed** —
+there are no prices, volumes, trades, or order books here. For actual trades it just deep-links
+out to NSE / BSE pages.
+
+- Frontend: `https://bondcentral.in` (SPA, no SSR — plain `curl`/WebFetch only gets an empty
+  "OBPP Association" shell; must render JS or hit the API directly).
+- Backend API: `https://api.bondcentral.in` — **FastAPI, open CORS (`*`), no auth required**
+  on read endpoints. This is the real data source.
+
+## Scale
+- Search universe: **25,501 securities** (`total_records`).
+- Curated/headline stats (`/statistics/`, "as of Jan 2026", sourced from NSE, BSE, NSDL, CDSL, CCIL):
+  - total_issuers: 707
+  - total_isins: 6,900
+  - listed_issuers: 347 / listed_isins: 1,483
+  - total_value_listed_corporate: 4,284,283 (₹ cr) ; total_value_listed_bonds: 644,122 (₹ cr)
+
+## API surface (from `/openapi.json`)
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/securities/` | **Main endpoint.** List + filter the universe. Params below. |
+| GET | `/statistics/` | Headline counts (above). |
+| GET | `/issuer/search?query=` | Issuer-name autocomplete → array of matching names. |
+| GET | `/gsec-rates/?start_date&end_date&order_dir` | G-Sec rate history — **returned empty** in testing; G-Sec yields on the site are actually served from static CSVs (see below). |
+| GET | `/generate-nse-url/?isin_number&issuer_name` | Builds a deep link to NSE debt filings. |
+| GET | `/generate-bse-url/?isin_number` | ISIN → BSE scrip-code resolver (see NSE/BSE bridge). |
+| GET | `/securities/get-signed-urls/?isin` | Signed URLs (offer docs); 404s when no docs for ISIN. |
+| GET | `/securities/link/?isin` | 404'd in testing. |
+| POST | `/login/` | Auth (not needed for read access). |
+| PUT | `/statistics/update/` | Admin, needs `authorization`. |
+
+Static G-Sec yield data (loaded by the details page, not the API):
+`https://bondcentral.in/data/India {3,5,10}-Year Bond Yield Historical Data.csv`
+
+## `/securities/` — parameters & what ACTUALLY works
+Endpoint: `GET https://api.bondcentral.in/securities/?page=1&size=100&<filters>`
+- `page` (1-based), `size` (**max 100**, enforced — >100 returns HTTP 422).
+- Pagination info returned as `pagination_info{current_page,page_size,total_records,total_pages,has_next,has_previous}`.
+
+Filters exposed in the UI: `isin`, `issuer`, `coupon_rate`, `credit_rating`, `instrument_type`,
+`residual_maturity`, `secured_unsecured`.
+
+**Reality check — backend implementation is partial/buggy:**
+| Filter | Works server-side? | Evidence |
+|---|---|---|
+| `isin` | ✅ exact match | `isin=INE002A07809` → 1 |
+| `issuer` | ✅ substring | `issuer=RELIANCE` → 396 |
+| `credit_rating` | ✅ exact | AAA→2978, AA→964, AA+→778, BBB→348, A→203 |
+| `secured_unsecured` | ✅ | `Secured` → 16,789 |
+| `coupon_rate` | ❌ ignored | every value returns full 25,501 |
+| `residual_maturity` | ❌ ignored | every value returns full 25,501 |
+| `instrument_type` | ⚠️ applied but matches nothing | any value → `{"detail":"No securities found"}` |
+
+UI dropdown values (from JS bundle, for reference even though several are no-ops):
+- coupon_rate: `upto 7%`, `7-9%`, `9-11%`, `11-14%`, `14% & above`
+- credit_rating: `AAA`, `AA+`, `AA`, `AA-`, `A+`, `BBB+`, `BBB`, `BBB-`, `BB+ & below (non investment grade)`
+- instrument_type: `Bonds Secured`, `Bonds Unsecured`
+- residual_maturity: `0-1 Year`, `1-3 Years`, `3-5 Years`, `>5 Years`
+
+## Per-security record schema
+Same nested shape from both list and detail (`/securities/?isin=...`): `{isin, data:{...}}`.
+Key fields (≈60 total): `issuer`, `security_name`, `isin_description`, `security_class`
+(e.g. Debentures), `coupon_rate`, `coupon_type`, `interest_type` (Fixed/Zero), `frequency`,
+`face_value`, `issue_price`, `maturity_date`, `allotment_date`, `secured_unsecured`,
+`security_status` (ACTIVE), `mode_of_issue` (Private Placement), `issuer_ownership_type`
+(PSU/Non PSU), `issue_size_in_crores`, `total_allotment_quantity`, `registrar_details`,
+`debenture_trustee_name` / `trusteeship_details`, `coupon_payment_dates`,
+`first_interest_payment_date`, `interest_rate_up_to`, `tenure_..._at_the_time_of_issuance` (days),
+call/put descriptions, perpetual flag, `stock_exchanges[]` (listing_status per exchange),
+and `ratings[]` (`cra_rating`, `credit_rating_agency_name`, `date_of_credit_rating`,
+`ratings_outlook`, `ratings_watch`). Many fields are `"Not Applicable"`/`null` — data completeness is uneven.
+
+## Bulk-pull recipe (full universe)
+```
+for page in 1..256:   # ceil(25501/100)
+    GET https://api.bondcentral.in/securities/?page={page}&size=100
+    (header Origin: https://bondcentral.in ; no auth)
+```
+≈256 requests for the whole securities master. Be polite (throttle); backend is a single
+nginx/Ubuntu box.
+
+## NSE / BSE bridge (per-bond detail page links)
+Each detail page renders an **NSE** and a **BSE** link. They are NOT equivalent:
+
+- **BSE (valuable): `/generate-bse-url/?isin_number=<ISIN>` is a hidden ISIN → BSE scrip-code
+  resolver.** Returns `{isin, scrip_code, bse_url}`, e.g. `INE002A08534` → `958311`. The scrip
+  code is a server-side mapping (not in the securities payload) and 404s for unlisted bonds.
+  That scrip code unlocks BSE's own market-data API (fetchable with a browser UA +
+  `Referer: https://www.bseindia.com/`):
+  - `https://api.bseindia.com/BseIndiaAPI/api/getScripHeaderData/w?Debtflag=D&scripcode=<SC>&seriesid=`
+    → live quote block: LTP, PrevClose, Open/High/Low, %chg (often blank = illiquid, but endpoint works).
+  - `https://api.bseindia.com/BseIndiaAPI/api/ComHeadernew/w?quotetype=ON&scripcode=<SC>&seriesid=`
+    → security master: SecurityId (e.g. 905RIL28), FaceVal, ISIN, SetlType (T+1), sector/group (F=debt).
+  - Pipeline: `ISIN → generate-bse-url → scrip_code → BSE api.bseindia.com → quotes/trades`.
+- **NSE (dead end for trades): `/generate-nse-url/?isin_number&issuer_name`** just string-builds
+  `nseindia.com/market-data/debt-private-placement/corporate-filings?company_name=<issuer>`.
+  Issuer-level, keyed by name → disclosure filings only. No ISIN/symbol resolution, no trade data.
+  For NSE trades, go direct to NSE's debt market-data APIs (need session cookies / Akamai handling).
+
+Caveat: most of the 25.5k universe is illiquid, so per-ISIN BSE quotes are frequently empty.
+Real transaction volume lives in exchange-level trade reports (BSE/NSE debt) and CCIL/NDS-OM (G-Secs).
+
+## Key takeaways for the research
+1. This is a clean, **auth-free securities-master source** for Indian bonds/debentures — good for
+   the "universe" side of the research (~25.5k ISINs, ~700 issuers).
+2. It has **no trade/transaction/price data** — for those you need NSE/BSE/CCIL/NSDL directly
+   (BondCentral only links out; BSE is reachable via the scrip-code bridge above).
+3. Data is issuance/reference-grade and partially incomplete; ratings often blank.
+4. Only 4 of the 7 filters work server-side — filter client-side after bulk pull if you need
+   coupon/maturity slicing.
