@@ -33,8 +33,8 @@ def _find(checks: list[QualityCheck], name: str) -> QualityCheck:
     return next(c for c in checks if c.name == name)
 
 
-def _trade(isin: str, segment: str, ltp: float) -> TradeRecord:
-    return TradeRecord(isin=isin, trade_date=DATE, source="ccil", segment=segment, ltp=ltp)
+def _trade(isin: str, segment: str, ltp: float, lty: float | None = None) -> TradeRecord:
+    return TradeRecord(isin=isin, trade_date=DATE, source="ccil", segment=segment, ltp=ltp, lty=lty)
 
 
 def test_check_trades_price_band_scoped_to_par_priced_segments() -> None:
@@ -49,6 +49,17 @@ def test_check_trades_price_band_scoped_to_par_priced_segments() -> None:
     oob = _find(check_trades(trades), "ltp_out_of_range")
     assert oob.observed == 1.0  # only the bad GSEC
     assert not oob.passed
+
+
+def test_check_trades_flags_implausible_yield_but_not_sgb() -> None:
+    # A transposed-column STRIP shows a >25% "yield"; an SGB's non-standard yield must be ignored.
+    trades = [
+        _trade("IN0020260025", "GSEC", 101.0, lty=6.9),  # normal
+        _trade("IN000923C044", "STRIPS", 99.5, lty=99.595),  # swapped price/yield -> flag
+        _trade("IN0020170034", "SGB", 9500.0, lty=33.0),  # SGB yield meaningless -> ignore
+    ]
+    oob = _find(check_trades(trades), "lty_out_of_range")
+    assert oob.observed == 1.0 and not oob.passed
 
 
 def test_check_trades_empty_is_info_row_count() -> None:

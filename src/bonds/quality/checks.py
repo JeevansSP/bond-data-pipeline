@@ -178,6 +178,11 @@ def check_trades(trades: list[TradeRecord]) -> list[QualityCheck]:
     # segments only.
     par_priced = [t for t in trades if t.segment in _PAR_PRICED_SEGMENTS]
     px_oob = sum(1 for t in par_priced if t.ltp is not None and not PRICE_MIN <= t.ltp <= PRICE_MAX)
+    # Yields are a plausibility check across every YTM-bearing segment (SGB excluded — its "yield"
+    # isn't a standard YTM). An implausible yield most often means CCIL transposed the price/yield
+    # columns for that row (seen on some STRIPS sessions); flag it rather than silently trust it.
+    ytm_bearing = [t for t in trades if t.segment != "SGB"]
+    yld_oob = sum(1 for t in ytm_bearing if t.lty is not None and not YTM_MIN <= t.lty <= YTM_MAX)
     checks += [
         QualityCheck(
             "invalid_isin", Level.ERROR, passed=invalid_isin == 0, observed=float(invalid_isin)
@@ -188,6 +193,13 @@ def check_trades(trades: list[TradeRecord]) -> list[QualityCheck]:
             passed=px_oob == 0,
             observed=float(px_oob),
             detail=f"outside [{PRICE_MIN}, {PRICE_MAX}] among {len(par_priced)} par-priced trades",
+        ),
+        QualityCheck(
+            "lty_out_of_range",
+            Level.WARN,
+            passed=yld_oob == 0,
+            observed=float(yld_oob),
+            detail=f"outside [{YTM_MIN}, {YTM_MAX}] among {len(ytm_bearing)} YTM-bearing trades",
         ),
     ]
     return checks
