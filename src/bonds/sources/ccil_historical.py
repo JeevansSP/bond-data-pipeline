@@ -299,7 +299,9 @@ _ZERO_COUPON_SEGMENTS: Final = frozenset({"TBILL", "STRIPS"})
 _LEAD_COUPON_RE: Final = re.compile(r"^\s*(\d{1,2}\.\d{1,3})\b")
 _SLASH_DATE_RE: Final = re.compile(r"\b(\d{2})/(\d{2})/(\d{4})\b")  # DD/MM/YYYY
 _COMPACT_DATE_RE: Final = re.compile(r"\b(\d{2})(\d{2})(\d{4})\b")  # DDMMYYYY, e.g. DTB 15012027
-_DMMMY_RE: Final = re.compile(r"\b(\d{2})([A-Z]{3})(\d{4})")  # DDMMMYYYY, e.g. 12DEC2041
+# DDMMMYYYY, e.g. "12DEC2041" — no leading \b so it also matches the glued "GS02JAN2011C" /
+# "GS15JUN2049P" strip spellings (a \b fails between the S and the digit, both word chars).
+_DMMMY_RE: Final = re.compile(r"(\d{2})([A-Z]{3})(\d{4})")
 _MONTHS: Final = {
     m: i
     for i, m in enumerate(
@@ -321,9 +323,9 @@ def _parse_maturity(desc: str | None, segment: str) -> dt.date | None:
     if segment == "TBILL":  # "091 DTB MATURING 07/06/2002" or "DTB 15012027"
         m = _SLASH_DATE_RE.search(up) or _COMPACT_DATE_RE.search(up)
         return _safe_date(int(m.group(3)), int(m.group(2)), int(m.group(1))) if m else None
-    m = _DMMMY_RE.search(up)  # STRIPS / dated stock: "12DEC2041"
-    if m and m.group(2) in _MONTHS:
-        return _safe_date(int(m.group(3)), _MONTHS[m.group(2)], int(m.group(1)))
+    for m in _DMMMY_RE.finditer(up):  # STRIPS / dated stock: "12DEC2041"; first valid-month wins
+        if m.group(2) in _MONTHS:
+            return _safe_date(int(m.group(3)), _MONTHS[m.group(2)], int(m.group(1)))
     return None  # G-Sec/SDL/SGB carry only a maturity year in the feed -> left unknown
 
 

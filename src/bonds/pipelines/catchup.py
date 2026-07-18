@@ -65,7 +65,19 @@ def series_start(database: Database, source: str, *, as_of: dt.date, max_gap_day
     """First business day to (re)ingest for a date-series ``source`` (see :func:`bounded_start`)."""
     with database.session() as session:
         anchor = IngestionRunRepository(session).last_processed_date(source)
-    return bounded_start(anchor, as_of=as_of, max_gap_days=max_gap_days)
+    start = bounded_start(anchor, as_of=as_of, max_gap_days=max_gap_days)
+    if anchor is not None and anchor + dt.timedelta(days=1) < start:
+        # The gap exceeds max_gap_days; days between the anchor and the floor won't be caught up
+        # and will be recorded as processed, so surface it — the operator must run an explicit
+        # backfill for [anchor+1, start) or those days are lost.
+        logger.warning(
+            "catchup.gap_exceeds_cap",
+            source=source,
+            last_processed=anchor.isoformat(),
+            resume_from=start.isoformat(),
+            skipped_days=(start - anchor).days - 1,
+        )
+    return start
 
 
 def catch_up(

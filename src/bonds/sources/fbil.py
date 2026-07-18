@@ -15,13 +15,14 @@ from __future__ import annotations
 
 import datetime as dt
 import io
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import Final
 from zipfile import BadZipFile
 
 import httpx
 import openpyxl
+from openpyxl.utils.exceptions import InvalidFileException
 
 from bonds.config import Settings, get_settings
 from bonds.http import ThrottledClient
@@ -128,13 +129,12 @@ class FbilSource(MetricsCollector):
         """
         try:
             workbook = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
-        except BadZipFile as exc:
+        except (BadZipFile, InvalidFileException) as exc:
             raise DataUnavailable(
                 f"FBIL {instrument.value} returned a non-xlsx body for {date}"
             ) from exc
         try:
-            rows: Iterable[Sequence[object]] = workbook.active.iter_rows(values_only=True)
-            header_index, headers = _find_header(rows)
+            rows, header_index, headers = _find_data_sheet(workbook)
             columns = _column_map(headers)
             records: list[SovereignValuation] = []
             seen = 0
@@ -164,7 +164,27 @@ def _find_header(rows: Iterable[Sequence[object]]) -> tuple[int, Sequence[object
         first = row[0] if row else None
         if isinstance(first, str) and first.strip().upper() == "ISIN":
             return index, row
-    raise SourceError("could not locate an 'ISIN' header row in FBIL workbook")
+    raise SourceError("could not locate an 'ISIN' header row in FBIL worksheet")
+
+
+def _find_data_sheet(
+    workbook: openpyxl.workbook.Workbook,
+) -> tuple[Iterator[Sequence[object]], int, Sequence[object]]:
+    """Find the first worksheet with an ISIN header.
+
+    Returns its row iterator (positioned just after the header), the header index and the header
+    row. FBIL occasionally saves the workbook with a non-data sheet active (e.g. the "Note on FRB
+    & IIB" tab) while the real data sheet sits alongside, so we search all sheets rather than trust
+    ``workbook.active`` — otherwise a valid data day is wrongly rejected as headerless.
+    """
+    for worksheet in workbook.worksheets:
+        rows: Iterator[Sequence[object]] = worksheet.iter_rows(values_only=True)
+        try:
+            index, headers = _find_header(rows)
+        except SourceError:
+            continue  # this sheet isn't the data sheet; try the next
+        return rows, index, headers
+    raise SourceError("could not locate an 'ISIN' header row in any FBIL worksheet")
 
 
 def _column_map(headers: Sequence[object]) -> dict[str, int]:

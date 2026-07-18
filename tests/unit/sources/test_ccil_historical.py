@@ -192,6 +192,19 @@ def test_derive_security_strip_and_gsec_coupon() -> None:
     assert strip.instrument_type is InstrumentType.STRIPS
     assert strip.coupon == 0.0 and strip.maturity_date == dt.date(2041, 12, 12)
 
+
+@pytest.mark.parametrize(
+    ("desc", "maturity"),
+    [
+        ("GS02JAN2011C", dt.date(2011, 1, 2)),  # date glued to "GS" (no space/boundary)
+        ("07.72 GOVT. STOCK GS15JUN2049P", dt.date(2049, 6, 15)),
+        ("GOVT. STOCK 12DEC2041C", dt.date(2041, 12, 12)),  # spaced form still works
+    ],
+)
+def test_derive_security_strip_maturity_glued_and_spaced(desc: str, maturity: dt.date) -> None:
+    sec = derive_security("IN000111C012", desc, "STRIPS")
+    assert sec is not None and sec.maturity_date == maturity
+
     gsec = derive_security("IN0020260025", "06.94 GOVT. STOCK 2036", "GSEC")
     assert gsec is not None
     assert gsec.coupon == pytest.approx(6.94)

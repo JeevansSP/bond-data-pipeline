@@ -59,6 +59,28 @@ def test_parse_raises_without_header(tmp_path: Path) -> None:
         _source(tmp_path).parse(buf.getvalue(), date=DATE, instrument=InstrumentType.GSEC)
 
 
+def test_parse_finds_data_sheet_when_not_active(tmp_path: Path) -> None:
+    # FBIL sometimes saves the file with a non-data tab (e.g. "Note on FRB & IIB") active while the
+    # real G-Sec sheet sits alongside; parse must search all sheets, not trust workbook.active.
+    import io
+
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    data = wb.active
+    data.title = "G-Sec"
+    data.append(["ISIN", "Coupon", "Maturity(dd-mmm-yyyy)", "Price(Rs)", "YTM% p.a. (Semi-Annual)"])
+    data.append(["IN0020160035", 6.97, dt.datetime(2026, 9, 6), 100.24, 5.27])
+    note = wb.create_sheet("Note on FRB & IIB")
+    note.append([None, "Note on FRB & IIB", "23-Feb-2023"])
+    wb.active = wb.sheetnames.index("Note on FRB & IIB")  # non-data sheet is active
+    buf = io.BytesIO()
+    wb.save(buf)
+
+    records = _source(tmp_path).parse(buf.getvalue(), date=DATE, instrument=InstrumentType.GSEC)
+    assert [r.isin for r in records] == ["IN0020160035"]
+
+
 def test_parse_non_xlsx_body_is_data_unavailable(tmp_path: Path) -> None:
     # FBIL serves an HTML page (HTTP 200) for dates outside its published range; that must be
     # treated as no-data (SKIPPED), not crash a backfill with BadZipFile.
