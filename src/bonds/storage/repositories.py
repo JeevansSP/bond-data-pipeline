@@ -57,6 +57,8 @@ class ValuationRepository:
             }
             for v in valuations
         ]
+        # A single INSERT ... ON CONFLICT cannot touch the same key twice; dedupe (last wins).
+        rows = list({(r["isin"], r["quote_date"], r["source"]): r for r in rows}.values())
         for chunk in _chunks(rows):
             stmt = pg_insert(Valuation).values(list(chunk))
             stmt = stmt.on_conflict_do_update(
@@ -100,6 +102,8 @@ class SecurityRepository:
             }
             for r in records
         ]
+        # A single INSERT ... ON CONFLICT cannot touch the same ISIN twice; dedupe (last wins).
+        rows = list({r["isin"]: r for r in rows}.values())
         for chunk in _chunks(rows):
             stmt = pg_insert(Security).values(list(chunk))
             stmt = stmt.on_conflict_do_update(

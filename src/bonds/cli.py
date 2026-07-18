@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 from collections import Counter
+from enum import StrEnum
 from typing import Annotated
 
 import typer
@@ -17,6 +18,9 @@ from bonds.pipelines import (
     SovereignValuationPipeline,
     UniversePipeline,
 )
+from bonds.pipelines.universe import UniverseFetcher
+from bonds.sources.bondcentral import BondCentralSource
+from bonds.sources.cdsl import CdslSource
 from bonds.storage import Database
 
 app = typer.Typer(add_completion=False, help="Indian bond market data pipelines.")
@@ -59,22 +63,39 @@ def _summarise(results: list[PipelineResult], *, label: str) -> None:
         raise typer.Exit(code=1)
 
 
+class UniverseSource(StrEnum):
+    """Selectable universe source connectors."""
+
+    bondcentral = "bondcentral"
+    cdsl = "cdsl"
+
+
 @ingest_app.command("universe")
 def ingest_universe(
+    source: Annotated[
+        UniverseSource,
+        typer.Option(help="Universe source connector."),
+    ] = UniverseSource.bondcentral,
     as_of: Annotated[
         dt.datetime | None,
-        typer.Option(formats=["%Y-%m-%d"], help="Snapshot date (default: today)."),
+        typer.Option(
+            formats=["%Y-%m-%d"],
+            help="Snapshot date. BondCentral: default today. CDSL: a 31-Mar/30-Sep report date.",
+        ),
     ] = None,
     max_pages: Annotated[
         int | None,
-        typer.Option(help="Cap pages fetched (smoke run; omit for the full universe)."),
+        typer.Option(help="Cap pages fetched (BondCentral smoke run; ignored for CDSL)."),
     ] = None,
 ) -> None:
-    """Upsert the corporate securities-master universe (BondCentral) + rating history."""
+    """Upsert a securities-master universe + attribute history (BondCentral or CDSL)."""
     _init_logging()
     day = (as_of or dt.datetime.now(dt.UTC)).date()
-    result = UniversePipeline(Database()).run(day, max_pages=max_pages)
-    _summarise([result], label=f"universe {day.isoformat()}")
+    connector: UniverseFetcher = (
+        CdslSource() if source is UniverseSource.cdsl else BondCentralSource()
+    )
+    result = UniversePipeline(Database(), source=connector).run(day, max_pages=max_pages)
+    _summarise([result], label=f"universe[{source.value}] {day.isoformat()}")
 
 
 @ingest_app.command("sovereign-valuation")

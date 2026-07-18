@@ -40,7 +40,10 @@ DEFAULT_PRODUCTS: tuple[str, ...] = ("gsec", "sdl")
 class ValuationFetcher(Protocol):
     """The slice of a source connector this pipeline depends on."""
 
-    name: str
+    @property
+    def name(self) -> str:
+        """Stable source identifier (read-only; connectors declare it ``Final``)."""
+        ...
 
     def fetch_valuations(self, product: str, date: dt.date) -> list[SovereignValuation]:
         """Download + parse one product/date into valuation records."""

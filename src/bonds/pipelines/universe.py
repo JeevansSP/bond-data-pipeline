@@ -29,18 +29,26 @@ logger = get_logger(__name__)
 # Attributes surfaced by connectors that we track over time (SCD-2). Only non-null values are
 # recorded, so day-1 does not flood the table with "unrated" rows.
 TRACKED_ATTRIBUTES: tuple[str, ...] = (
+    # BondCentral
     "credit_rating",
     "credit_rating_agency",
     "credit_rating_date",
     "security_status",
     "secured_unsecured",
+    # CDSL (change over time / per snapshot)
+    "amount_outstanding_cr",
+    "amount_issued_cr",
+    "payment_frequency",
 )
 
 
 class UniverseFetcher(Protocol):
     """The slice of a source connector this pipeline depends on."""
 
-    name: str
+    @property
+    def name(self) -> str:
+        """Stable source identifier (read-only; connectors declare it ``Final``)."""
+        ...
 
     def iter_records(
         self, as_of: dt.date, *, size: int = ..., max_pages: int | None = ...
