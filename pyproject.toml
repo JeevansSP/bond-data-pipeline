@@ -16,6 +16,7 @@ dependencies = [
     "openpyxl>=3.1",
     "lxml>=5.3",
     "typer>=0.12",
+    "rich>=13.7",
     "structlog>=24.4",
 ]
 

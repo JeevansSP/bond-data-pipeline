@@ -8,6 +8,16 @@ from enum import StrEnum
 from typing import Annotated
 
 import typer
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
+from rich.table import Table
 
 from bonds import __version__
 from bonds.config import get_settings
@@ -21,6 +31,7 @@ from bonds.pipelines import (
     TradePipeline,
     UniversePipeline,
 )
+from bonds.pipelines.suite import StepOutcome, default_suite, summarize
 from bonds.pipelines.universe import UniverseFetcher
 from bonds.sources.bondcentral import BondCentralSource
 from bonds.sources.ccil import CcilSource
@@ -65,6 +76,75 @@ def _summarise(results: list[PipelineResult], *, label: str) -> None:
         f"{counts.get(RunStatus.FAILED, 0)} failed, {total_rows} rows"
     )
     if counts.get(RunStatus.FAILED, 0):
+        raise typer.Exit(code=1)
+
+
+def _status_text(o: StepOutcome) -> str:
+    if o.has_failure:
+        return f"[bold red]✗ {o.failed} failed[/] · {o.rows} rows"
+    if o.skipped and not o.ok:
+        return f"[yellow]⊘ skipped[/] · {o.rows} rows"
+    return f"[bold green]✓ {o.ok} ok[/] · {o.rows} rows"
+
+
+def _print_summary(console: Console, day: dt.date, outcomes: dict[str, StepOutcome]) -> None:
+    table = Table(title=f"Ingest summary · {day.isoformat()}", title_style="bold")
+    table.add_column("Stage")
+    table.add_column("Result")
+    table.add_column("Rows", justify="right")
+    for label, o in outcomes.items():
+        table.add_row(label, _status_text(o), f"{o.rows:,}")
+    total_rows = sum(o.rows for o in outcomes.values())
+    failed = sum(o.failed for o in outcomes.values())
+    table.add_section()
+    verdict = "[bold red]FAILURES[/]" if failed else "[bold green]all clean[/]"
+    table.add_row("[bold]Total", verdict, f"[bold]{total_rows:,}")
+    console.print(table)
+
+
+@ingest_app.command("all")
+def ingest_all(
+    as_of: Annotated[
+        dt.datetime | None,
+        typer.Option(formats=["%Y-%m-%d"], help="Business date (default: today)."),
+    ] = None,
+    max_universe_pages: Annotated[
+        int | None,
+        typer.Option(help="Cap BondCentral universe pages (smoke run; omit for full)."),
+    ] = None,
+) -> None:
+    """Run the full daily ingest suite (all sources) with a live progress TUI."""
+    # Quiet logs so structlog output doesn't garble the live display.
+    configure_logging(level="WARNING", json=get_settings().log_json)
+    day = (as_of or dt.datetime.now(dt.UTC)).date()
+    console = Console()
+    steps = default_suite(Database(), day, max_universe_pages=max_universe_pages)
+    outcomes: dict[str, StepOutcome] = {}
+
+    console.rule(f"[bold]Indian bond pipeline · {day.isoformat()}")
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold]{task.description}"),
+        BarColumn(bar_width=None),
+        MofNCompleteColumn(),
+        TextColumn("{task.fields[status]}"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task_ids = {
+            s.label: progress.add_task(s.label, total=1, start=False, status="[dim]pending")
+            for s in steps
+        }
+        for step in steps:
+            tid = task_ids[step.label]
+            progress.start_task(tid)
+            progress.update(tid, status="[yellow]running…")
+            outcome = summarize(step.run())
+            outcomes[step.label] = outcome
+            progress.update(tid, completed=1, status=_status_text(outcome))
+
+    _print_summary(console, day, outcomes)
+    if any(o.has_failure for o in outcomes.values()):
         raise typer.Exit(code=1)
 
 

@@ -50,6 +50,10 @@ npm install                              # install husky hooks (Node used ONLY f
 docker compose up -d postgres            # start Postgres (volume under ./data/postgres)
 uv run alembic upgrade head              # apply schema
 
+# run the WHOLE daily suite (all sources) with a live rich progress TUI
+uv run bonds ingest all                          # full run
+uv run bonds ingest all --max-universe-pages 3   # smoke run
+
 # upsert the corporate securities-master universe (BondCentral) + rating history
 uv run bonds ingest universe                     # full (~25.5k ISINs, ~256 pages)
 uv run bonds ingest universe --max-pages 3       # smoke run (300 bonds)
