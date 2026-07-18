@@ -15,6 +15,7 @@ from bonds.models import (
     RbiAuctionRecord,
     SecurityRecord,
     SovereignValuation,
+    TradeRecord,
 )
 from bonds.quality.isin import is_valid_isin
 
@@ -154,6 +155,31 @@ def check_public_issues(issues: list[PublicIssueRecord]) -> list[QualityCheck]:
             Level.WARN,
             passed=True,
             observed=_rate(null_final, total),
+        ),
+    ]
+    return checks
+
+
+def check_trades(trades: list[TradeRecord]) -> list[QualityCheck]:
+    """Quality checks for a trade batch. Zero rows is INFO (markets close/holidays)."""
+    total = len(trades)
+    checks: list[QualityCheck] = [
+        QualityCheck("row_count", Level.INFO, passed=True, observed=float(total)),
+    ]
+    if total == 0:
+        return checks
+    invalid_isin = sum(1 for t in trades if not is_valid_isin(t.isin))
+    px_oob = sum(1 for t in trades if t.ltp is not None and not PRICE_MIN <= t.ltp <= PRICE_MAX)
+    checks += [
+        QualityCheck(
+            "invalid_isin", Level.ERROR, passed=invalid_isin == 0, observed=float(invalid_isin)
+        ),
+        QualityCheck(
+            "ltp_out_of_range",
+            Level.WARN,
+            passed=px_oob == 0,
+            observed=float(px_oob),
+            detail=f"outside [{PRICE_MIN}, {PRICE_MAX}]",
         ),
     ]
     return checks

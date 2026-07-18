@@ -6,6 +6,7 @@ from bonds.models.records import (
     RbiAuctionRecord,
     SecurityRecord,
     SovereignValuation,
+    TradeRecord,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "RbiAuctionRecord",
     "SecurityRecord",
     "SovereignValuation",
+    "TradeRecord",
 ]

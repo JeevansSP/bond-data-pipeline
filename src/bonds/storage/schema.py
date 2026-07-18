@@ -134,6 +134,28 @@ class Valuation(Base):
     )
 
 
+class Trade(Base):
+    """Per-ISIN secondary-market trade summary for one session (e.g. NSE corporate bonds)."""
+
+    __tablename__ = "trades"
+    __table_args__ = (CheckConstraint("ltp IS NULL OR ltp > 0", name="ck_trade_ltp_positive"),)
+
+    isin: Mapped[str] = mapped_column(String(12), primary_key=True)
+    trade_date: Mapped[dt.date] = mapped_column(Date, primary_key=True, index=True)
+    source: Mapped[str] = mapped_column(String(32), primary_key=True)
+    segment: Mapped[str] = mapped_column(String(24), primary_key=True)
+    descriptor: Mapped[str | None] = mapped_column(Text)
+    ltp: Mapped[float | None] = mapped_column(Float)
+    lty: Mapped[float | None] = mapped_column(Float)
+    no_of_trades: Mapped[int | None] = mapped_column(Integer)
+    trade_value: Mapped[float | None] = mapped_column(Float)
+    wap: Mapped[float | None] = mapped_column(Float)
+    way: Mapped[float | None] = mapped_column(Float)
+    loaded_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class IngestionRun(Base):
     """Audit record for a single pipeline execution against one dataset + business date."""
 

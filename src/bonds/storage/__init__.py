@@ -9,6 +9,7 @@ from bonds.storage.schema import (
     RbiAuction,
     Security,
     SecurityAttributeHistory,
+    Trade,
     Valuation,
 )
 
@@ -21,5 +22,6 @@ __all__ = [
     "RbiAuction",
     "Security",
     "SecurityAttributeHistory",
+    "Trade",
     "Valuation",
 ]

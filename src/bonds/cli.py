@@ -18,6 +18,7 @@ from bonds.pipelines import (
     RbiAuctionPipeline,
     RunStatus,
     SovereignValuationPipeline,
+    TradePipeline,
     UniversePipeline,
 )
 from bonds.pipelines.universe import UniverseFetcher
@@ -112,6 +113,20 @@ def ingest_public_issues(
     day = (as_of or dt.datetime.now(dt.UTC)).date()
     result = PublicIssuePipeline(Database()).run(day)
     _summarise([result], label=f"public-issues {day.isoformat()}")
+
+
+@ingest_app.command("nse-trades")
+def ingest_nse_trades(
+    as_of: Annotated[
+        dt.datetime | None,
+        typer.Option(formats=["%Y-%m-%d"], help="Snapshot date (default: today)."),
+    ] = None,
+) -> None:
+    """Ingest NSE corporate-bond trades (latest session; forward capture)."""
+    _init_logging()
+    day = (as_of or dt.datetime.now(dt.UTC)).date()
+    result = TradePipeline(Database()).run(day)
+    _summarise([result], label=f"nse-trades {day.isoformat()}")
 
 
 @ingest_app.command("rbi-auctions")

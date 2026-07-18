@@ -18,6 +18,7 @@ from bonds.models import (
     RbiAuctionRecord,
     SecurityRecord,
     SovereignValuation,
+    TradeRecord,
 )
 from bonds.storage.schema import (
     DataQualityCheck,
@@ -26,6 +27,7 @@ from bonds.storage.schema import (
     RbiAuction,
     Security,
     SecurityAttributeHistory,
+    Trade,
     Valuation,
 )
 
@@ -306,6 +308,53 @@ class PublicIssueRepository:
                     "base_size_cr": stmt.excluded.base_size_cr,
                     "final_size_cr": stmt.excluded.final_size_cr,
                     "financial_year": stmt.excluded.financial_year,
+                },
+            )
+            self._session.execute(stmt)
+        return len(rows)
+
+
+class TradeRepository:
+    """Persist secondary-market trade summaries (idempotent per isin+date+source+segment)."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def upsert_many(self, trades: list[TradeRecord]) -> int:
+        """Insert or refresh a batch of trades. Returns rows written."""
+        if not trades:
+            return 0
+        rows = [
+            {
+                "isin": t.isin,
+                "trade_date": t.trade_date,
+                "source": t.source,
+                "segment": t.segment,
+                "descriptor": t.descriptor,
+                "ltp": t.ltp,
+                "lty": t.lty,
+                "no_of_trades": t.no_of_trades,
+                "trade_value": t.trade_value,
+                "wap": t.wap,
+                "way": t.way,
+            }
+            for t in trades
+        ]
+        rows = list(
+            {(r["isin"], r["trade_date"], r["source"], r["segment"]): r for r in rows}.values()
+        )
+        for chunk in _chunks(rows):
+            stmt = pg_insert(Trade).values(list(chunk))
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["isin", "trade_date", "source", "segment"],
+                set_={
+                    "descriptor": stmt.excluded.descriptor,
+                    "ltp": stmt.excluded.ltp,
+                    "lty": stmt.excluded.lty,
+                    "no_of_trades": stmt.excluded.no_of_trades,
+                    "trade_value": stmt.excluded.trade_value,
+                    "wap": stmt.excluded.wap,
+                    "way": stmt.excluded.way,
                 },
             )
             self._session.execute(stmt)

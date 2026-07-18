@@ -10,9 +10,9 @@ Implemented:
     cdsl        Corporate issued/outstanding half-yearly snapshots.
     sebi        Corporate-bond public-issue calendar (primary market).
     rbi         Sovereign auction calendar (announcements + dates + links).
+    nse         Exchange corporate-bond trade feed (Akamai cookie-primed).
 
 Planned (typed stubs — see each module's docstring for the documented endpoints):
-    nse         Exchange corporate-bond trade feed.
     ccil        G-Sec / NDS-OM secondary trades & settlement.
 """
 

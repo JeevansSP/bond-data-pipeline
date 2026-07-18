@@ -12,12 +12,14 @@ from bonds.models import (
     RbiAuctionRecord,
     SecurityRecord,
     SovereignValuation,
+    TradeRecord,
 )
 from bonds.quality.checks import (
     Level,
     QualityCheck,
     check_public_issues,
     check_rbi_auctions,
+    check_trades,
     check_universe,
     check_valuations,
 )
@@ -75,6 +77,12 @@ class QualityInspector:
         """Run RBI auction checks + drift, persist, and log."""
         checks = check_rbi_auctions(auctions)
         checks.append(self._drift_check(len(auctions)))
+        self._persist(checks)
+        return checks
+
+    def inspect_trades(self, trades: list[TradeRecord]) -> list[QualityCheck]:
+        """Run trade checks (no drift — trade counts vary widely by session), persist, and log."""
+        checks = check_trades(trades)
         self._persist(checks)
         return checks
 

@@ -42,6 +42,28 @@ class SovereignValuation(BaseModel):
     ytm: float | None = None
 
 
+class TradeRecord(BaseModel):
+    """A per-ISIN secondary-market trade summary for one session (e.g. NSE corporate bonds)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    isin: str = Field(min_length=12, max_length=12)
+    trade_date: dt.date
+    source: str
+    segment: str
+    descriptor: str | None = None
+    ltp: float | None = None
+    """Last traded price."""
+    lty: float | None = None
+    """Last traded yield."""
+    no_of_trades: int | None = None
+    trade_value: float | None = None
+    wap: float | None = None
+    """Weighted-average price."""
+    way: float | None = None
+    """Weighted-average yield."""
+
+
 class RbiAuctionRecord(BaseModel):
     """An RBI sovereign auction announcement (calendar level; financials are a follow-up)."""
 
