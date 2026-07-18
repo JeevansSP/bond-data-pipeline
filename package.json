@@ -1,0 +1,23 @@
+{
+  "name": "bonds-pipeline-hooks",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Git hooks (husky + lint-staged) for the Python bonds pipeline. Node is used ONLY for hook orchestration; all real work runs via `uv run`.",
+  "scripts": {
+    "prepare": "husky",
+    "lint": "uv run ruff check .",
+    "format:check": "uv run ruff format --check .",
+    "typecheck": "uv run mypy",
+    "test": "uv run pytest"
+  },
+  "lint-staged": {
+    "*.py": [
+      "uv run ruff format",
+      "uv run ruff check --fix"
+    ]
+  },
+  "devDependencies": {
+    "husky": "^9.1.6",
+    "lint-staged": "^15.2.10"
+  }
+}

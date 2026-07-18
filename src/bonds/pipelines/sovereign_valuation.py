@@ -1,0 +1,116 @@
+"""Sovereign valuation pipeline (pillar 3): FBIL G-Sec/SDL daily price & YTM.
+
+For each product/date it:
+    1. downloads + parses the FBIL published workbook (raw file landed in the data lake),
+    2. upserts the valuations (price/YTM history),
+    3. upserts the securities it references into the universe (pillar 1 for sovereigns),
+    4. writes an ingestion audit row.
+
+Idempotent: re-running a date refreshes rather than duplicates. Missing days (HTTP 500) are
+recorded as ``skipped`` and never abort a backfill.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from collections.abc import Sequence
+from typing import Protocol
+
+from sqlalchemy.orm import Session
+
+from bonds.calendar import business_days
+from bonds.logging import get_logger
+from bonds.models import SecurityRecord, SovereignValuation
+from bonds.pipelines.base import PipelineResult, RunStatus
+from bonds.sources.base import DataUnavailable
+from bonds.sources.fbil import FbilSource
+from bonds.storage import Database
+from bonds.storage.repositories import (
+    IngestionRunRepository,
+    SecurityRepository,
+    ValuationRepository,
+)
+
+logger = get_logger(__name__)
+
+DEFAULT_PRODUCTS: tuple[str, ...] = ("gsec", "sdl")
+
+
+class ValuationFetcher(Protocol):
+    """The slice of a source connector this pipeline depends on."""
+
+    name: str
+
+    def fetch_valuations(self, product: str, date: dt.date) -> list[SovereignValuation]:
+        """Download + parse one product/date into valuation records."""
+        ...
+
+
+class SovereignValuationPipeline:
+    """Ingest FBIL sovereign valuations into ``valuations`` + ``securities``."""
+
+    def __init__(
+        self,
+        database: Database,
+        source: ValuationFetcher | None = None,
+        products: Sequence[str] = DEFAULT_PRODUCTS,
+    ) -> None:
+        self._db = database
+        self._source = source or FbilSource()
+        self._products = tuple(products)
+
+    def run_date(self, date: dt.date) -> list[PipelineResult]:
+        """Ingest every configured product for a single business date."""
+        return [self._run_product(product, date) for product in self._products]
+
+    def backfill(self, start: dt.date, end: dt.date) -> list[PipelineResult]:
+        """Ingest every configured product across ``[start, end]`` (weekdays only)."""
+        results: list[PipelineResult] = []
+        for day in business_days(start, end):
+            results.extend(self.run_date(day))
+        return results
+
+    # ------------------------------------------------------------------ internals
+    def _run_product(self, product: str, date: dt.date) -> PipelineResult:
+        dataset = f"{self._source.name}.{product}"
+        with self._db.session() as session:
+            runs = IngestionRunRepository(session)
+            run = runs.start(source=self._source.name, dataset=dataset, run_date=date)
+            try:
+                valuations = self._source.fetch_valuations(product, date)
+            except DataUnavailable as exc:
+                runs.finish(run, status=RunStatus.SKIPPED, message=str(exc))
+                logger.info("pipeline.skipped", dataset=dataset, date=date.isoformat())
+                return PipelineResult(date, dataset, RunStatus.SKIPPED, message=str(exc))
+            except Exception as exc:
+                runs.finish(run, status=RunStatus.FAILED, message=repr(exc))
+                logger.error(
+                    "pipeline.failed", dataset=dataset, date=date.isoformat(), error=repr(exc)
+                )
+                return PipelineResult(date, dataset, RunStatus.FAILED, message=repr(exc))
+
+            rows = self._persist(session, valuations, seen_on=date)
+            runs.finish(run, status=RunStatus.SUCCESS, rows=rows)
+            logger.info("pipeline.success", dataset=dataset, date=date.isoformat(), rows=rows)
+            return PipelineResult(date, dataset, RunStatus.SUCCESS, rows=rows)
+
+    @staticmethod
+    def _persist(
+        session: Session, valuations: list[SovereignValuation], *, seen_on: dt.date
+    ) -> int:
+        ValuationRepository(session).upsert_many(valuations)
+        securities = [_to_security(v) for v in valuations]
+        SecurityRepository(session).upsert_many(securities, seen_on=seen_on)
+        return len(valuations)
+
+
+def _to_security(v: SovereignValuation) -> SecurityRecord:
+    """Derive a universe :class:`SecurityRecord` from a valuation row."""
+    return SecurityRecord(
+        isin=v.isin,
+        instrument_type=v.instrument_type,
+        source=v.source,
+        description=v.description,
+        coupon=v.coupon,
+        maturity_date=v.maturity_date,
+    )

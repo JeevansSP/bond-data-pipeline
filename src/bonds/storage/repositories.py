@@ -1,0 +1,171 @@
+"""Repositories encapsulating all read/write access to the schema.
+
+Upserts use Postgres ``INSERT ... ON CONFLICT`` so pipelines are idempotent: re-running a
+date simply refreshes its rows rather than duplicating or erroring.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.orm import Session
+
+from bonds.models import SecurityRecord, SovereignValuation
+from bonds.storage.schema import (
+    IngestionRun,
+    Security,
+    SecurityAttributeHistory,
+    Valuation,
+)
+
+
+class ValuationRepository:
+    """Persist daily per-ISIN valuations (idempotent per ``(isin, quote_date, source)``)."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def upsert_many(self, valuations: list[SovereignValuation]) -> int:
+        """Insert or refresh a batch of valuations. Returns the number of rows written."""
+        if not valuations:
+            return 0
+        rows = [
+            {
+                "isin": v.isin,
+                "quote_date": v.quote_date,
+                "source": v.source,
+                "instrument_type": v.instrument_type.value,
+                "description": v.description,
+                "coupon": v.coupon,
+                "maturity_date": v.maturity_date,
+                "price": v.price,
+                "ytm": v.ytm,
+            }
+            for v in valuations
+        ]
+        stmt = pg_insert(Valuation).values(rows)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["isin", "quote_date", "source"],
+            set_={
+                "instrument_type": stmt.excluded.instrument_type,
+                "description": stmt.excluded.description,
+                "coupon": stmt.excluded.coupon,
+                "maturity_date": stmt.excluded.maturity_date,
+                "price": stmt.excluded.price,
+                "ytm": stmt.excluded.ytm,
+            },
+        )
+        self._session.execute(stmt)
+        return len(rows)
+
+
+class SecurityRepository:
+    """Upsert universe securities and maintain SCD-2 attribute history."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def upsert_many(self, records: list[SecurityRecord], *, seen_on: dt.date) -> int:
+        """Upsert securities, setting ``first_seen`` on insert and advancing ``last_seen``."""
+        if not records:
+            return 0
+        rows = [
+            {
+                "isin": r.isin,
+                "instrument_type": r.instrument_type.value,
+                "description": r.description,
+                "issuer": r.issuer,
+                "coupon": r.coupon,
+                "maturity_date": r.maturity_date,
+                "face_value": r.face_value,
+                "source": r.source,
+                "first_seen": seen_on,
+                "last_seen": seen_on,
+            }
+            for r in records
+        ]
+        stmt = pg_insert(Security).values(rows)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["isin"],
+            set_={
+                "instrument_type": stmt.excluded.instrument_type,
+                "description": stmt.excluded.description,
+                "issuer": stmt.excluded.issuer,
+                "coupon": stmt.excluded.coupon,
+                "maturity_date": stmt.excluded.maturity_date,
+                "face_value": stmt.excluded.face_value,
+                "source": stmt.excluded.source,
+                # first_seen is preserved (only set on insert); last_seen advances.
+                "last_seen": stmt.excluded.last_seen,
+            },
+        )
+        self._session.execute(stmt)
+        return len(rows)
+
+    def record_attribute(
+        self, isin: str, attribute: str, value: str | None, *, effective: dt.date, source: str
+    ) -> bool:
+        """Append an SCD-2 row iff ``value`` differs from the current one.
+
+        Returns:
+            ``True`` if a change was recorded, ``False`` if the value was unchanged.
+        """
+        current = self._session.execute(
+            select(SecurityAttributeHistory)
+            .where(
+                SecurityAttributeHistory.isin == isin,
+                SecurityAttributeHistory.attribute == attribute,
+                SecurityAttributeHistory.valid_to.is_(None),
+            )
+            .order_by(SecurityAttributeHistory.valid_from.desc())
+        ).scalar_one_or_none()
+
+        if current is not None and current.value == value:
+            return False
+        if current is not None:
+            current.valid_to = effective - dt.timedelta(days=1)
+
+        self._session.add(
+            SecurityAttributeHistory(
+                isin=isin,
+                attribute=attribute,
+                value=value,
+                valid_from=effective,
+                valid_to=None,
+                source=source,
+            )
+        )
+        return True
+
+
+class IngestionRunRepository:
+    """Create and finalise ingestion audit records."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def start(self, *, source: str, dataset: str, run_date: dt.date) -> IngestionRun:
+        """Open an ingestion run in ``running`` state and return it."""
+        run = IngestionRun(
+            source=source,
+            dataset=dataset,
+            run_date=run_date,
+            status="running",
+            rows_ingested=0,
+            started_at=dt.datetime.now(dt.UTC),
+        )
+        self._session.add(run)
+        self._session.flush()
+        return run
+
+    def finish(
+        self, run: IngestionRun, *, status: str, rows: int = 0, message: str | None = None
+    ) -> None:
+        """Close an ingestion run with a terminal ``status`` and row count."""
+        run.status = status
+        run.rows_ingested = rows
+        run.message = message
+        run.finished_at = dt.datetime.now(dt.UTC)
+        self._session.add(run)

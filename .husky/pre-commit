@@ -1,0 +1,3 @@
+#!/usr/bin/env sh
+# Fast gate on staged files: auto-format + lint-fix Python via lint-staged.
+npx lint-staged

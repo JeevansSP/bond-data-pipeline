@@ -1,2 +1,30 @@
+# ---- on-disk data lake & database volume (kept local, never committed) ----
+/data/
+
+# ---- python / uv ----
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+dist/
+build/
+
+# ---- node / husky ----
+node_modules/
+
+# ---- env & secrets ----
+.env
+.env.*
+!.env.example
+
+# ---- editor / OS ----
 .DS_Store
+.idea/
+.vscode/
 *.log

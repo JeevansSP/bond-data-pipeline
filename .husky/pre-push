@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+# Full gate before pushing: formatting, lint, strict type-hints, tests + coverage floor.
+echo "▶ ruff format --check"   && uv run ruff format --check . && \
+echo "▶ ruff check"           && uv run ruff check .          && \
+echo "▶ mypy (strict)"        && uv run mypy                  && \
+echo "▶ pytest (cov ≥ 80%)"   && uv run pytest -m "not integration"
