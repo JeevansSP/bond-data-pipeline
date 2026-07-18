@@ -26,6 +26,7 @@ import base64
 import csv
 import datetime as dt
 import io
+import re
 from collections import defaultdict
 from typing import Final
 
@@ -246,19 +247,27 @@ def _parse_row(row: list[str]) -> _ParsedRow | None:
     )
 
 
+# STRIPS trade as "GOVT. STOCK <DDMMMYYYY>C|P" — a single cashflow date with a C (coupon strip)
+# or P (principal strip) suffix, vs a regular G-Sec ending in a 4-digit year.
+_STRIP_RE: Final = re.compile(r"\d{2}[A-Z]{3}\d{4}[CP]$")
+
+
 def _instrument_segment(desc: str | None) -> str:
     """Classify an NDS-OM security description into an instrument segment.
 
     Naming seen in the feed: "GOVT. STOCK" (G-Sec), "DTB <date>" (Discounted Treasury Bill),
-    "... SDL/SGS ..." (State Government Securities), "SGB ..." (Sovereign Gold Bond), "CMB".
+    "... SDL/SGS ..." (State Government Securities), "SGB ..." (Sovereign Gold Bond), "CMB",
+    and STRIPS ("GOVT. STOCK 12DEC2041C"/"...2074P") — deep-discount zero-coupon single cashflows.
     """
-    up = (desc or "").upper()
+    up = (desc or "").strip().upper()
     if "DTB" in up or "T-BILL" in up or "TREASURY BILL" in up or up.startswith("CMB"):
         return "TBILL"
     if "SGB" in up:
         return "SGB"
     if "SDL" in up or "SGS" in up:
         return "SDL"
+    if _STRIP_RE.search(up):
+        return "STRIPS"
     return "GSEC"
 
 

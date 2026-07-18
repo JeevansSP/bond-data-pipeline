@@ -26,6 +26,9 @@ YTM_MIN, YTM_MAX = 0.0, 25.0
 """Plausible annualised yields for INR bonds."""
 MAX_NULL_VALUE_RATE = 0.05
 """Warn if >5% of a valuation batch has a null price/YTM."""
+_PAR_PRICED_SEGMENTS = frozenset({"GSEC", "SDL", "TBILL"})
+"""Trade segments quoted per 100 face; SGB (per gram) and STRIPS (deep discount) are excluded
+from the par-price band check."""
 
 
 class Level(StrEnum):
@@ -169,7 +172,12 @@ def check_trades(trades: list[TradeRecord]) -> list[QualityCheck]:
     if total == 0:
         return checks
     invalid_isin = sum(1 for t in trades if not is_valid_isin(t.isin))
-    px_oob = sum(1 for t in trades if t.ltp is not None and not PRICE_MIN <= t.ltp <= PRICE_MAX)
+    # The [PRICE_MIN, PRICE_MAX] bound is a per-100-face coupon-bond sanity range. SGB (quoted per
+    # gram of gold, ~thousands) and STRIPS (deep-discount zero-coupon, single digits) trade on a
+    # different basis, so applying it to them is a false positive — scope the check to par-priced
+    # segments only.
+    par_priced = [t for t in trades if t.segment in _PAR_PRICED_SEGMENTS]
+    px_oob = sum(1 for t in par_priced if t.ltp is not None and not PRICE_MIN <= t.ltp <= PRICE_MAX)
     checks += [
         QualityCheck(
             "invalid_isin", Level.ERROR, passed=invalid_isin == 0, observed=float(invalid_isin)
@@ -179,7 +187,7 @@ def check_trades(trades: list[TradeRecord]) -> list[QualityCheck]:
             Level.WARN,
             passed=px_oob == 0,
             observed=float(px_oob),
-            detail=f"outside [{PRICE_MIN}, {PRICE_MAX}]",
+            detail=f"outside [{PRICE_MIN}, {PRICE_MAX}] among {len(par_priced)} par-priced trades",
         ),
     ]
     return checks

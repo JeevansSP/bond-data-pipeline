@@ -6,8 +6,14 @@ import datetime as dt
 
 import pytest
 
-from bonds.models import InstrumentType, SecurityRecord, SovereignValuation
-from bonds.quality.checks import Level, QualityCheck, check_universe, check_valuations
+from bonds.models import InstrumentType, SecurityRecord, SovereignValuation, TradeRecord
+from bonds.quality.checks import (
+    Level,
+    QualityCheck,
+    check_trades,
+    check_universe,
+    check_valuations,
+)
 
 DATE = dt.date(2026, 7, 10)
 
@@ -25,6 +31,29 @@ def _val(isin: str, price: float | None, ytm: float | None) -> SovereignValuatio
 
 def _find(checks: list[QualityCheck], name: str) -> QualityCheck:
     return next(c for c in checks if c.name == name)
+
+
+def _trade(isin: str, segment: str, ltp: float) -> TradeRecord:
+    return TradeRecord(isin=isin, trade_date=DATE, source="ccil", segment=segment, ltp=ltp)
+
+
+def test_check_trades_price_band_scoped_to_par_priced_segments() -> None:
+    # SGB (per gram, ~17950) and STRIPS (deep discount, ~28) price far outside [50,200] but are
+    # legitimately priced; only GSEC/SDL/TBILL should count toward ltp_out_of_range.
+    trades = [
+        _trade("IN0020260025", "GSEC", 101.0),  # in band
+        _trade("IN0020210228", "SGB", 17950.0),  # legit high, must NOT flag
+        _trade("IN001241C032", "STRIPS", 28.6),  # legit low, must NOT flag
+        _trade("IN0020190999", "GSEC", 5.0),  # genuinely bad par bond, MUST flag
+    ]
+    oob = _find(check_trades(trades), "ltp_out_of_range")
+    assert oob.observed == 1.0  # only the bad GSEC
+    assert not oob.passed
+
+
+def test_check_trades_empty_is_info_row_count() -> None:
+    (row_count,) = check_trades([])
+    assert row_count.name == "row_count" and row_count.observed == 0.0
 
 
 def test_check_valuations_all_clean() -> None:

@@ -118,6 +118,9 @@ def test_column_shift_row_is_rejected() -> None:
         ("07.20 KARNATAKA SDL 2030", "SDL"),
         ("SGB 2028 SR-II", "SGB"),
         ("dtb lowercase", "TBILL"),
+        ("GOVT. STOCK 12DEC2041C", "STRIPS"),  # coupon strip
+        ("07.09 GOVT. STOCK 25NOV2074P", "STRIPS"),  # principal strip (with coupon prefix)
+        ("06.94 GOVT. STOCK 2036", "GSEC"),  # regular G-Sec ends in a year, not a strip
         (None, "GSEC"),
         ("", "GSEC"),
     ],
