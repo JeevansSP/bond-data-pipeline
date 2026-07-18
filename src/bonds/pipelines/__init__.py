@@ -2,5 +2,11 @@
 
 from bonds.pipelines.base import PipelineResult, RunStatus
 from bonds.pipelines.sovereign_valuation import SovereignValuationPipeline
+from bonds.pipelines.universe import UniversePipeline
 
-__all__ = ["PipelineResult", "RunStatus", "SovereignValuationPipeline"]
+__all__ = [
+    "PipelineResult",
+    "RunStatus",
+    "SovereignValuationPipeline",
+    "UniversePipeline",
+]

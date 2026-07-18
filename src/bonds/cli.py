@@ -10,7 +10,12 @@ import typer
 from bonds import __version__
 from bonds.config import get_settings
 from bonds.logging import configure_logging, get_logger
-from bonds.pipelines import PipelineResult, RunStatus, SovereignValuationPipeline
+from bonds.pipelines import (
+    PipelineResult,
+    RunStatus,
+    SovereignValuationPipeline,
+    UniversePipeline,
+)
 from bonds.storage import Database
 
 app = typer.Typer(add_completion=False, help="Indian bond market data pipelines.")
@@ -53,6 +58,24 @@ def _summarise(results: list[PipelineResult], *, label: str) -> None:
     )
     if counts.get(RunStatus.FAILED, 0):
         raise typer.Exit(code=1)
+
+
+@ingest_app.command("universe")
+def ingest_universe(
+    as_of: Annotated[
+        dt.datetime | None,
+        typer.Option(formats=["%Y-%m-%d"], help="Snapshot date (default: today)."),
+    ] = None,
+    max_pages: Annotated[
+        int | None,
+        typer.Option(help="Cap pages fetched (smoke run; omit for the full universe)."),
+    ] = None,
+) -> None:
+    """Upsert the corporate securities-master universe (BondCentral) + rating history."""
+    _init_logging()
+    day = (as_of or dt.datetime.now(dt.UTC)).date()
+    result = UniversePipeline(Database()).run(day, max_pages=max_pages)
+    _summarise([result], label=f"universe {day.isoformat()}")
 
 
 @ingest_app.command("sovereign-valuation")

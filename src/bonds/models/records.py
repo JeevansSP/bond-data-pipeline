@@ -55,3 +55,5 @@ class SecurityRecord(BaseModel):
     coupon: float | None = None
     maturity_date: dt.date | None = None
     face_value: float | None = None
+    attributes: dict[str, str | None] = Field(default_factory=dict)
+    """Trackable attributes for SCD-2 history (e.g. ``{"credit_rating": "AAA"}``)."""

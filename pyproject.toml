@@ -97,7 +97,7 @@ omit = [
     "src/bonds/storage/database.py",
     "src/bonds/storage/repositories.py",
     "src/bonds/pipelines/sovereign_valuation.py",
-    "src/bonds/sources/bondcentral.py",
+    "src/bonds/pipelines/universe.py",
     "src/bonds/sources/cdsl.py",
     "src/bonds/sources/nse.py",
     "src/bonds/sources/ccil.py",

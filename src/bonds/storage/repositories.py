@@ -7,6 +7,7 @@ date simply refreshes its rows rather than duplicating or erroring.
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Iterator, Sequence
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -19,6 +20,16 @@ from bonds.storage.schema import (
     SecurityAttributeHistory,
     Valuation,
 )
+
+# Postgres caps a statement at 65535 bind parameters; chunk multi-row inserts well under that
+# (widest row here is ~10 columns, so 1000 rows -> ~10k params).
+_CHUNK_ROWS = 1000
+
+
+def _chunks[T](items: Sequence[T], size: int = _CHUNK_ROWS) -> Iterator[Sequence[T]]:
+    """Yield ``items`` in slices of at most ``size``."""
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
 
 
 class ValuationRepository:
@@ -45,19 +56,20 @@ class ValuationRepository:
             }
             for v in valuations
         ]
-        stmt = pg_insert(Valuation).values(rows)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["isin", "quote_date", "source"],
-            set_={
-                "instrument_type": stmt.excluded.instrument_type,
-                "description": stmt.excluded.description,
-                "coupon": stmt.excluded.coupon,
-                "maturity_date": stmt.excluded.maturity_date,
-                "price": stmt.excluded.price,
-                "ytm": stmt.excluded.ytm,
-            },
-        )
-        self._session.execute(stmt)
+        for chunk in _chunks(rows):
+            stmt = pg_insert(Valuation).values(list(chunk))
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["isin", "quote_date", "source"],
+                set_={
+                    "instrument_type": stmt.excluded.instrument_type,
+                    "description": stmt.excluded.description,
+                    "coupon": stmt.excluded.coupon,
+                    "maturity_date": stmt.excluded.maturity_date,
+                    "price": stmt.excluded.price,
+                    "ytm": stmt.excluded.ytm,
+                },
+            )
+            self._session.execute(stmt)
         return len(rows)
 
 
@@ -86,22 +98,23 @@ class SecurityRepository:
             }
             for r in records
         ]
-        stmt = pg_insert(Security).values(rows)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["isin"],
-            set_={
-                "instrument_type": stmt.excluded.instrument_type,
-                "description": stmt.excluded.description,
-                "issuer": stmt.excluded.issuer,
-                "coupon": stmt.excluded.coupon,
-                "maturity_date": stmt.excluded.maturity_date,
-                "face_value": stmt.excluded.face_value,
-                "source": stmt.excluded.source,
-                # first_seen is preserved (only set on insert); last_seen advances.
-                "last_seen": stmt.excluded.last_seen,
-            },
-        )
-        self._session.execute(stmt)
+        for chunk in _chunks(rows):
+            stmt = pg_insert(Security).values(list(chunk))
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["isin"],
+                set_={
+                    "instrument_type": stmt.excluded.instrument_type,
+                    "description": stmt.excluded.description,
+                    "issuer": stmt.excluded.issuer,
+                    "coupon": stmt.excluded.coupon,
+                    "maturity_date": stmt.excluded.maturity_date,
+                    "face_value": stmt.excluded.face_value,
+                    "source": stmt.excluded.source,
+                    # first_seen is preserved (only set on insert); last_seen advances.
+                    "last_seen": stmt.excluded.last_seen,
+                },
+            )
+            self._session.execute(stmt)
         return len(rows)
 
     def record_attribute(
@@ -138,6 +151,52 @@ class SecurityRepository:
             )
         )
         return True
+
+    def record_attribute_bulk(
+        self, attribute: str, values: dict[str, str | None], *, effective: dt.date, source: str
+    ) -> int:
+        """SCD-2 many ISINs for one ``attribute`` in a single pass.
+
+        Loads all currently-open rows for ``attribute`` once (one query), diffs in memory, and
+        writes only genuine changes. Far cheaper than per-ISIN :meth:`record_attribute` when
+        ingesting a whole universe.
+
+        Returns:
+            The number of changed values recorded.
+        """
+        if not values:
+            return 0
+        open_rows = (
+            self._session.execute(
+                select(SecurityAttributeHistory).where(
+                    SecurityAttributeHistory.attribute == attribute,
+                    SecurityAttributeHistory.valid_to.is_(None),
+                )
+            )
+            .scalars()
+            .all()
+        )
+        current = {row.isin: row for row in open_rows}
+
+        changes = 0
+        for isin, value in values.items():
+            existing = current.get(isin)
+            if existing is not None and existing.value == value:
+                continue
+            if existing is not None:
+                existing.valid_to = effective - dt.timedelta(days=1)
+            self._session.add(
+                SecurityAttributeHistory(
+                    isin=isin,
+                    attribute=attribute,
+                    value=value,
+                    valid_from=effective,
+                    valid_to=None,
+                    source=source,
+                )
+            )
+            changes += 1
+        return changes
 
 
 class IngestionRunRepository:
