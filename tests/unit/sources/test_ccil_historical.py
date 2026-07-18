@@ -109,24 +109,29 @@ def test_column_shift_row_is_rejected() -> None:
 
 
 @pytest.mark.parametrize(
-    ("desc", "segment"),
+    ("desc", "isin", "segment"),
     [
-        ("06.94 GOVT. STOCK 2036", "GSEC"),
-        ("DTB 15012027", "TBILL"),
-        ("CMB 91 DAYS 2026", "TBILL"),
-        ("06.97 MAHARASHTRA SGS 2028", "SDL"),
-        ("07.20 KARNATAKA SDL 2030", "SDL"),
-        ("SGB 2028 SR-II", "SGB"),
-        ("dtb lowercase", "TBILL"),
-        ("GOVT. STOCK 12DEC2041C", "STRIPS"),  # coupon strip
-        ("07.09 GOVT. STOCK 25NOV2074P", "STRIPS"),  # principal strip (with coupon prefix)
-        ("06.94 GOVT. STOCK 2036", "GSEC"),  # regular G-Sec ends in a year, not a strip
-        (None, "GSEC"),
-        ("", "GSEC"),
+        # Central government (IN00...) — sub-type comes from the description.
+        ("06.94 GOVT. STOCK 2036", "IN0020260025", "GSEC"),
+        ("DTB 15012027", "IN0020260099", "TBILL"),
+        ("CMB 91 DAYS 2026", "IN0020260107", "TBILL"),
+        ("91 TBILL MATURING 08/03/2002", "IN002001X019", "TBILL"),  # old bare-"TBILL" naming
+        ("SGB 2028 SR-II", "IN0020280010", "SGB"),
+        ("GOVT. STOCK 12DEC2041C", "IN001241C032", "STRIPS"),  # coupon strip
+        ("07.09 GOVT. STOCK 25NOV2074P", "IN0020740015", "STRIPS"),  # principal strip
+        ("GOVT. STOCK 02JAN2024 C", "IN000124C015", "STRIPS"),  # old space-before-C spelling
+        ("06.94 GOVT. STOCK 2036", "IN0020260025", "GSEC"),  # year suffix, not a strip
+        (None, "IN0020260025", "GSEC"),
+        ("", "IN0020260025", "GSEC"),
+        # State issuers (non-IN00 prefix) — SDL by ISIN regardless of description spelling.
+        ("06.97 MAHARASHTRA SGS 2028", "IN2220190127", "SDL"),
+        ("07.20 KARNATAKA SDL 2030", "IN1920300011", "SDL"),
+        ("11.50% MAHARASHTRA S.D. 2010", "IN2219900015", "SDL"),  # old "S.D." naming
+        ("9.40% PUNJAB GOVT. STOCK 2011", "IN2820110019", "SDL"),  # state loan named "GOVT. STOCK"
     ],
 )
-def test_instrument_segment_classification(desc: str | None, segment: str) -> None:
-    assert _instrument_segment(desc) == segment
+def test_instrument_segment_classification(desc: str | None, isin: str, segment: str) -> None:
+    assert _instrument_segment(desc, isin) == segment
 
 
 @pytest.mark.parametrize(
