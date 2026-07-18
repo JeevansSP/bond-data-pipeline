@@ -104,14 +104,21 @@ def _finalize(
     message: str,
     started: dt.datetime,
 ) -> None:
-    """Write a terminal audit row in a fresh session (survives the work session's rollback)."""
-    with database.session() as session:
-        IngestionRunRepository(session).record(
-            source=source,
-            dataset=dataset,
-            run_date=run_date,
-            status=status.value,
-            rows=0,
-            started_at=started,
-            message=message,
-        )
+    """Write a terminal audit row in a fresh session (survives the work session's rollback).
+
+    Best-effort: if even this write fails (e.g. Postgres is down), log and swallow so
+    ``execute_run`` still honours its never-raises contract and the suite continues.
+    """
+    try:
+        with database.session() as session:
+            IngestionRunRepository(session).record(
+                source=source,
+                dataset=dataset,
+                run_date=run_date,
+                status=status.value,
+                rows=0,
+                started_at=started,
+                message=message,
+            )
+    except Exception as exc:  # audit is best-effort; never let it escape
+        logger.error("pipeline.audit_write_failed", dataset=dataset, error=repr(exc))

@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
+from bonds.logging import get_logger
 from bonds.models import (
     PublicIssueRecord,
     RbiAuctionRecord,
@@ -33,6 +34,8 @@ from bonds.storage.schema import (
     Valuation,
 )
 
+logger = get_logger(__name__)
+
 # Postgres caps a statement at 65535 bind parameters; chunk multi-row inserts well under that
 # (widest row here is ~10 columns, so 1000 rows -> ~10k params).
 _CHUNK_ROWS = 1000
@@ -42,6 +45,46 @@ def _chunks[T](items: Sequence[T], size: int = _CHUNK_ROWS) -> Iterator[Sequence
     """Yield ``items`` in slices of at most ``size``."""
     for start in range(0, len(items), size):
         yield items[start : start + size]
+
+
+def _apply_scd2(
+    current: SecurityAttributeHistory | None,
+    isin: str,
+    attribute: str,
+    value: str | None,
+    effective: dt.date,
+    source: str,
+) -> bool:
+    """Decide the SCD-2 transition, mutating ``current`` as needed.
+
+    Returns ``True`` if a change should be recorded. The caller inserts a new open row when
+    ``current is None`` or ``effective > current.valid_from`` (a genuine forward change).
+
+    - unchanged value               -> ``False`` (no-op)
+    - ``effective < valid_from``     -> ``False`` (out-of-order backfill; attribute history must be
+      ingested chronologically — skip rather than overwrite the newer value or collide)
+    - ``effective == valid_from``    -> update value+source in place, ``True`` (same-day correction)
+    - ``effective > valid_from``     -> close the open row, ``True`` (caller opens a new one)
+    """
+    if current is None:
+        return True
+    if current.value == value:
+        return False
+    if effective < current.valid_from:
+        logger.warning(
+            "scd2.out_of_order_skipped",
+            isin=isin,
+            attribute=attribute,
+            effective=effective.isoformat(),
+            current_from=current.valid_from.isoformat(),
+        )
+        return False
+    if effective == current.valid_from:
+        current.value = value
+        current.source = source
+        return True
+    current.valid_to = effective - dt.timedelta(days=1)
+    return True
 
 
 class ValuationRepository:
@@ -160,36 +203,33 @@ class SecurityRepository:
         Returns:
             ``True`` if a change was recorded, ``False`` if the value was unchanged.
         """
-        current = self._session.execute(
-            select(SecurityAttributeHistory)
-            .where(
-                SecurityAttributeHistory.isin == isin,
-                SecurityAttributeHistory.attribute == attribute,
-                SecurityAttributeHistory.valid_to.is_(None),
+        # .first() (not scalar_one_or_none) so a legacy multi-open-row state can't crash the run.
+        current = (
+            self._session.execute(
+                select(SecurityAttributeHistory)
+                .where(
+                    SecurityAttributeHistory.isin == isin,
+                    SecurityAttributeHistory.attribute == attribute,
+                    SecurityAttributeHistory.valid_to.is_(None),
+                )
+                .order_by(SecurityAttributeHistory.valid_from.desc())
             )
-            .order_by(SecurityAttributeHistory.valid_from.desc())
-        ).scalar_one_or_none()
-
-        if current is not None and current.value == value:
-            return False
-        if current is not None and effective <= current.valid_from:
-            # Same-day (or earlier) change: overwrite the open row in place. Closing it would
-            # make valid_to < valid_from and collide with uq_attr_history_point on valid_from.
-            current.value = value
-            return True
-        if current is not None:
-            current.valid_to = effective - dt.timedelta(days=1)
-
-        self._session.add(
-            SecurityAttributeHistory(
-                isin=isin,
-                attribute=attribute,
-                value=value,
-                valid_from=effective,
-                valid_to=None,
-                source=source,
-            )
+            .scalars()
+            .first()
         )
+        if not _apply_scd2(current, isin, attribute, value, effective, source):
+            return False
+        if current is None or effective > current.valid_from:
+            self._session.add(
+                SecurityAttributeHistory(
+                    isin=isin,
+                    attribute=attribute,
+                    value=value,
+                    valid_from=effective,
+                    valid_to=None,
+                    source=source,
+                )
+            )
         return True
 
     def record_attribute_bulk(
@@ -221,26 +261,19 @@ class SecurityRepository:
         changes = 0
         for isin, value in values.items():
             existing = current.get(isin)
-            if existing is not None and existing.value == value:
+            if not _apply_scd2(existing, isin, attribute, value, effective, source):
                 continue
-            if existing is not None and effective <= existing.valid_from:
-                # Same-day (or earlier) change: overwrite in place so a same-day re-run stays
-                # idempotent instead of colliding on uq_attr_history_point / inverting the interval.
-                existing.value = value
-                changes += 1
-                continue
-            if existing is not None:
-                existing.valid_to = effective - dt.timedelta(days=1)
-            self._session.add(
-                SecurityAttributeHistory(
-                    isin=isin,
-                    attribute=attribute,
-                    value=value,
-                    valid_from=effective,
-                    valid_to=None,
-                    source=source,
+            if existing is None or effective > existing.valid_from:
+                self._session.add(
+                    SecurityAttributeHistory(
+                        isin=isin,
+                        attribute=attribute,
+                        value=value,
+                        valid_from=effective,
+                        valid_to=None,
+                        source=source,
+                    )
                 )
-            )
             changes += 1
         return changes
 
@@ -475,6 +508,8 @@ class DataQualityRepository:
         """Upsert check results so a same-day re-run overwrites rather than duplicates."""
         if not rows:
             return
+        # Guard the conflict key so a duplicate check_name in one batch can't 'affect a row twice'.
+        rows = list({(r["dataset"], r["run_date"], r["check_name"]): r for r in rows}.values())
         stmt = pg_insert(DataQualityCheck).values(rows)
         stmt = stmt.on_conflict_do_update(
             index_elements=["dataset", "run_date", "check_name"],

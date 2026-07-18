@@ -138,6 +138,6 @@ def _as_int(value: Any) -> int | None:
     if value is None or value == "":
         return None
     try:
-        return int(value)
+        return int(float(str(value).replace(",", "")))  # handle Indian-grouped / float-ish strings
     except (TypeError, ValueError):
         return None

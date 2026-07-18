@@ -81,6 +81,21 @@ def test_download_raises_data_unavailable_on_500(tmp_path: Path) -> None:
 
 
 @respx.mock
+def test_download_does_not_retry_holiday_500(tmp_path: Path) -> None:
+    # 500 = non-publishing day; it must fail fast, not burn the retry budget.
+    route = respx.get("https://www.fbil.org.in/wasdm/gsec/downloadPublished").mock(
+        return_value=httpx.Response(500)
+    )
+    settings = Settings(
+        data_root=tmp_path, http=HttpSettings(min_interval_seconds=0.0, max_retries=4)
+    )
+    source = FbilSource(client=ThrottledClient(settings.http), settings=settings)
+    with pytest.raises(DataUnavailable):
+        source.download("gsec", DATE)
+    assert route.call_count == 1  # not 4
+
+
+@respx.mock
 def test_fetch_valuations_end_to_end(tmp_path: Path, fbil_gsec_workbook: bytes) -> None:
     respx.get("https://www.fbil.org.in/wasdm/gsec/downloadPublished").mock(
         return_value=httpx.Response(200, content=fbil_gsec_workbook)

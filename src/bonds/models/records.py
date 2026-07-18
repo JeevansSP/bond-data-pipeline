@@ -125,3 +125,9 @@ class SecurityRecord(BaseModel):
     face_value: float | None = None
     attributes: dict[str, str | None] = Field(default_factory=dict)
     """Trackable attributes for SCD-2 history (e.g. ``{"credit_rating": "AAA"}``)."""
+
+    @field_validator("coupon")
+    @classmethod
+    def _coupon_nonneg_or_none(cls, v: float | None) -> float | None:
+        # Match ck_security_coupon_nonneg: one bad coupon nulls out rather than failing the batch.
+        return v if v is None or v >= 0 else None

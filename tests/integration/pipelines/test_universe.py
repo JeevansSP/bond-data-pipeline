@@ -180,6 +180,14 @@ def test_same_day_attribute_change_is_idempotent(database: Database) -> None:
     assert _rating_history(database, ISIN_A) == [("AA", None)]  # updated in place, one open row
 
 
+def test_out_of_order_backfill_preserves_current_value(database: Database) -> None:
+    # Ingest a LATER date first, then an EARLIER one: the older observation is skipped rather than
+    # overwriting the newer current value or crashing.
+    UniversePipeline(database, source=FakeUniverseSource([_rec(ISIN_A, "AAA")])).run(DAY2)
+    UniversePipeline(database, source=FakeUniverseSource([_rec(ISIN_A, "AA")])).run(DAY1)
+    assert _rating_history(database, ISIN_A) == [("AAA", None)]  # current value intact
+
+
 def test_multiple_runs_in_a_day_stay_idempotent(database: Database) -> None:
     src = FakeUniverseSource([_rec(ISIN_A, "AAA"), _rec(ISIN_B, "AA+")])
     UniversePipeline(database, source=src).run(DAY1)
@@ -201,10 +209,9 @@ def test_multiple_runs_in_a_day_stay_idempotent(database: Database) -> None:
 
 
 def test_db_phase_failure_is_audited_and_returns_failed(database: Database) -> None:
-    # A coupon < 0 violates ck_security_coupon_nonneg during the load phase (after fetch).
-    bad = SecurityRecord(
-        isin=ISIN_A, instrument_type=InstrumentType.CORP, source=SOURCE, coupon=-5.0
-    )
+    # A too-long record source (> securities.source VARCHAR(32)) fails on insert, in the load
+    # phase. The pipeline's own source name stays SOURCE, so the audit row is cleaned up.
+    bad = SecurityRecord(isin=ISIN_A, instrument_type=InstrumentType.CORP, source="X" * 40)
     result = UniversePipeline(database, source=FakeUniverseSource([bad])).run(DAY1)
     assert result.status is RunStatus.FAILED  # returned, not raised
     with database.session() as s:

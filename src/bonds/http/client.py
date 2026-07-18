@@ -68,6 +68,12 @@ class ThrottledClient:
         """Close the underlying httpx client and its connection pool."""
         self._client.close()
 
+    def __del__(self) -> None:
+        """Best-effort GC cleanup: release the connection pool if never explicitly closed."""
+        client = getattr(self, "_client", None)
+        if client is not None:
+            client.close()
+
     def _throttle(self) -> None:
         elapsed = time.monotonic() - self._last_request_at
         wait = self._min_interval - elapsed
