@@ -15,6 +15,9 @@ See ``docs/research/2026-07-18_113141_ccilindia.com.md``.
 
 Trade-by-trade rows are aggregated to one per ISIN per day (VWAP price/yield, count, total value),
 matching the ``trades`` table shape used by NSE; the raw CSV is landed for finer granularity.
+
+Note on units: ``trade_value`` here is the summed **face value** traded (turnover in face terms),
+a different basis from NSE's session turnover — don't sum ``trades.trade_value`` across sources.
 """
 
 from __future__ import annotations
@@ -34,8 +37,13 @@ from bonds.http import ThrottledClient
 from bonds.logging import get_logger
 from bonds.models import TradeRecord
 from bonds.quality.metrics import MetricsCollector
+from bonds.sources.base import SourceError
 
 logger = get_logger(__name__)
+
+# One parsed trade row: (isin, trade_date, description, face, price, ytm, time_key).
+_TimeKey = tuple[int, int, int]
+_ParsedRow = tuple[str, dt.date, str | None, float, float | None, float | None, _TimeKey]
 
 _PAGE: Final = "https://www.ccilindia.com/g-sec-historical-trades"
 _PORTLET: Final = "NewTradeByTradeGsec_NewTradeByTradeGsecPortlet_INSTANCE_xbna"
@@ -91,10 +99,36 @@ class CcilHistoricalTradesSource(MetricsCollector):
         return records
 
     def download(self, start: dt.date, end: dt.date) -> str:
-        """Download the raw trade CSV for ``[start, end]`` (landing it), priming cookies once."""
+        """Download the raw trade CSV for ``[start, end]`` (landing it).
+
+        Akamai/Liferay return challenge/error pages as HTTP 200 with HTML. If we get one — e.g.
+        cookies expired mid-backfill — we re-prime cookies and retry once; a persistent non-CSV
+        response raises :class:`SourceError` (→ audited FAILED) rather than being silently treated
+        as an empty (holiday) day.
+        """
+        self._prime()
+        text = self._post(start, end)
+        if _looks_like_html(text):
+            self._primed = False
+            self._prime()
+            text = self._post(start, end)
+            if _looks_like_html(text):
+                raise SourceError(f"CCIL returned a non-CSV page for {start}..{end} (challenge?)")
+        from_s, to_s = start.isoformat(), end.isoformat()
+        path = (
+            self._settings.data_dir / "raw" / self.name / f"historical_trades_{from_s}_{to_s}.csv"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        logger.info("ccil.hist_downloaded", start=from_s, end=to_s, bytes=len(text.encode()))
+        return text
+
+    def _prime(self) -> None:
         if not self._primed:
-            self._client.get(_PAGE, headers=_PAGE_HEADERS)
+            self._client.get(_PAGE, headers=_PAGE_HEADERS)  # mint Akamai cookies
             self._primed = True
+
+    def _post(self, start: dt.date, end: dt.date) -> str:
         from_s, to_s = start.isoformat(), end.isoformat()
         response = self._client.post(
             _SERVE_URL,
@@ -106,25 +140,16 @@ class CcilHistoricalTradesSource(MetricsCollector):
             },
             headers=_POST_HEADERS,
         )
-        text = response.text
-        path = (
-            self._settings.data_dir / "raw" / self.name / f"historical_trades_{from_s}_{to_s}.csv"
-        )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
-        logger.info("ccil.hist_downloaded", start=from_s, end=to_s, bytes=len(text.encode()))
-        return text
+        return response.text
 
 
 # ---------------------------------------------------------------------- parsing
 def aggregate_trades(csv_text: str, *, source: str) -> list[TradeRecord]:
     """Parse the trade-by-trade CSV and aggregate to one :class:`TradeRecord` per ISIN per day."""
-    if not csv_text.strip() or "ISIN" not in csv_text[:200]:
+    if not csv_text.strip():
         return []
     reader = csv.reader(io.StringIO(csv_text))
-    header = next(reader, None)
-    if header is None:
-        return []
+    next(reader, None)  # drop the header row (columns validated positionally in _parse_row)
 
     # (isin, date) -> aggregation accumulator
     groups: dict[tuple[str, dt.date], _Agg] = defaultdict(_Agg)
@@ -132,8 +157,8 @@ def aggregate_trades(csv_text: str, *, source: str) -> list[TradeRecord]:
         parsed = _parse_row(row)
         if parsed is None:
             continue
-        isin, trade_date, desc, face, price, ytm, time_s = parsed
-        groups[(isin, trade_date)].add(desc, face, price, ytm, time_s)
+        isin, trade_date, desc, face, price, ytm, time_key = parsed
+        groups[(isin, trade_date)].add(desc, face, price, ytm, time_key)
 
     records = []
     for (isin, trade_date), agg in groups.items():
@@ -147,8 +172,8 @@ class _Agg:
     __slots__ = (
         "count",
         "desc",
+        "last_key",
         "last_px",
-        "last_time",
         "last_yld",
         "px_num",
         "total_face",
@@ -161,22 +186,27 @@ class _Agg:
         self.total_face = 0.0
         self.px_num = 0.0
         self.yld_num = 0.0
-        self.last_time = ""
+        self.last_key: _TimeKey = (-1, -1, -1)
         self.last_px: float | None = None
         self.last_yld: float | None = None
 
     def add(
-        self, desc: str | None, face: float, price: float | None, ytm: float | None, time_s: str
+        self,
+        desc: str | None,
+        face: float,
+        price: float | None,
+        ytm: float | None,
+        time_key: _TimeKey,
     ) -> None:
         self.desc = self.desc or desc
-        self.count += 1
-        if price is not None and face > 0:
+        self.count += 1  # every trade counts toward no_of_trades
+        if price is not None and price > 0 and face > 0:
             self.total_face += face
             self.px_num += price * face
             if ytm is not None:
                 self.yld_num += ytm * face
-        if time_s >= self.last_time:  # latest trade of the day
-            self.last_time, self.last_px, self.last_yld = time_s, price, ytm
+            if time_key >= self.last_key:  # ltp/lty = latest trade with a valid price
+                self.last_key, self.last_px, self.last_yld = time_key, price, ytm
 
     def to_record(self, isin: str, trade_date: dt.date, source: str) -> TradeRecord:
         wap = self.px_num / self.total_face if self.total_face else None
@@ -196,10 +226,10 @@ class _Agg:
         )
 
 
-def _parse_row(
-    row: list[str],
-) -> tuple[str, dt.date, str | None, float, float | None, float | None, str] | None:
-    if len(row) < 8:
+def _parse_row(row: list[str]) -> _ParsedRow | None:
+    # Reject any row whose column count isn't the expected 8 — an unquoted comma (in a description
+    # or a grouped number like "7,50,00,000") would otherwise shift every field silently.
+    if len(row) != 8:
         return None
     trade_date = _as_date(row[0])
     isin = row[2].strip()
@@ -212,7 +242,7 @@ def _parse_row(
         _as_float(row[4]) or 0.0,
         _as_float(row[5]),
         _as_float(row[6]),
-        row[1].strip(),
+        _time_key(row[1]),
     )
 
 
@@ -250,3 +280,25 @@ def _as_date(value: str) -> dt.date | None:
         except ValueError:
             continue
     return None
+
+
+def _time_key(value: str) -> tuple[int, int, int]:
+    """Parse an ``HH:MM:SS`` trade time into a numeric sort key.
+
+    Integer comparison is padding-agnostic — ``"9:05:00"`` and ``"09:05:00"`` both sort correctly —
+    unlike lexical string comparison, which would rank an unpadded 9 AM after 4 PM. Unparseable
+    times sort earliest so they never win the "latest trade" selection.
+    """
+    parts = value.strip().split(":")
+    if len(parts) != 3:
+        return (-1, -1, -1)
+    try:
+        return (int(parts[0]), int(parts[1]), int(parts[2]))
+    except ValueError:
+        return (-1, -1, -1)
+
+
+def _looks_like_html(text: str) -> bool:
+    """True if the payload is an HTML challenge/error page rather than the trade CSV."""
+    head = text[:512].lstrip().lower()
+    return head.startswith(("<!doctype", "<html")) or "<body" in head
