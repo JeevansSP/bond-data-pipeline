@@ -13,11 +13,17 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from bonds.models import PublicIssueRecord, SecurityRecord, SovereignValuation
+from bonds.models import (
+    PublicIssueRecord,
+    RbiAuctionRecord,
+    SecurityRecord,
+    SovereignValuation,
+)
 from bonds.storage.schema import (
     DataQualityCheck,
     IngestionRun,
     PublicIssue,
+    RbiAuction,
     Security,
     SecurityAttributeHistory,
     Valuation,
@@ -300,6 +306,48 @@ class PublicIssueRepository:
                     "base_size_cr": stmt.excluded.base_size_cr,
                     "final_size_cr": stmt.excluded.final_size_cr,
                     "financial_year": stmt.excluded.financial_year,
+                },
+            )
+            self._session.execute(stmt)
+        return len(rows)
+
+
+class RbiAuctionRepository:
+    """Persist RBI auction calendar records (idempotent per prid + source)."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def upsert_many(self, auctions: list[RbiAuctionRecord], *, seen_on: dt.date) -> int:
+        """Insert or refresh auctions, setting ``first_seen`` on insert; advancing ``last_seen``."""
+        if not auctions:
+            return 0
+        rows = [
+            {
+                "prid": a.prid,
+                "title": a.title,
+                "auction_type": a.auction_type,
+                "auction_date": a.auction_date,
+                "detail_url": a.detail_url,
+                "pdf_url": a.pdf_url,
+                "source": a.source,
+                "first_seen": seen_on,
+                "last_seen": seen_on,
+            }
+            for a in auctions
+        ]
+        rows = list({(r["prid"], r["source"]): r for r in rows}.values())
+        for chunk in _chunks(rows):
+            stmt = pg_insert(RbiAuction).values(list(chunk))
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["prid", "source"],
+                set_={
+                    "title": stmt.excluded.title,
+                    "auction_type": stmt.excluded.auction_type,
+                    "auction_date": stmt.excluded.auction_date,
+                    "detail_url": stmt.excluded.detail_url,
+                    "pdf_url": stmt.excluded.pdf_url,
+                    "last_seen": stmt.excluded.last_seen,
                 },
             )
             self._session.execute(stmt)

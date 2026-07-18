@@ -15,6 +15,7 @@ from bonds.logging import configure_logging, get_logger
 from bonds.pipelines import (
     PipelineResult,
     PublicIssuePipeline,
+    RbiAuctionPipeline,
     RunStatus,
     SovereignValuationPipeline,
     UniversePipeline,
@@ -111,6 +112,20 @@ def ingest_public_issues(
     day = (as_of or dt.datetime.now(dt.UTC)).date()
     result = PublicIssuePipeline(Database()).run(day)
     _summarise([result], label=f"public-issues {day.isoformat()}")
+
+
+@ingest_app.command("rbi-auctions")
+def ingest_rbi_auctions(
+    as_of: Annotated[
+        dt.datetime | None,
+        typer.Option(formats=["%Y-%m-%d"], help="Snapshot date (default: today)."),
+    ] = None,
+) -> None:
+    """Ingest the RBI sovereign auction calendar (recent auctions + dates + links)."""
+    _init_logging()
+    day = (as_of or dt.datetime.now(dt.UTC)).date()
+    result = RbiAuctionPipeline(Database()).run(day)
+    _summarise([result], label=f"rbi-auctions {day.isoformat()}")
 
 
 @ingest_app.command("sovereign-valuation")

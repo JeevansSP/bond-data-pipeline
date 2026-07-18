@@ -169,6 +169,27 @@ class PublicIssue(Base):
     )
 
 
+class RbiAuction(Base):
+    """An RBI sovereign auction announcement (calendar; financials are a follow-up)."""
+
+    __tablename__ = "rbi_auctions"
+    __table_args__ = (UniqueConstraint("prid", "source", name="uq_rbi_auction"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    prid: Mapped[str] = mapped_column(String(16), index=True)
+    title: Mapped[str] = mapped_column(Text)
+    auction_type: Mapped[str] = mapped_column(String(16), index=True)
+    auction_date: Mapped[dt.date | None] = mapped_column(Date, index=True)
+    detail_url: Mapped[str | None] = mapped_column(Text)
+    pdf_url: Mapped[str | None] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(String(32))
+    first_seen: Mapped[dt.date] = mapped_column(Date)
+    last_seen: Mapped[dt.date] = mapped_column(Date)
+    loaded_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class DataQualityCheck(Base):
     """Result of one data-quality assertion for a dataset + business date.
 

@@ -9,11 +9,11 @@ Implemented:
     bondcentral Corporate securities-master universe (~25.5k ISINs) + credit rating.
     cdsl        Corporate issued/outstanding half-yearly snapshots.
     sebi        Corporate-bond public-issue calendar (primary market).
+    rbi         Sovereign auction calendar (announcements + dates + links).
 
 Planned (typed stubs — see each module's docstring for the documented endpoints):
     nse         Exchange corporate-bond trade feed.
     ccil        G-Sec / NDS-OM secondary trades & settlement.
-    rbi         Sovereign primary-issuance auctions.
 """
 
 from bonds.sources.base import DataUnavailable, Source, SourceError

@@ -42,6 +42,20 @@ class SovereignValuation(BaseModel):
     ytm: float | None = None
 
 
+class RbiAuctionRecord(BaseModel):
+    """An RBI sovereign auction announcement (calendar level; financials are a follow-up)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    prid: str
+    title: str
+    auction_type: str
+    source: str
+    auction_date: dt.date | None = None
+    detail_url: str | None = None
+    pdf_url: str | None = None
+
+
 class PublicIssueRecord(BaseModel):
     """A corporate-bond public issue (SEBI primary-market calendar; not per-ISIN)."""
 

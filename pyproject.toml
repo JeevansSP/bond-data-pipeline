@@ -101,6 +101,7 @@ omit = [
     "src/bonds/pipelines/sovereign_valuation.py",
     "src/bonds/pipelines/universe.py",
     "src/bonds/pipelines/public_issue.py",
+    "src/bonds/pipelines/rbi_auction.py",
     "src/bonds/quality/inspector.py",
     "src/bonds/sources/nse.py",
     "src/bonds/sources/ccil.py",

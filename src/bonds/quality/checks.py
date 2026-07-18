@@ -10,7 +10,12 @@ import datetime as dt
 from dataclasses import dataclass
 from enum import StrEnum
 
-from bonds.models import PublicIssueRecord, SecurityRecord, SovereignValuation
+from bonds.models import (
+    PublicIssueRecord,
+    RbiAuctionRecord,
+    SecurityRecord,
+    SovereignValuation,
+)
 from bonds.quality.isin import is_valid_isin
 
 # --- thresholds (tunable) -------------------------------------------------------------------
@@ -149,6 +154,30 @@ def check_public_issues(issues: list[PublicIssueRecord]) -> list[QualityCheck]:
             Level.WARN,
             passed=True,
             observed=_rate(null_final, total),
+        ),
+    ]
+    return checks
+
+
+def check_rbi_auctions(auctions: list[RbiAuctionRecord]) -> list[QualityCheck]:
+    """Quality checks for an RBI auction batch (row count, unclassified, missing-date rate)."""
+    total = len(auctions)
+    checks: list[QualityCheck] = [
+        QualityCheck("row_count", Level.ERROR, passed=total > 0, observed=float(total)),
+    ]
+    if total == 0:
+        return checks
+    unclassified = sum(1 for a in auctions if a.auction_type == "Other")
+    null_date = sum(1 for a in auctions if a.auction_date is None)
+    checks += [
+        QualityCheck(
+            "unclassified_auction_type",
+            Level.WARN,
+            passed=unclassified == 0,
+            observed=float(unclassified),
+        ),
+        QualityCheck(
+            "null_auction_date_rate", Level.WARN, passed=True, observed=_rate(null_date, total)
         ),
     ]
     return checks

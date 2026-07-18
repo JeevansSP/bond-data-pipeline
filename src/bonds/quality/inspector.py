@@ -7,11 +7,17 @@ import datetime as dt
 from sqlalchemy.orm import Session
 
 from bonds.logging import get_logger
-from bonds.models import PublicIssueRecord, SecurityRecord, SovereignValuation
+from bonds.models import (
+    PublicIssueRecord,
+    RbiAuctionRecord,
+    SecurityRecord,
+    SovereignValuation,
+)
 from bonds.quality.checks import (
     Level,
     QualityCheck,
     check_public_issues,
+    check_rbi_auctions,
     check_universe,
     check_valuations,
 )
@@ -62,6 +68,13 @@ class QualityInspector:
         """Run public-issue checks + drift, persist, and log."""
         checks = check_public_issues(issues)
         checks.append(self._drift_check(len(issues)))
+        self._persist(checks)
+        return checks
+
+    def inspect_rbi_auctions(self, auctions: list[RbiAuctionRecord]) -> list[QualityCheck]:
+        """Run RBI auction checks + drift, persist, and log."""
+        checks = check_rbi_auctions(auctions)
+        checks.append(self._drift_check(len(auctions)))
         self._persist(checks)
         return checks
 
