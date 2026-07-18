@@ -9,13 +9,19 @@ from sqlalchemy.orm import Session
 from bonds.logging import get_logger
 from bonds.models import SecurityRecord, SovereignValuation
 from bonds.quality.checks import Level, QualityCheck, check_universe, check_valuations
-from bonds.storage.repositories import DataQualityRepository, IngestionRunRepository
+from bonds.storage.repositories import (
+    DataQualityRepository,
+    IngestionRunRepository,
+    SecurityRepository,
+)
 from bonds.storage.schema import DataQualityCheck
 
 logger = get_logger(__name__)
 
 DRIFT_DROP_THRESHOLD = 0.20
 """Warn if a batch is >20% smaller than the previous successful run (possible truncated feed)."""
+COUPON_TOLERANCE = 0.001
+"""Coupons closer than this are treated as equal across sources."""
 
 
 class QualityInspector:
@@ -35,11 +41,57 @@ class QualityInspector:
         return checks
 
     def inspect_universe(self, records: list[SecurityRecord]) -> list[QualityCheck]:
-        """Run universe checks + drift, persist, and log."""
+        """Run universe checks + drift + cross-source reconciliation, persist, and log.
+
+        Reconciliation must run BEFORE the upsert overwrites the stored row, so the comparison is
+        against whatever *other* source last wrote the ISIN.
+        """
         checks = check_universe(records, as_of=self._run_date)
         checks.append(self._drift_check(len(records)))
+        checks += self._reconcile(records)
         self._persist(checks)
         return checks
+
+    def _reconcile(self, records: list[SecurityRecord]) -> list[QualityCheck]:
+        stored = SecurityRepository(self._session).load_reference([r.isin for r in records])
+        compared = coupon_mismatch = maturity_mismatch = 0
+        for r in records:
+            existing = stored.get(r.isin)
+            if existing is None:
+                continue
+            ex_coupon, ex_maturity, ex_source = existing
+            if ex_source == r.source:
+                continue  # same source re-ingest, not a cross-source comparison
+            compared += 1
+            if (
+                r.coupon is not None
+                and ex_coupon is not None
+                and abs(r.coupon - ex_coupon) > COUPON_TOLERANCE
+            ):
+                coupon_mismatch += 1
+            if (
+                r.maturity_date is not None
+                and ex_maturity is not None
+                and r.maturity_date != ex_maturity
+            ):
+                maturity_mismatch += 1
+        detail = f"compared {compared} ISINs vs another source"
+        return [
+            QualityCheck(
+                "cross_source_coupon_mismatch",
+                Level.WARN,
+                passed=coupon_mismatch == 0,
+                observed=float(coupon_mismatch),
+                detail=detail,
+            ),
+            QualityCheck(
+                "cross_source_maturity_mismatch",
+                Level.WARN,
+                passed=maturity_mismatch == 0,
+                observed=float(maturity_mismatch),
+                detail=detail,
+            ),
+        ]
 
     # ------------------------------------------------------------------ internals
     def _drift_check(self, current_rows: int) -> QualityCheck:

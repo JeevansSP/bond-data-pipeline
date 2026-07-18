@@ -124,6 +124,23 @@ class SecurityRepository:
             self._session.execute(stmt)
         return len(rows)
 
+    def load_reference(
+        self, isins: list[str]
+    ) -> dict[str, tuple[float | None, dt.date | None, str]]:
+        """Return ``{isin: (coupon, maturity_date, source)}`` for the currently-stored rows."""
+        if not isins:
+            return {}
+        result: dict[str, tuple[float | None, dt.date | None, str]] = {}
+        for chunk in _chunks(isins):
+            rows = self._session.execute(
+                select(
+                    Security.isin, Security.coupon, Security.maturity_date, Security.source
+                ).where(Security.isin.in_(list(chunk)))
+            ).all()
+            for isin, coupon, maturity, source in rows:
+                result[isin] = (coupon, maturity, source)
+        return result
+
     def record_attribute(
         self, isin: str, attribute: str, value: str | None, *, effective: dt.date, source: str
     ) -> bool:

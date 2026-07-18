@@ -33,9 +33,8 @@ DAY2 = dt.date(2026, 7, 17)
 class FakeUniverseSource:
     """A :class:`UniverseFetcher` yielding canned records (no network)."""
 
-    name = SOURCE
-
-    def __init__(self, records: list[SecurityRecord]) -> None:
+    def __init__(self, records: list[SecurityRecord], *, name: str = SOURCE) -> None:
+        self.name = name
         self._records = records
 
     def iter_records(
@@ -172,3 +171,40 @@ def test_active_securities_view_excludes_matured_and_dead(database: Database) ->
         )
     assert ISIN_A in active
     assert ISIN_B not in active  # matured is filtered out of the investable universe
+
+
+def test_cross_source_reconciliation_flags_coupon_mismatch(database: Database) -> None:
+    src_a, src_b, isin = "reconA", "reconB", "INUNIV000009"
+
+    def _mk(source: str, coupon: float) -> SecurityRecord:
+        return SecurityRecord(
+            isin=isin,
+            instrument_type=InstrumentType.CORP,
+            source=source,
+            coupon=coupon,
+            maturity_date=dt.date(2030, 1, 1),
+        )
+
+    try:
+        UniversePipeline(database, source=FakeUniverseSource([_mk(src_a, 7.0)], name=src_a)).run(
+            DAY1
+        )
+        # src_b reports a different coupon for the same ISIN -> mismatch
+        UniversePipeline(database, source=FakeUniverseSource([_mk(src_b, 8.5)], name=src_b)).run(
+            DAY1
+        )
+        with database.session() as s:
+            observed = s.execute(
+                text(
+                    "SELECT observed FROM data_quality_checks WHERE source=:src "
+                    "AND check_name='cross_source_coupon_mismatch' ORDER BY id DESC LIMIT 1"
+                ),
+                {"src": src_b},
+            ).scalar_one()
+        assert observed == 1.0
+    finally:
+        with database.session() as s:
+            for src in (src_a, src_b):
+                s.execute(delete(Security).where(Security.source == src))
+                s.execute(delete(IngestionRun).where(IngestionRun.source == src))
+                s.execute(text("DELETE FROM data_quality_checks WHERE source=:s"), {"s": src})

@@ -82,12 +82,14 @@ class UniversePipeline:
                 logger.error("universe.failed", dataset=dataset, error=repr(exc))
                 return PipelineResult(as_of, dataset, RunStatus.FAILED, message=repr(exc))
 
-            securities = SecurityRepository(session)
-            rows = securities.upsert_many(records, seen_on=as_of)
-            changes = self._record_attributes(securities, records, effective=as_of)
+            # Quality + reconciliation run first: reconciliation compares against the row a
+            # *different* source last wrote, before this upsert overwrites it.
             QualityInspector(
                 session, source=self._source.name, dataset=dataset, run_date=as_of
             ).inspect_universe(records)
+            securities = SecurityRepository(session)
+            rows = securities.upsert_many(records, seen_on=as_of)
+            changes = self._record_attributes(securities, records, effective=as_of)
             runs.finish(run, status=RunStatus.SUCCESS, rows=rows, message=f"{changes} attr changes")
             logger.info("universe.success", dataset=dataset, rows=rows, attr_changes=changes)
             return PipelineResult(as_of, dataset, RunStatus.SUCCESS, rows=rows)
