@@ -50,6 +50,37 @@ def test_upsert_out_of_order_keeps_true_seen_window(db: Database) -> None:
         assert row.last_seen == dt.date(2026, 7, 18)  # latest, did not regress
 
 
+def test_enrich_missing_fills_nulls_without_overwriting(db: Database) -> None:
+    # Seed a sparse row (coupon null, issuer set), then enrich: null coupon fills, set issuer stays.
+    with db.session() as s:
+        SecurityRepository(s).upsert_many(
+            [
+                SecurityRecord(
+                    isin=ISIN,
+                    instrument_type=InstrumentType.CORP,
+                    source="cdsl",
+                    issuer="Original Issuer",
+                )
+            ],
+            seen_on=DAY,
+        )
+    enrichment = SecurityRecord(
+        isin=ISIN,
+        instrument_type=InstrumentType.CORP,
+        source="bondcentral",
+        coupon=8.5,
+        issuer="BondCentral Issuer",  # must NOT overwrite the existing issuer
+        maturity_date=dt.date(2030, 6, 1),
+    )
+    with db.session() as s:
+        SecurityRepository(s).enrich_missing([enrichment])
+    with db.session() as s:
+        row = s.execute(select(Security).where(Security.isin == ISIN)).scalar_one()
+        assert row.coupon == pytest.approx(8.5)  # null -> filled
+        assert row.maturity_date == dt.date(2030, 6, 1)  # null -> filled
+        assert row.issuer == "Original Issuer"  # already set -> preserved
+
+
 def test_insert_missing_inserts_then_does_not_overwrite(db: Database) -> None:
     # First insert (as if from FBIL) writes the row.
     with db.session() as s:

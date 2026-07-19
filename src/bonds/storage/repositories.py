@@ -9,7 +9,7 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import Iterator, Sequence
 
-from sqlalchemy import CursorResult, func, select
+from sqlalchemy import CursorResult, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -217,6 +217,29 @@ class SecurityRepository:
             if isinstance(result, CursorResult):
                 inserted += max(result.rowcount, 0)  # rowcount is -1 when the driver can't report
         return inserted
+
+    def enrich_missing(self, records: list[SecurityRecord]) -> int:
+        """Coalesce-fill NULL reference fields on existing securities (never overwrites a value).
+
+        Used to backfill coupon/maturity/issuer from an enrichment source (BondCentral) onto rows
+        an upstream (CDSL) left sparse. Returns the number of rows touched.
+        """
+        touched = 0
+        for r in records:
+            result = self._session.execute(
+                update(Security)
+                .where(Security.isin == r.isin)
+                .values(
+                    coupon=func.coalesce(Security.coupon, r.coupon),
+                    maturity_date=func.coalesce(Security.maturity_date, r.maturity_date),
+                    issuer=func.coalesce(Security.issuer, r.issuer),
+                    interest_type=func.coalesce(Security.interest_type, r.interest_type),
+                    face_value=func.coalesce(Security.face_value, r.face_value),
+                )
+            )
+            if isinstance(result, CursorResult):
+                touched += max(result.rowcount, 0)
+        return touched
 
     def load_reference(
         self, isins: list[str]

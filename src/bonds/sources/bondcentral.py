@@ -114,6 +114,20 @@ class BondCentralSource(MetricsCollector):
             rows_dropped=total_items - total_kept,
         )
 
+    def fetch_reference(self, isin: str) -> SecurityRecord | None:
+        """Fetch one security's reference data by ISIN (for enrichment); ``None`` if not covered.
+
+        The detail lookup ``/securities/?isin=X`` returns the same ``{isin, data:{...}}`` shape as
+        the list, so it reuses :func:`_parse_item` (coupon_rate, maturity_date, issuer, etc.).
+        """
+        response = self._client.get(
+            _URL,
+            params={"isin": isin, "page": "1", "size": "1"},
+            headers={"Accept": "application/json", "Origin": _ORIGIN},
+        )
+        items = response.json().get("data") or []
+        return _parse_item(items[0]) if items else None
+
 
 # ---------------------------------------------------------------------- parsing
 def _parse_item(item: dict[str, Any]) -> SecurityRecord | None:

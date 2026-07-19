@@ -33,6 +33,7 @@ from bonds.pipelines import (
     UniversePipeline,
 )
 from bonds.pipelines.catchup import DEFAULT_MAX_GAP_DAYS, catch_up
+from bonds.pipelines.enrichment import EnrichmentPipeline
 from bonds.pipelines.suite import StepOutcome, default_suite, summarize
 from bonds.pipelines.universe import UniverseFetcher
 from bonds.quality.assessment import AssessmentReport, run_assessment
@@ -305,6 +306,20 @@ def ingest_ccil_trades_backfill(
     pipeline = TradePipeline(db, source=source, derive_securities=derive_securities)
     results = [pipeline.run(day) for day in business_days(start.date(), end.date())]
     _summarise(results, label=f"ccil-backfill {start.date()}..{end.date()}")
+
+
+@ingest_app.command("enrich-securities")
+def ingest_enrich_securities(
+    limit: Annotated[
+        int | None,
+        typer.Option(help="Max securities to enrich this run (omit for all missing coupons)."),
+    ] = None,
+) -> None:
+    """Fill missing coupon/maturity/issuer on securities from BondCentral (coalesce, gap-fill)."""
+    _init_logging()
+    day = dt.datetime.now(dt.UTC).date()
+    result = EnrichmentPipeline(Database()).run(day, limit=limit)
+    _summarise([result], label=f"enrich-securities {day.isoformat()}")
 
 
 @ingest_app.command("rbi-auctions")
