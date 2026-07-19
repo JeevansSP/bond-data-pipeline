@@ -7,6 +7,19 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+# Plausible bond-maturity window. Outside this, a date is a sentinel/placeholder, not a real
+# maturity: CDSL uses 1999-12-31 (no-maturity) and 2099-12-31 / 2999-12-31 (perpetual bonds), and
+# the floor is set below the earliest real instrument (a 2002 T-Bill) so no genuine maturity is cut.
+_MATURITY_MIN: dt.date = dt.date(2001, 1, 1)
+_MATURITY_MAX: dt.date = dt.date(2098, 12, 31)
+
+
+def _plausible_maturity(value: dt.date | None) -> dt.date | None:
+    """Null a maturity that falls outside the plausible window (a placeholder, not a real date)."""
+    if value is not None and not (_MATURITY_MIN <= value <= _MATURITY_MAX):
+        return None
+    return value
+
 
 class InstrumentType(StrEnum):
     """Bond instrument classification used across the universe."""
@@ -53,6 +66,11 @@ class SovereignValuation(BaseModel):
     @classmethod
     def _ytm_nonneg_or_none(cls, v: float | None) -> float | None:
         return v if v is None or v >= 0 else None
+
+    @field_validator("maturity_date")
+    @classmethod
+    def _maturity_plausible_or_none(cls, v: dt.date | None) -> dt.date | None:
+        return _plausible_maturity(v)
 
 
 class TradeRecord(BaseModel):
@@ -133,3 +151,8 @@ class SecurityRecord(BaseModel):
     def _coupon_nonneg_or_none(cls, v: float | None) -> float | None:
         # Match ck_security_coupon_nonneg: one bad coupon nulls out rather than failing the batch.
         return v if v is None or v >= 0 else None
+
+    @field_validator("maturity_date")
+    @classmethod
+    def _maturity_plausible_or_none(cls, v: dt.date | None) -> dt.date | None:
+        return _plausible_maturity(v)

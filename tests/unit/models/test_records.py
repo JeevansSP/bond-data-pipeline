@@ -48,3 +48,27 @@ def test_negative_coupon_coerced_to_none() -> None:
         isin="IN1520160061", instrument_type=InstrumentType.SDL, source="cdsl", coupon=0.0
     )
     assert ok.coupon == 0.0  # zero-coupon is valid
+
+
+@pytest.mark.parametrize(
+    ("maturity", "expected"),
+    [
+        (dt.date(1999, 12, 31), None),  # CDSL no-maturity sentinel
+        (dt.date(2999, 12, 31), None),  # perpetual-bond sentinel
+        (dt.date(2099, 12, 31), None),  # perpetual-bond sentinel
+        (dt.date(1934, 1, 9), None),  # junk
+        (dt.date(2002, 3, 21), dt.date(2002, 3, 21)),  # real 2002 T-Bill maturity kept
+        (dt.date(2065, 6, 1), dt.date(2065, 6, 1)),  # real long-dated G-Sec kept
+        (None, None),
+    ],
+)
+def test_implausible_maturity_coerced_to_none(
+    maturity: dt.date | None, expected: dt.date | None
+) -> None:
+    r = SecurityRecord(
+        isin="IN1520160061",
+        instrument_type=InstrumentType.CORP,
+        source="cdsl",
+        maturity_date=maturity,
+    )
+    assert r.maturity_date == expected
