@@ -35,6 +35,8 @@ from bonds.pipelines import (
 from bonds.pipelines.catchup import DEFAULT_MAX_GAP_DAYS, catch_up
 from bonds.pipelines.suite import StepOutcome, default_suite, summarize
 from bonds.pipelines.universe import UniverseFetcher
+from bonds.quality.assessment import AssessmentReport, run_assessment
+from bonds.quality.checks import Level
 from bonds.sources.bondcentral import BondCentralSource
 from bonds.sources.ccil_historical import CcilHistoricalTradesSource, derive_securities
 from bonds.sources.cdsl import CdslSource
@@ -44,8 +46,10 @@ from bonds.storage import Database
 app = typer.Typer(add_completion=False, help="Indian bond market data pipelines.")
 db_app = typer.Typer(help="Database bootstrap/maintenance.")
 ingest_app = typer.Typer(help="Run ingestion pipelines.")
+dq_app = typer.Typer(help="Data-quality assessment.")
 app.add_typer(db_app, name="db")
 app.add_typer(ingest_app, name="ingest")
+app.add_typer(dq_app, name="dq")
 
 logger = get_logger("bonds.cli")
 
@@ -67,6 +71,42 @@ def db_init() -> None:
     _init_logging()
     Database().create_all()
     typer.echo("✔ schema created")
+
+
+_VERDICT = {
+    (Level.ERROR, False): "[bold red]✗ ERROR[/]",
+    (Level.WARN, False): "[yellow]⚠ WARN[/]",
+    (Level.INFO, True): "[dim]· info[/]",
+}
+
+
+def _render_assessment(console: Console, report: AssessmentReport) -> None:
+    for dimension, checks in report.groups.items():
+        table = Table(title=dimension, title_style="bold", title_justify="left")
+        table.add_column("Check")
+        table.add_column("Verdict")
+        table.add_column("Observed", justify="right")
+        table.add_column("Detail", style="dim")
+        for c in checks:
+            verdict = _VERDICT.get((c.level, c.passed), "[green]✓ pass[/]")
+            obs = "" if c.observed is None else f"{c.observed:,.4g}"
+            table.add_row(c.name, verdict, obs, c.detail or "")
+        console.print(table)
+
+
+@dq_app.command("assess")
+def dq_assess() -> None:
+    """Run the full database-wide data-quality assessment (exit 1 on any ERROR)."""
+    _init_logging()
+    console = Console()
+    report = run_assessment(Database())
+    _render_assessment(console, report)
+    errors = sum(1 for c in report.checks if c.level is Level.ERROR and not c.passed)
+    warns = sum(1 for c in report.checks if c.level is Level.WARN and not c.passed)
+    style = "bold red" if errors else ("yellow" if warns else "bold green")
+    console.print(f"[{style}]{errors} error(s), {warns} warning(s)[/]")
+    if errors:
+        raise typer.Exit(code=1)
 
 
 def _summarise(results: list[PipelineResult], *, label: str) -> None:

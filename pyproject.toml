@@ -107,6 +107,7 @@ omit = [
     "src/bonds/pipelines/trade.py",
     "src/bonds/pipelines/catchup.py",  # orchestrates network+DB pipelines (integration path)
     "src/bonds/quality/inspector.py",
+    "src/bonds/quality/assessment.py",  # DB-wide queries (integration path)
     "src/bonds/sources/rbi.py",  # fetch_auctions does per-auction detail fetches (integration path)
 ]
 
