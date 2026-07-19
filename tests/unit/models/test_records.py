@@ -72,3 +72,13 @@ def test_implausible_maturity_coerced_to_none(
         maturity_date=maturity,
     )
     assert r.maturity_date == expected
+
+
+def test_interest_type_truncated_to_column_width() -> None:
+    r = SecurityRecord(
+        isin="IN1520160061",
+        instrument_type=InstrumentType.CORP,
+        source="bondcentral",
+        interest_type="X" * 60,  # longer than VARCHAR(48)
+    )
+    assert r.interest_type is not None and len(r.interest_type) == 48

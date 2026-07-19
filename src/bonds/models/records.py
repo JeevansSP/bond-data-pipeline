@@ -156,3 +156,10 @@ class SecurityRecord(BaseModel):
     @classmethod
     def _maturity_plausible_or_none(cls, v: dt.date | None) -> dt.date | None:
         return _plausible_maturity(v)
+
+    @field_validator("interest_type")
+    @classmethod
+    def _interest_type_fits_column(cls, v: str | None) -> str | None:
+        # securities.interest_type is VARCHAR(48); a longer source value (some BondCentral corp
+        # categories) is truncated rather than overflowing and failing the whole batch.
+        return v[:48] if v is not None else None

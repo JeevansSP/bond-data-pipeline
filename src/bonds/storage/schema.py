@@ -73,7 +73,7 @@ class Security(Base):
     description: Mapped[str | None] = mapped_column(Text)
     issuer: Mapped[str | None] = mapped_column(Text, index=True)
     coupon: Mapped[float | None] = mapped_column(Float)
-    interest_type: Mapped[str | None] = mapped_column(String(24))
+    interest_type: Mapped[str | None] = mapped_column(String(48))
     maturity_date: Mapped[dt.date | None] = mapped_column(Date, index=True)
     face_value: Mapped[float | None] = mapped_column(Float)
     source: Mapped[str] = mapped_column(String(32))
