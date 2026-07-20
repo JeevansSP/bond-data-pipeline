@@ -30,9 +30,10 @@ logger = get_logger(__name__)
 _URL: Final = "https://api.bondcentral.in/securities/"
 _ORIGIN: Final = "https://bondcentral.in"
 _MAX_PAGE_SIZE: Final = 100
-# A page that keeps 500-ing (BondCentral has a broken ~100-record window) shouldn't sink the whole
-# ~256-page snapshot; skip it and continue, but abort if too many fail (a real outage).
-_MAX_SKIPPED_PAGES: Final = 5
+# BondCentral persistently 500s on several broken ~100-record windows (~6 of 256 pages observed,
+# ~2.4%); those records are simply un-fetchable, so skip them and take the ~25k we can get rather
+# than sink the whole snapshot. The cap still trips a genuine outage (>~12% of pages failing).
+_MAX_SKIPPED_PAGES: Final = 30
 
 
 class BondCentralSource(MetricsCollector):
