@@ -16,17 +16,23 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Final
 
+import httpx
+
 from bonds.config import Settings, get_settings
 from bonds.http import ThrottledClient
 from bonds.logging import get_logger
 from bonds.models import InstrumentType, SecurityRecord
 from bonds.quality.metrics import MetricsCollector
+from bonds.sources.base import SourceError
 
 logger = get_logger(__name__)
 
 _URL: Final = "https://api.bondcentral.in/securities/"
 _ORIGIN: Final = "https://bondcentral.in"
 _MAX_PAGE_SIZE: Final = 100
+# A page that keeps 500-ing (BondCentral has a broken ~100-record window) shouldn't sink the whole
+# ~256-page snapshot; skip it and continue, but abort if too many fail (a real outage).
+_MAX_SKIPPED_PAGES: Final = 5
 
 
 class BondCentralSource(MetricsCollector):
@@ -79,9 +85,26 @@ class BondCentralSource(MetricsCollector):
         size = min(size, _MAX_PAGE_SIZE)
         self.reset_metrics()
         page = 1
-        total_bytes = total_items = total_kept = 0
+        total_bytes = total_items = total_kept = skipped_pages = 0
+        known_total_pages: int | None = None
         while True:
-            payload, page_bytes = self._fetch_page(page, size, as_of)
+            try:
+                payload, page_bytes = self._fetch_page(page, size, as_of)
+            except httpx.HTTPError as exc:
+                # A persistently-failing page must not abort the whole snapshot: skip it and go on,
+                # capped so a genuine outage still fails loudly.
+                skipped_pages += 1
+                logger.warning("bondcentral.page_skipped", page=page, error=str(exc)[:80])
+                if skipped_pages > _MAX_SKIPPED_PAGES:
+                    raise SourceError(
+                        f"BondCentral: {skipped_pages} pages failed to fetch; aborting"
+                    ) from exc
+                if (known_total_pages is not None and page >= known_total_pages) or (
+                    max_pages is not None and page >= max_pages
+                ):
+                    break
+                page += 1
+                continue
             items = payload.get("data") or []
             kept = 0
             for item in items:
@@ -93,6 +116,7 @@ class BondCentralSource(MetricsCollector):
             total_items += len(items)
             total_kept += kept
             info = payload.get("pagination_info") or {}
+            known_total_pages = info.get("total_pages") or known_total_pages
             logger.info(
                 "bondcentral.page",
                 page=page,
@@ -106,6 +130,8 @@ class BondCentralSource(MetricsCollector):
             if max_pages is not None and page >= max_pages:
                 break
             page += 1
+        if skipped_pages:
+            logger.warning("bondcentral.pages_skipped_total", skipped=skipped_pages)
         self.add_metric(
             "universe",
             bytes_downloaded=total_bytes,

@@ -85,6 +85,36 @@ def test_iter_records_paginates_until_exhausted(tmp_path: Path) -> None:
     assert all(r.instrument_type is InstrumentType.CORP for r in records)
 
 
+def _page(isin: str, total: int, has_next: bool) -> dict[str, Any]:
+    return {
+        "data": [{"isin": isin, "data": {"isin": isin, "coupon_rate": 7.0}}],
+        "pagination_info": {"total_pages": total, "has_next": has_next},
+    }
+
+
+@respx.mock
+def test_iter_records_skips_persistently_failing_page(tmp_path: Path) -> None:
+    # BondCentral 500s a broken middle page; the pull must skip it and keep going, not abort.
+    respx.get(URL, params={"page": "1", "size": "100"}).mock(
+        return_value=httpx.Response(200, json=_page("INE002A07809", total=3, has_next=True))
+    )
+    respx.get(URL, params={"page": "2", "size": "100"}).mock(return_value=httpx.Response(500))
+    respx.get(URL, params={"page": "3", "size": "100"}).mock(
+        return_value=httpx.Response(200, json=_page("IN8241O08017", total=3, has_next=False))
+    )
+    records = list(_source(tmp_path).iter_records(AS_OF))
+    assert {r.isin for r in records} == {"INE002A07809", "IN8241O08017"}  # page 2 skipped
+
+
+@respx.mock
+def test_iter_records_aborts_when_too_many_pages_fail(tmp_path: Path) -> None:
+    from bonds.sources.base import SourceError
+
+    respx.get(URL).mock(return_value=httpx.Response(500))  # every page fails
+    with pytest.raises(SourceError, match="pages failed"):
+        list(_source(tmp_path).iter_records(AS_OF))
+
+
 @respx.mock
 def test_parsing_maps_fields_and_rating(tmp_path: Path) -> None:
     _mock_pages()
