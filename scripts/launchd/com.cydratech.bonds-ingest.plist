@@ -18,11 +18,11 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>/Users/jeevanprakash/Desktop/work/cydratech/bonds-research/scripts/run_daily_ingest.sh</string>
+    <string>/Users/jeevanprakash/work/cydratech/bonds-research/scripts/run_daily_ingest.sh</string>
   </array>
 
   <key>WorkingDirectory</key>
-  <string>/Users/jeevanprakash/Desktop/work/cydratech/bonds-research</string>
+  <string>/Users/jeevanprakash/work/cydratech/bonds-research</string>
 
   <key>StartCalendarInterval</key>
   <dict>
@@ -36,9 +36,9 @@
   <true/>
 
   <key>StandardOutPath</key>
-  <string>/Users/jeevanprakash/Desktop/work/cydratech/bonds-research/data/logs/launchd.out.log</string>
+  <string>/Users/jeevanprakash/work/cydratech/bonds-research/data/logs/launchd.out.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/jeevanprakash/Desktop/work/cydratech/bonds-research/data/logs/launchd.err.log</string>
+  <string>/Users/jeevanprakash/work/cydratech/bonds-research/data/logs/launchd.err.log</string>
 
   <key>ProcessType</key>
   <string>Background</string>
