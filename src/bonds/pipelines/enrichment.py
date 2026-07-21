@@ -14,7 +14,7 @@ import datetime as dt
 from typing import Protocol
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from bonds.logging import get_logger
@@ -50,14 +50,26 @@ class EnrichmentPipeline:
         self._source = source or BondCentralSource()
 
     def run(self, as_of: dt.date, *, limit: int | None = None) -> PipelineResult:
-        """Enrich up to ``limit`` securities that are missing a coupon (all if ``None``)."""
+        """Enrich up to ``limit`` securities missing an *expected* coupon (all if ``None``)."""
         dataset = f"{self._source.name}.enrichment"
         with self._db.session() as session:
             # BondCentral is a corporate securities master, so only corporate rows are enrichable;
             # sovereign ISINs (IN00...) aren't in it and would all resolve to None.
+            #
+            # A NULL coupon is only a *gap* where a fixed coupon should exist. For zero-coupon and
+            # market-linked paper (Variable-Index/Equity/Commodity, MIBOR floaters — ~6.7k rows)
+            # NULL is the correct value; selecting them would refetch the same unfillable ISINs
+            # on every run (verified: a full pass filled zero of them).
             stmt = (
                 select(Security.isin)
-                .where(Security.coupon.is_(None), Security.instrument_type == "CORP")
+                .where(
+                    Security.coupon.is_(None),
+                    Security.instrument_type == "CORP",
+                    or_(
+                        Security.interest_type.is_(None),
+                        Security.interest_type.ilike("%fixed%"),
+                    ),
+                )
                 .order_by(Security.isin)
             )
             if limit is not None:
