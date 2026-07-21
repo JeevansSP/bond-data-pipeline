@@ -95,8 +95,9 @@ branch = true
 # The unit-coverage floor covers pure/logic modules. The Postgres-dependent layer
 # (engine, repositories, DB orchestration) is exercised by `-m integration` tests that
 # run against a live database in CI/verification, so it is omitted from the unit floor.
+# Keep this list honest: only omit modules that genuinely cannot run without a live DB —
+# an omitted file with unit tests hides real gaps (this is how catch_up() went untested).
 omit = [
-    "src/bonds/cli.py",
     "*/migrations/*",
     "src/bonds/storage/database.py",
     "src/bonds/storage/repositories.py",
@@ -105,10 +106,9 @@ omit = [
     "src/bonds/pipelines/public_issue.py",
     "src/bonds/pipelines/rbi_auction.py",
     "src/bonds/pipelines/trade.py",
-    "src/bonds/pipelines/catchup.py",  # orchestrates network+DB pipelines (integration path)
+    "src/bonds/pipelines/enrichment.py",  # DB query + coalesce-update (integration path)
     "src/bonds/quality/inspector.py",
     "src/bonds/quality/assessment.py",  # DB-wide queries (integration path)
-    "src/bonds/sources/rbi.py",  # fetch_auctions does per-auction detail fetches (integration path)
 ]
 
 [tool.coverage.report]
