@@ -211,9 +211,10 @@ def test_derive_security_strip_maturity_glued_and_spaced(desc: str, maturity: dt
     assert gsec.maturity_date is None  # year-only in the feed -> left unknown
 
 
-def test_derive_security_sdl_issuer_none_and_sgb() -> None:
+def test_derive_security_sdl_state_issuer_and_sgb() -> None:
     sdl = derive_security("IN2220190127", "06.97 MAHARASHTRA SGS 2028", "SDL")
-    assert sdl is not None and sdl.instrument_type is InstrumentType.SDL and sdl.issuer is None
+    assert sdl is not None and sdl.instrument_type is InstrumentType.SDL
+    assert sdl.issuer == "State Government (MAHARASHTRA)"
     sgb = derive_security("IN0020210228", "02.50 SGB 2029 SERIES VIII", "SGB")
     assert sgb is not None and sgb.instrument_type is InstrumentType.SGB
     assert sgb.coupon == pytest.approx(2.50)
@@ -280,3 +281,71 @@ def test_fetch_trades_end_to_end(tmp_path: Path) -> None:
     records = source.fetch_trades(dt.date(2026, 7, 17))
     assert {r.segment for r in records} == {"GSEC", "SDL", "TBILL"}
     assert (tmp_path / "raw" / "ccil" / "historical_trades_2026-07-17_2026-07-17.csv").exists()
+
+
+class TestRepairPriceYield:
+    """CCIL occasionally lands price/yield transposed; the parser must repair or discard."""
+
+    def test_transposed_columns_are_swapped_back(self) -> None:
+        # Real example (IN0020140029, 2014-06-24): price 8.48 / yield 104.2283.
+        csv = _HEADER + (
+            "24-06-2014,10:00:00,IN0020140029,08.27 GOVT. STOCK 2020(WR),50000000,8.48,104.2283,O\n"
+        )
+        rec = aggregate_trades(csv, source="ccil")[0]
+        assert rec.ltp == pytest.approx(104.2283)
+        assert rec.lty == pytest.approx(8.48)
+        assert rec.wap == pytest.approx(104.2283)
+        assert rec.way == pytest.approx(8.48)
+
+    def test_implausible_yield_with_plausible_price_is_discarded(self) -> None:
+        # Real example (IN002012X024, 2012-08-22): price 83.93 (plausible T-Bill),
+        # yield 98.43 (garbage) -> keep the price, drop the yield.
+        csv = (
+            _HEADER
+            + "22-08-2012,10:00:00,IN002012X024,091 DTB 02112012,50000000,83.9307,98.4262,O\n"
+        )
+        rec = aggregate_trades(csv, source="ccil")[0]
+        assert rec.ltp == pytest.approx(83.9307)
+        assert rec.lty is None
+        assert rec.way is None
+
+    def test_negative_yield_is_discarded(self) -> None:
+        csv = (
+            _HEADER
+            + "09-12-2013,10:00:00,IN2220190127,09.37 GUJARAT SDL 2023,50000000,101.5,-50.76,O\n"
+        )
+        rec = aggregate_trades(csv, source="ccil")[0]
+        assert rec.ltp == pytest.approx(101.5)
+        assert rec.lty is None
+
+    def test_plausible_rows_pass_through_untouched(self) -> None:
+        csv = (
+            _HEADER
+            + "17-07-2026,10:00:00,IN0020260025,07.10 GOVT. STOCK 2029,50000000,101.115,7.08,O\n"
+        )
+        rec = aggregate_trades(csv, source="ccil")[0]
+        assert rec.ltp == pytest.approx(101.115)
+        assert rec.lty == pytest.approx(7.08)
+
+
+@pytest.mark.parametrize(
+    ("desc", "issuer"),
+    [
+        ("05.60 ANDHRA PRADESH SDL 2014", "State Government (ANDHRA PRADESH)"),
+        ("09.37 MAHARASHTRA S.D. 2023", "State Government (MAHARASHTRA)"),
+        ("06.97 MAHARASHTRA SGS 2028", "State Government (MAHARASHTRA)"),
+        ("07.33 JAMMU & KASHMIR SDL 2029", "State Government (JAMMU & KASHMIR)"),
+        ("garbage with no state marker", None),
+        (None, None),
+    ],
+)
+def test_sdl_issuer_derivation(desc: str | None, issuer: str | None) -> None:
+    rec = derive_security("IN1020090015", desc, "SDL")
+    assert rec is not None
+    assert rec.issuer == issuer
+
+
+def test_sgb_issuer_is_goi() -> None:
+    rec = derive_security("IN0020260033", "02.50 SGB 2026 SERIES XIV 17 18 FV 2881", "SGB")
+    assert rec is not None
+    assert rec.issuer == "Government of India"

@@ -165,6 +165,62 @@ def check_completeness(conn: Connection) -> list[QualityCheck]:
     return checks
 
 
+def check_consistency(conn: Connection) -> list[QualityCheck]:
+    """Internal contradictions and staleness signals in the securities master."""
+    zero_coupon_conflict = _scalar(
+        conn,
+        "SELECT count(*) FROM securities "
+        "WHERE upper(interest_type) LIKE '%ZERO%' AND coupon IS NOT NULL AND coupon > 0",
+    )
+    # Implausible-looking sovereign/corp yields in trades: the CCIL transposition guard nulls
+    # these at parse time now, so anything remaining is either old data or a new pattern.
+    implausible_yields = _scalar(
+        conn,
+        "SELECT count(*) FROM trades WHERE lty IS NOT NULL AND (lty < 0 OR lty > 40)",
+    )
+    matured_active = _scalar(
+        conn,
+        "SELECT count(*) FROM securities s "
+        "JOIN security_attribute_history h ON h.isin=s.isin "
+        "  AND h.attribute='security_status' AND h.valid_to IS NULL AND h.value='ACTIVE' "
+        "WHERE s.maturity_date < CURRENT_DATE - INTERVAL '365 days'",
+    )
+    coupon_above_25 = _scalar(conn, "SELECT count(*) FROM securities WHERE coupon > 25")
+    return [
+        QualityCheck(
+            "zero_coupon_contradiction",
+            Level.WARN,
+            passed=zero_coupon_conflict == 0,
+            observed=zero_coupon_conflict,
+            detail="interest_type says zero-coupon but coupon > 0 (source contradiction)",
+        ),
+        QualityCheck(
+            "implausible_trade_yields",
+            Level.WARN,
+            passed=implausible_yields == 0,
+            observed=implausible_yields,
+            detail="lty < 0 or > 40 — transposed/garbled source columns",
+        ),
+        QualityCheck(
+            "matured_but_status_active",
+            Level.INFO,
+            passed=True,
+            observed=matured_active,
+            detail=(
+                "matured >1y ago yet upstream status still ACTIVE (stale source status; "
+                "the active_securities view already excludes them by maturity)"
+            ),
+        ),
+        QualityCheck(
+            "coupon_above_25pct",
+            Level.INFO,
+            passed=True,
+            observed=coupon_above_25,
+            detail="verified-legit distressed/high-yield paper; listed for awareness",
+        ),
+    ]
+
+
 def check_cross_source(conn: Connection) -> list[QualityCheck]:
     """CCIL traded VWAP should track FBIL published price for the same sovereign ISIN & day."""
     row = conn.execute(
@@ -220,6 +276,7 @@ def run_assessment(database: Database) -> AssessmentReport:
                 "Uniqueness": check_uniqueness(conn),
                 "Referential integrity": check_referential_integrity(conn),
                 "Completeness": check_completeness(conn),
+                "Consistency": check_consistency(conn),
                 "Cross-source reconciliation": check_cross_source(conn),
             }
         )

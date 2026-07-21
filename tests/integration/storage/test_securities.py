@@ -112,12 +112,23 @@ def test_upsert_null_reference_fields_do_not_regress_enriched_values(db: Databas
 
 
 def test_insert_missing_inserts_then_does_not_overwrite(db: Database) -> None:
-    # First insert (as if from FBIL) writes the row.
+    # First insert (as if from FBIL) writes the row; the return value is the TRUE insert count
+    # (cursor.rowcount is -1 for multi-row VALUES, so this must come from RETURNING).
     with db.session() as s:
-        SecurityRepository(s).insert_missing([_sec("fbil", InstrumentType.GSEC, 6.94)], seen_on=DAY)
+        assert (
+            SecurityRepository(s).insert_missing(
+                [_sec("fbil", InstrumentType.GSEC, 6.94)], seen_on=DAY
+            )
+            == 1
+        )
     # A later CCIL-derived insert for the SAME ISIN must NOT overwrite the authoritative row.
     with db.session() as s:
-        SecurityRepository(s).insert_missing([_sec("ccil", InstrumentType.TBILL, 0.0)], seen_on=DAY)
+        assert (
+            SecurityRepository(s).insert_missing(
+                [_sec("ccil", InstrumentType.TBILL, 0.0)], seen_on=DAY
+            )
+            == 0
+        )
     with db.session() as s:
         row = s.execute(select(Security).where(Security.isin == ISIN)).scalar_one()
         assert row.source == "fbil"  # unchanged

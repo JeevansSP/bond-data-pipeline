@@ -265,6 +265,34 @@ class _Agg:
         )
 
 
+# Plausibility bounds for Indian sovereign yields (% p.a.). Historical peak repo-era yields sit
+# well under 20; anything above _YTM_IMPLAUSIBLE is a price in the yield column, not a yield.
+_YTM_IMPLAUSIBLE: Final = 40.0
+_PRICE_LOOKS_LIKE_YIELD_MAX: Final = 40.0
+
+
+def _repair_price_yield(
+    price: float | None, ytm: float | None
+) -> tuple[float | None, float | None]:
+    """Undo CCIL's occasional price/yield column transposition; discard implausible yields.
+
+    Some sessions (seen on SDL/STRIPS/G-Sec rows across 2002-2023) land with the columns
+    swapped — e.g. price 8.48 / yield 104.23 for a bond trading near 104 at an 8.48% yield.
+    A yield above ``_YTM_IMPLAUSIBLE`` is never a real Indian sovereign yield, so:
+
+    * yield implausible and price small enough to *be* a yield -> swap them back;
+    * yield implausible but price plausible (isolated garbled cell) -> drop the yield;
+    * negative yield -> drop (not a real print in this market).
+    """
+    if ytm is not None and ytm > _YTM_IMPLAUSIBLE:
+        if price is not None and 0 < price < _PRICE_LOOKS_LIKE_YIELD_MAX:
+            return ytm, price
+        return price, None
+    if ytm is not None and ytm < 0:
+        return price, None
+    return price, ytm
+
+
 def _parse_row(row: list[str]) -> _ParsedRow | None:
     # Reject any row whose column count isn't the expected 8 — an unquoted comma (in a description
     # or a grouped number like "7,50,00,000") would otherwise shift every field silently.
@@ -274,13 +302,14 @@ def _parse_row(row: list[str]) -> _ParsedRow | None:
     isin = row[2].strip()
     if trade_date is None or len(isin) != 12 or not isin.startswith("IN"):
         return None
+    price, ytm = _repair_price_yield(_as_float(row[5]), _as_float(row[6]))
     return (
         isin,
         trade_date,
         row[3].strip() or None,
         _as_float(row[4]) or 0.0,
-        _as_float(row[5]),
-        _as_float(row[6]),
+        price,
+        ytm,
         _time_key(row[1]),
     )
 
@@ -374,17 +403,38 @@ def _parse_coupon(desc: str | None, segment: str) -> float | None:
     return float(m.group(1)) if m else None
 
 
+# SDL descriptions carry the full state name between the coupon and a drift-prone marker:
+# "05.60 ANDHRA PRADESH SDL 2014", "09.37 MAHARASHTRA S.D. 2023", "06.97 MAHARASHTRA SGS 2028".
+# Legacy (pre-2012) rows write the coupon with a % ("10.35% ASSAM SDL 2011") and sometimes drop
+# the marker entirely ("10.50% JAMMU & KASHMIR 2011") — the maturity year then bounds the state.
+_SDL_STATE_RE: Final = re.compile(
+    r"^\s*[\d.]+\s*%?\s+(?P<state>[A-Z .&]+?)\s*(?:\b(?:SDL|SGS|SGL)\b|S\.?\s?D\.?L?\.?\s|\d{4})"
+)
+
+
+def _sdl_issuer(desc: str | None) -> str | None:
+    m = _SDL_STATE_RE.match((desc or "").strip().upper())
+    if not m:
+        return None
+    state = " ".join(m.group("state").split())
+    return f"State Government ({state})"
+
+
 def derive_security(isin: str, descriptor: str | None, segment: str) -> SecurityRecord | None:
     """Build a reference :class:`SecurityRecord` from one traded CCIL instrument."""
     itype = _SEGMENT_TYPE.get(segment)
     if itype is None:
         return None
+    if segment in _CENTRAL_SEGMENTS:
+        issuer: str | None = "Government of India"
+    else:
+        issuer = _sdl_issuer(descriptor)  # SDL: state parsed from the description
     return SecurityRecord(
         isin=isin,
         instrument_type=itype,
         source="ccil",
         description=descriptor,
-        issuer="Government of India" if segment in _CENTRAL_SEGMENTS else None,
+        issuer=issuer,
         coupon=_parse_coupon(descriptor, segment),
         interest_type="ZERO_COUPON" if segment in _ZERO_COUPON_SEGMENTS else "FIXED",
         maturity_date=_parse_maturity(descriptor, segment),

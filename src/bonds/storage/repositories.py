@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from sqlalchemy import CursorResult, and_, case, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -22,7 +23,12 @@ from bonds.models import (
     SovereignValuation,
     TradeRecord,
 )
-from bonds.quality.metrics import FileMetric
+
+if TYPE_CHECKING:
+    # Annotation-only: a runtime import would create a cycle (bonds.quality's __init__ imports
+    # the inspector, which imports this module) that bites any caller importing bonds.storage
+    # before bonds.quality.
+    from bonds.quality.metrics import FileMetric
 from bonds.storage.schema import (
     DataQualityCheck,
     EtlFileMetric,
@@ -215,10 +221,11 @@ class SecurityRepository:
                 pg_insert(Security)
                 .values(list(chunk))
                 .on_conflict_do_nothing(index_elements=["isin"])
+                # RETURNING emits only actually-inserted rows, giving a true insert count —
+                # cursor.rowcount is -1 here (SQLAlchemy runs multi-row VALUES as executemany).
+                .returning(Security.isin)
             )
-            result = self._session.execute(stmt)
-            if isinstance(result, CursorResult):
-                inserted += max(result.rowcount, 0)  # rowcount is -1 when the driver can't report
+            inserted += len(self._session.execute(stmt).all())
         return inserted
 
     def enrich_missing(self, records: list[SecurityRecord]) -> int:

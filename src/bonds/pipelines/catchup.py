@@ -29,6 +29,7 @@ from bonds.pipelines.universe import UniversePipeline
 from bonds.sources.ccil_historical import CcilHistoricalTradesSource, derive_securities
 from bonds.sources.fbil import FbilSource
 from bonds.sources.nse import NseSource
+from bonds.sources.nse import derive_securities as derive_nse_securities
 from bonds.storage import Database
 from bonds.storage.repositories import DatasetProgress, IngestionRunRepository
 
@@ -160,6 +161,10 @@ def catch_up(
     groups["Universe · BondCentral"] = [UniversePipeline(database).run(as_of)]
     groups["Public issues · SEBI"] = [PublicIssuePipeline(database).run(as_of)]
     groups["Auctions · RBI"] = [RbiAuctionPipeline(database).run(as_of)]
-    groups["Corp trades · NSE"] = [TradePipeline(database, source=NseSource()).run(as_of)]
+    groups["Corp trades · NSE"] = [
+        TradePipeline(database, source=NseSource(), derive_securities=derive_nse_securities).run(
+            as_of
+        )
+    ]
 
     return CatchUpReport(as_of=as_of, groups=groups)

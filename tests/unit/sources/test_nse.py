@@ -11,6 +11,7 @@ import respx
 
 from bonds.config import HttpSettings, Settings
 from bonds.http import ThrottledClient
+from bonds.models import InstrumentType
 from bonds.sources.nse import NseSource, _as_float, _as_int, _parse_timestamp, _to_record
 
 _ROW = {
@@ -84,3 +85,52 @@ def test_fetch_trades_primes_cookies_and_parses_segments(tmp_path: Path) -> None
     assert len(records) == 1
     assert records[0].trade_date == dt.date(2026, 7, 17)  # from the envelope timestamp
     assert (tmp_path / "raw" / "nse" / "2026-07-18" / "otctrades_listed.json").exists()
+
+
+class TestDeriveSecurities:
+    """Minimal reference rows derived from trade descriptors (orphan-trade prevention)."""
+
+    def test_derives_issuer_and_coupon(self) -> None:
+        from bonds.sources.nse import derive_security
+
+        rec = derive_security("INE07HK07825", "KRAZYBEE SERVICES LIMITED 10.65 NCD 12AG27 FVRS1LAC")
+        assert rec.issuer == "KRAZYBEE SERVICES LIMITED"
+        assert rec.coupon == pytest.approx(10.65)
+        assert rec.instrument_type is InstrumentType.CORP
+        assert rec.source == "nse"
+
+    def test_series_markers_do_not_pollute_issuer(self) -> None:
+        from bonds.sources.nse import derive_security
+
+        rec = derive_security("INE00DJ07052", "TAPIR CONSTRUCTIONS LIMITED SR I TR I 12.5 NCD")
+        assert rec.issuer == "TAPIR CONSTRUCTIONS LIMITED"
+        assert rec.coupon == pytest.approx(12.5)
+
+    def test_missing_descriptor_still_yields_a_row(self) -> None:
+        from bonds.sources.nse import derive_security
+
+        rec = derive_security("INE0TEST0000", None)
+        assert rec.isin == "INE0TEST0000"
+        assert rec.issuer is None and rec.coupon is None
+
+    def test_batch_dedupes_by_isin(self) -> None:
+        from bonds.models import TradeRecord
+        from bonds.sources.nse import derive_securities
+
+        trades = [
+            TradeRecord(
+                isin="INE0TEST0000",
+                trade_date=dt.date(2026, 7, 20),
+                source="nse",
+                segment="otctrades_listed",
+                descriptor="ACME LTD 9.0 NCD",
+            ),
+            TradeRecord(
+                isin="INE0TEST0000",
+                trade_date=dt.date(2026, 7, 20),
+                source="nse",
+                segment="exchtrades_listed",
+                descriptor="ACME LTD 9.0 NCD",
+            ),
+        ]
+        assert len(derive_securities(trades)) == 1

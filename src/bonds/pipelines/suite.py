@@ -18,6 +18,7 @@ from bonds.pipelines.trade import TradePipeline
 from bonds.pipelines.universe import UniversePipeline
 from bonds.sources.ccil_historical import CcilHistoricalTradesSource, derive_securities
 from bonds.sources.nse import NseSource
+from bonds.sources.nse import derive_securities as derive_nse_securities
 from bonds.storage import Database
 
 
@@ -77,7 +78,11 @@ def default_suite(
         ),
         IngestStep(
             "Corp trades · NSE",
-            lambda: [TradePipeline(database, source=NseSource()).run(as_of)],
+            lambda: [
+                TradePipeline(
+                    database, source=NseSource(), derive_securities=derive_nse_securities
+                ).run(as_of)
+            ],
         ),
         IngestStep(
             "G-Sec/T-Bill trades · CCIL",

@@ -43,6 +43,7 @@ from bonds.sources.bondcentral import BondCentralSource
 from bonds.sources.ccil_historical import CcilHistoricalTradesSource, derive_securities
 from bonds.sources.cdsl import CdslSource
 from bonds.sources.nse import NseSource
+from bonds.sources.nse import derive_securities as derive_nse_securities
 from bonds.storage import Database
 
 app = typer.Typer(add_completion=False, help="Indian bond market data pipelines.")
@@ -301,7 +302,9 @@ def ingest_nse_trades(
     """Ingest NSE corporate-bond trades (latest session; forward capture)."""
     _init_logging()
     day = _day(as_of)
-    result = TradePipeline(Database(), source=NseSource()).run(day)
+    result = TradePipeline(
+        Database(), source=NseSource(), derive_securities=derive_nse_securities
+    ).run(day)
     _summarise([result], label=f"nse-trades {day.isoformat()}")
 
 

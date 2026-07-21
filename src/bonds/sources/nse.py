@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 from typing import Any, Final
 
 from bonds.config import Settings, get_settings
 from bonds.http import ThrottledClient
 from bonds.logging import get_logger
-from bonds.models import TradeRecord
+from bonds.models import InstrumentType, SecurityRecord, TradeRecord
 from bonds.quality.metrics import MetricsCollector
 
 logger = get_logger(__name__)
@@ -150,3 +151,44 @@ def _as_int(value: Any) -> int | None:
         return int(float(str(value).replace(",", "")))  # handle Indian-grouped / float-ish strings
     except (TypeError, ValueError):
         return None
+
+
+# ------------------------------------------------------- securities-master derivation
+# Some NSE-traded corporate ISINs never appear in the BondCentral/CDSL universe pulls (fresh
+# private placements, unlisted-segment paper). Derive a minimal reference row from the trade
+# descriptor so trades never orphan; the enrichment pass fills coupon/maturity properly later
+# (a missing coupon is exactly its selection criterion).
+#
+# Descriptors look like "KRAZYBEE SERVICES LIMITED 10.65 NCD 12AG27 FVRS10LAC" — issuer text,
+# then optionally a coupon and series/date noise. Cut the issuer at the first digit or series
+# marker; take the first decimal-looking number as the coupon.
+_ISSUER_END_RE: Final = re.compile(r"\s+(?:SR\b|SERIES\b|TR\b|\d)")
+_COUPON_RE: Final = re.compile(r"\b(\d{1,2}\.\d{1,4})\b")
+
+
+def _derive_issuer(descriptor: str) -> str | None:
+    match = _ISSUER_END_RE.search(descriptor)
+    issuer = (descriptor[: match.start()] if match else descriptor).strip(" -.,")
+    return issuer or None
+
+
+def derive_security(isin: str, descriptor: str | None) -> SecurityRecord:
+    """Best-effort minimal reference row for one NSE-traded corporate ISIN."""
+    desc = (descriptor or "").strip() or None
+    coupon_match = _COUPON_RE.search(desc or "")
+    return SecurityRecord(
+        isin=isin,
+        instrument_type=InstrumentType.CORP,
+        source=NseSource.name,
+        description=desc,
+        issuer=_derive_issuer(desc) if desc else None,
+        coupon=float(coupon_match.group(1)) if coupon_match else None,
+    )
+
+
+def derive_securities(trades: list[TradeRecord]) -> list[SecurityRecord]:
+    """Reference securities for a batch of NSE trades (one per ISIN, last descriptor wins)."""
+    by_isin: dict[str, SecurityRecord] = {}
+    for t in trades:
+        by_isin[t.isin] = derive_security(t.isin, t.descriptor)
+    return list(by_isin.values())
