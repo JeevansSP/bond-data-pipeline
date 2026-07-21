@@ -48,6 +48,8 @@ class MetricsCollector:
         rows_dropped: int = 0,
     ) -> None:
         """Record the funnel metrics for one artifact."""
+        if not hasattr(self, "metrics"):  # a connector that forgot reset_metrics() in __init__
+            self.reset_metrics()
         self.metrics.append(
             FileMetric(
                 artifact=artifact,

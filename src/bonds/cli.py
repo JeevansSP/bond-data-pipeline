@@ -6,6 +6,7 @@ import datetime as dt
 from collections import Counter
 from enum import StrEnum
 from typing import Annotated
+from zoneinfo import ZoneInfo
 
 import typer
 from rich.console import Console
@@ -54,6 +55,29 @@ app.add_typer(dq_app, name="dq")
 
 logger = get_logger("bonds.cli")
 
+_IST = ZoneInfo("Asia/Kolkata")
+
+
+def _today() -> dt.date:
+    """Today on the Indian market clock.
+
+    NOT UTC, which is still *yesterday* between 00:00 and 05:30 IST (e.g. a machine booting
+    at 01:00 IST triggering RunAtLoad).
+    """
+    return dt.datetime.now(_IST).date()
+
+
+def _day(as_of: dt.datetime | None) -> dt.date:
+    """Resolve an optional ``--as-of`` option to a date, defaulting to IST-today."""
+    return as_of.date() if as_of else _today()
+
+
+def _date_range(start: dt.datetime, end: dt.datetime) -> tuple[dt.date, dt.date]:
+    """Validate a backfill range, failing with a clean CLI error instead of a traceback."""
+    if start.date() > end.date():
+        raise typer.BadParameter(f"--start {start.date()} is after --end {end.date()}")
+    return start.date(), end.date()
+
 
 def _init_logging() -> None:
     settings = get_settings()
@@ -77,7 +101,10 @@ def db_init() -> None:
 _VERDICT = {
     (Level.ERROR, False): "[bold red]✗ ERROR[/]",
     (Level.WARN, False): "[yellow]⚠ WARN[/]",
+    # INFO rows are observations, not enforced checks — render dim either way (a failed INFO
+    # must not fall through to a green "✓ pass").
     (Level.INFO, True): "[dim]· info[/]",
+    (Level.INFO, False): "[dim]· info[/]",
 }
 
 
@@ -159,7 +186,7 @@ def ingest_all(
     """Run the full daily ingest suite (all sources) with a live progress TUI."""
     # Quiet logs so structlog output doesn't garble the live display.
     configure_logging(level="WARNING", json=get_settings().log_json)
-    day = (as_of or dt.datetime.now(dt.UTC)).date()
+    day = _day(as_of)
     console = Console()
     steps = default_suite(Database(), day, max_universe_pages=max_universe_pages)
     outcomes: dict[str, StepOutcome] = {}
@@ -207,7 +234,7 @@ def ingest_catch_up(
     Idempotent — safe to run twice a day or after the machine was offline for several days.
     """
     _init_logging()
-    day = (as_of or dt.datetime.now(dt.UTC)).date()
+    day = _day(as_of)
     report = catch_up(Database(), as_of=day, max_gap_days=max_gap_days)
     outcomes = {label: summarize(results) for label, results in report.groups.items()}
     _print_summary(Console(), day, outcomes)
@@ -242,7 +269,7 @@ def ingest_universe(
 ) -> None:
     """Upsert a securities-master universe + attribute history (BondCentral or CDSL)."""
     _init_logging()
-    day = (as_of or dt.datetime.now(dt.UTC)).date()
+    day = _day(as_of)
     connector: UniverseFetcher = (
         CdslSource() if source is UniverseSource.cdsl else BondCentralSource()
     )
@@ -259,7 +286,7 @@ def ingest_public_issues(
 ) -> None:
     """Ingest the SEBI corporate-bond public-issue calendar."""
     _init_logging()
-    day = (as_of or dt.datetime.now(dt.UTC)).date()
+    day = _day(as_of)
     result = PublicIssuePipeline(Database()).run(day)
     _summarise([result], label=f"public-issues {day.isoformat()}")
 
@@ -273,7 +300,7 @@ def ingest_nse_trades(
 ) -> None:
     """Ingest NSE corporate-bond trades (latest session; forward capture)."""
     _init_logging()
-    day = (as_of or dt.datetime.now(dt.UTC)).date()
+    day = _day(as_of)
     result = TradePipeline(Database(), source=NseSource()).run(day)
     _summarise([result], label=f"nse-trades {day.isoformat()}")
 
@@ -287,7 +314,7 @@ def ingest_ccil_trades(
 ) -> None:
     """Ingest CCIL NDS-OM historical trades (G-Sec/SDL/T-Bill) for a date."""
     _init_logging()
-    day = (as_of or dt.datetime.now(dt.UTC)).date()
+    day = _day(as_of)
     result = TradePipeline(
         Database(), source=CcilHistoricalTradesSource(), derive_securities=derive_securities
     ).run(day)
@@ -301,11 +328,15 @@ def ingest_ccil_trades_backfill(
 ) -> None:
     """Backfill CCIL NDS-OM trades across a date range (weekdays; holidays return 0 rows)."""
     _init_logging()
+    first, last = _date_range(start, end)
     db = Database()
     source = CcilHistoricalTradesSource()
     pipeline = TradePipeline(db, source=source, derive_securities=derive_securities)
-    results = [pipeline.run(day) for day in business_days(start.date(), end.date())]
-    _summarise(results, label=f"ccil-backfill {start.date()}..{end.date()}")
+    results = [pipeline.run(day) for day in business_days(first, last)]
+    if not results:
+        typer.echo(f"ccil-backfill {first}..{last}: no business days in range — nothing to do")
+        return
+    _summarise(results, label=f"ccil-backfill {first}..{last}")
 
 
 @ingest_app.command("enrich-securities")
@@ -317,7 +348,7 @@ def ingest_enrich_securities(
 ) -> None:
     """Fill missing coupon/maturity/issuer on securities from BondCentral (coalesce, gap-fill)."""
     _init_logging()
-    day = dt.datetime.now(dt.UTC).date()
+    day = _today()
     result = EnrichmentPipeline(Database()).run(day, limit=limit)
     _summarise([result], label=f"enrich-securities {day.isoformat()}")
 
@@ -331,7 +362,7 @@ def ingest_rbi_auctions(
 ) -> None:
     """Ingest the RBI sovereign auction calendar (recent auctions + dates + links)."""
     _init_logging()
-    day = (as_of or dt.datetime.now(dt.UTC)).date()
+    day = _day(as_of)
     result = RbiAuctionPipeline(Database()).run(day)
     _summarise([result], label=f"rbi-auctions {day.isoformat()}")
 
@@ -345,7 +376,7 @@ def ingest_sovereign_valuation(
 ) -> None:
     """Ingest FBIL G-Sec/SDL price & YTM for a single date."""
     _init_logging()
-    day = (date or dt.datetime.now(dt.UTC)).date()
+    day = _day(date)
     results = SovereignValuationPipeline(Database()).run_date(day)
     _summarise(results, label=f"sovereign-valuation {day.isoformat()}")
 
@@ -359,8 +390,12 @@ def backfill_sovereign_valuation(
 ) -> None:
     """Backfill FBIL sovereign valuations across a date range (weekdays; holidays auto-skip)."""
     _init_logging()
-    results = SovereignValuationPipeline(Database()).backfill(start.date(), end.date())
-    _summarise(results, label=f"backfill {start.date()}..{end.date()}")
+    first, last = _date_range(start, end)
+    results = SovereignValuationPipeline(Database()).backfill(first, last)
+    if not results:
+        typer.echo(f"backfill {first}..{last}: no business days in range — nothing to do")
+        return
+    _summarise(results, label=f"backfill {first}..{last}")
 
 
 if __name__ == "__main__":

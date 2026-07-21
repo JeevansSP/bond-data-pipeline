@@ -15,14 +15,22 @@ def configure_logging(*, level: str = "INFO", json: bool = False) -> None:
     """Configure structlog once for the process.
 
     Args:
-        level: Standard logging level name (e.g. ``"INFO"``, ``"DEBUG"``).
+        level: Standard logging level name (e.g. ``"INFO"``, ``"DEBUG"``). An unknown name
+            falls back to ``INFO`` rather than crashing every command on a typo'd env var.
         json: Emit JSON lines (for cron/prod) instead of human-friendly console output.
+
+    Only the first call configures; later calls (including a different ``level``) are no-ops.
     """
     global _configured
     if _configured:
         return
 
-    logging.basicConfig(format="%(message)s", stream=sys.stdout, level=level.upper())
+    level = level.upper()
+    if level not in logging.getLevelNamesMapping():
+        logging.getLogger(__name__).warning("unknown log level %r; falling back to INFO", level)
+        level = "INFO"
+
+    logging.basicConfig(format="%(message)s", stream=sys.stdout, level=level)
 
     renderer: structlog.types.Processor = (
         structlog.processors.JSONRenderer() if json else structlog.dev.ConsoleRenderer()
@@ -36,9 +44,7 @@ def configure_logging(*, level: str = "INFO", json: bool = False) -> None:
             structlog.processors.format_exc_info,
             renderer,
         ],
-        wrapper_class=structlog.make_filtering_bound_logger(
-            logging.getLevelNamesMapping()[level.upper()]
-        ),
+        wrapper_class=structlog.make_filtering_bound_logger(logging.getLevelNamesMapping()[level]),
         logger_factory=structlog.PrintLoggerFactory(),
         cache_logger_on_first_use=True,
     )

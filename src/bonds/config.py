@@ -4,18 +4,22 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import quote_plus
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Repository root = three levels up from this file (src/bonds/config.py -> repo root).
 REPO_ROOT = Path(__file__).resolve().parents[2]
+# Resolve .env against the repo root, NOT the process CWD — `uv run bonds ...` from any other
+# directory must see the same configuration as the daily script (which cd's into the repo).
+_ENV_FILE = REPO_ROOT / ".env"
 
 
 class DatabaseSettings(BaseSettings):
     """Postgres connection settings (env prefix ``BONDS_DB_``)."""
 
-    model_config = SettingsConfigDict(env_prefix="BONDS_DB_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_prefix="BONDS_DB_", env_file=_ENV_FILE, extra="ignore")
 
     host: str = "localhost"
     port: int = 5432
@@ -25,10 +29,10 @@ class DatabaseSettings(BaseSettings):
 
     @property
     def url(self) -> str:
-        """SQLAlchemy URL for the psycopg (v3) driver."""
-        return (
-            f"postgresql+psycopg://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
-        )
+        """SQLAlchemy URL for the psycopg (v3) driver (credentials URL-escaped)."""
+        user = quote_plus(self.user)
+        password = quote_plus(self.password)  # '@', '/', '#', '%' etc. must not break the URL
+        return f"postgresql+psycopg://{user}:{password}@{self.host}:{self.port}/{self.name}"
 
 
 class HttpSettings(BaseSettings):
@@ -38,7 +42,7 @@ class HttpSettings(BaseSettings):
     Akamai-protected and rate-limit aggressively.
     """
 
-    model_config = SettingsConfigDict(env_prefix="BONDS_HTTP_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_prefix="BONDS_HTTP_", env_file=_ENV_FILE, extra="ignore")
 
     min_interval_seconds: float = 0.7
     max_retries: int = 4
@@ -52,7 +56,7 @@ class HttpSettings(BaseSettings):
 class Settings(BaseSettings):
     """Top-level settings (env prefix ``BONDS_``)."""
 
-    model_config = SettingsConfigDict(env_prefix="BONDS_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_prefix="BONDS_", env_file=_ENV_FILE, extra="ignore")
 
     data_root: Path = Field(default=Path("data"))
     log_level: str = "INFO"

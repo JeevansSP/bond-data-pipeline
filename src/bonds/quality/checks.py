@@ -122,8 +122,10 @@ def check_universe(records: list[SecurityRecord], *, as_of: dt.date) -> list[Qua
         QualityCheck(
             "invalid_isin", Level.ERROR, passed=invalid_isin == 0, observed=float(invalid_isin)
         ),
+        # A metric, not an enforced check (no threshold) -> INFO, so it can't masquerade as a
+        # warning that never fires.
         QualityCheck(
-            "null_maturity_rate", Level.WARN, passed=True, observed=_rate(null_maturity, total)
+            "null_maturity_rate", Level.INFO, passed=True, observed=_rate(null_maturity, total)
         ),
         QualityCheck(
             "matured_in_universe",
@@ -153,9 +155,10 @@ def check_public_issues(issues: list[PublicIssueRecord]) -> list[QualityCheck]:
         QualityCheck(
             "close_before_open", Level.WARN, passed=bad_window == 0, observed=float(bad_window)
         ),
+        # Metric, not an enforced check (no threshold) -> INFO.
         QualityCheck(
             "null_final_size_rate",
-            Level.WARN,
+            Level.INFO,
             passed=True,
             observed=_rate(null_final, total),
         ),
@@ -222,8 +225,9 @@ def check_rbi_auctions(auctions: list[RbiAuctionRecord]) -> list[QualityCheck]:
             passed=unclassified == 0,
             observed=float(unclassified),
         ),
+        # Metric, not an enforced check (no threshold) -> INFO.
         QualityCheck(
-            "null_auction_date_rate", Level.WARN, passed=True, observed=_rate(null_date, total)
+            "null_auction_date_rate", Level.INFO, passed=True, observed=_rate(null_date, total)
         ),
     ]
     return checks

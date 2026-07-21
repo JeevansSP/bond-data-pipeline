@@ -185,13 +185,19 @@ def check_cross_source(conn: Connection) -> list[QualityCheck]:
     pairs = float(row[0]) if row and row[0] is not None else 0.0
     p99 = float(row[1]) if row and row[1] is not None else 0.0
     if pairs < MIN_CROSS_SOURCE_PAIRS:
+        # A young/small database simply hasn't accumulated enough matched pairs yet — that's
+        # "not assessable", not a data-quality failure. A permanently-failing WARN here would
+        # train users to ignore warnings.
         return [
             QualityCheck(
                 "cross_source_coverage",
-                Level.WARN,
-                passed=False,
+                Level.INFO,
+                passed=True,
                 observed=pairs,
-                detail=f"only {int(pairs)} matched CCIL/FBIL pairs (<{MIN_CROSS_SOURCE_PAIRS})",
+                detail=(
+                    f"only {int(pairs)} matched CCIL/FBIL pairs (<{MIN_CROSS_SOURCE_PAIRS}); "
+                    "not enough to assess price reconciliation yet"
+                ),
             )
         ]
     return [
