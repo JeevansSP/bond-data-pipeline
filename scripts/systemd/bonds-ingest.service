@@ -13,4 +13,7 @@ Type=oneshot
 User=bonds
 WorkingDirectory=/opt/bonds-research
 ExecStart=/usr/bin/bash /opt/bonds-research/scripts/run_daily_ingest.sh
-TimeoutStartSec=3600
+# Generous: a catch-up after extended downtime (30 days x several sources at the polite
+# 0.7s/request rate, plus a full ~256-page BondCentral universe pull) can exceed an hour;
+# SIGKILLing it mid-ingest would fail the run invisibly.
+TimeoutStartSec=14400

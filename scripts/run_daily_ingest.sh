@@ -23,18 +23,43 @@ LOG_FILE="$LOG_DIR/ingest-$(date +%Y-%m-%d).log"
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$*" | tee -a "$LOG_FILE"; }
 
 # --- single-instance lock (mkdir is atomic on POSIX; steal it only if the holder has died) ---
+# flock(1) isn't on stock macOS, so this stays a mkdir lock, hardened against the races that
+# matter when RunAtLoad and the 21:00 timer fire together:
+#   * a fresh lock with no pid file yet means the holder is mid-acquisition -> treat as HELD
+#     (only steal a pid-less lock after a generous grace period, i.e. the holder crashed);
+#   * verify a live pid actually belongs to this script (PID reuse after reboot otherwise
+#     fakes "another ingest is running" and silently skips the day);
+#   * losing the steal race (our mkdir fails) exits cleanly instead of dying via set -e.
 LOCK_DIR="$REPO_DIR/data/.ingest.lock"
+LOCK_GRACE_SECONDS=300
+
+lock_mtime() { stat -f %m "$LOCK_DIR" 2>/dev/null || stat -c %Y "$LOCK_DIR" 2>/dev/null || echo 0; }
+
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  if [ -f "$LOCK_DIR/pid" ] && kill -0 "$(cat "$LOCK_DIR/pid" 2>/dev/null)" 2>/dev/null; then
-    log "another ingest is running (pid $(cat "$LOCK_DIR/pid")); exiting"
+  holder_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+  if [ -z "$holder_pid" ]; then
+    age=$(( $(date +%s) - $(lock_mtime) ))
+    if [ "$age" -lt "$LOCK_GRACE_SECONDS" ]; then
+      log "another ingest is acquiring the lock; exiting"
+      exit 0
+    fi
+  elif kill -0 "$holder_pid" 2>/dev/null \
+      && ps -p "$holder_pid" -o command= 2>/dev/null | grep -q "run_daily_ingest"; then
+    log "another ingest is running (pid $holder_pid); exiting"
     exit 0
   fi
   log "clearing stale lock"
   rm -rf "$LOCK_DIR"
-  mkdir "$LOCK_DIR"
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    log "another process took the lock; exiting"
+    exit 0
+  fi
 fi
 echo "$$" >"$LOCK_DIR/pid"
 trap 'rm -rf "$LOCK_DIR"' EXIT
+
+# --- prune old ingest logs (the dated files grow unbounded otherwise) ---
+find "$LOG_DIR" -name 'ingest-*.log' -mtime +30 -delete 2>/dev/null || true
 
 # --- ensure the Postgres container is up and accepting connections ---
 if command -v docker >/dev/null 2>&1; then

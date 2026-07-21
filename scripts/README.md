@@ -2,6 +2,7 @@
 Scheduling the daily bonds ingest as a self-healing service.
 
 2026-07-18_193000 : initial version (runner + launchd + systemd, idempotent catch-up)
+2026-07-21_112001 : hardened lock (acquisition race, PID reuse), 30-day log pruning, raised systemd timeout, documented launchd log-dir prerequisite
 ```
 
 # Daily ingest service
@@ -38,6 +39,11 @@ launchd runs a missed `StartCalendarInterval` job when the Mac next wakes or boo
 21:00 run fires on wake and the catch-up fills the gap.
 
 ```bash
+# 0. Make sure the log directory exists — launchd does NOT create intermediate directories
+#    for StandardOutPath/StandardErrorPath, so the very first run's launchd-level output
+#    would be lost on a fresh clone otherwise:
+mkdir -p data/logs
+
 # 1. Copy the agent into place (paths in the plist already point at this repo):
 cp scripts/launchd/com.cydratech.bonds-ingest.plist ~/Library/LaunchAgents/
 
