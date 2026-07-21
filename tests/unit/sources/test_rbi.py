@@ -57,6 +57,32 @@ def test_parse_detail_date_absent_returns_none() -> None:
     assert parse_detail_date(b"<html><body>no date here</body></html>") is None
 
 
+def test_fetch_auctions_enriches_dates_and_lands_index(tmp_path: object) -> None:
+    import httpx
+    import respx
+
+    from bonds.config import HttpSettings, Settings
+    from bonds.http import ThrottledClient
+    from bonds.sources.rbi import RbiSource
+
+    with respx.mock:
+        respx.get("https://www.rbi.org.in/scripts/FS_PressRelease.aspx?fn=2757").mock(
+            return_value=httpx.Response(200, content=_INDEX)
+        )
+        for prid in ("63182", "63185"):
+            respx.get(
+                f"https://www.rbi.org.in/scripts/FS_PressRelease.aspx?prid={prid}&fn=2757"
+            ).mock(return_value=httpx.Response(200, content=_DETAIL))
+
+        settings = Settings(data_root=tmp_path, http=HttpSettings(min_interval_seconds=0.0))  # type: ignore[arg-type]
+        source = RbiSource(client=ThrottledClient(settings.http), settings=settings)
+        records = source.fetch_auctions(dt.date(2026, 7, 17))
+
+    assert {r.prid for r in records} == {"63182", "63185"}
+    assert all(r.auction_date == dt.date(2026, 7, 17) for r in records)
+    assert source.metrics[0].rows_extracted == 2
+
+
 def test_detail_date_survives_http_error() -> None:
     # A failing detail page (404/timeout) must NOT abort the whole auction ingest.
     from unittest.mock import MagicMock

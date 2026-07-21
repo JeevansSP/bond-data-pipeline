@@ -8,6 +8,11 @@ v1 captures the calendar: title, auction type, date (from the detail page), and 
 Per-auction financials (cut-off yield, notified/accepted amounts) live in the detail page's
 transposed results table (securities as columns; layout varies by auction type) — a documented
 follow-up, not parsed here.
+
+NOTE on ``auction_date`` semantics: the date parsed from the detail page is the press-release
+*publication* date. For result-type releases that coincides with the auction; for announcement
+releases it precedes the auction by days. Parsing the true auction date from the release body
+(layout varies per auction type) is the same documented follow-up as the financials.
 """
 
 from __future__ import annotations
@@ -67,7 +72,10 @@ class RbiSource(MetricsCollector):
         return self._settings.data_dir / "raw" / self.name / f"auctions_{as_of.isoformat()}.html"
 
     def fetch_auctions(self, as_of: dt.date) -> list[RbiAuctionRecord]:
-        """Parse the auction index, then enrich each with its date from the detail page."""
+        """Parse the auction index, then enrich each with its press-release date.
+
+        See the module note on ``auction_date`` semantics.
+        """
         self.reset_metrics()
         response = self._client.get(_INDEX_URL, headers=_HEADERS)
         content = response.content
@@ -93,7 +101,7 @@ class RbiSource(MetricsCollector):
             return None
         try:
             detail = self._client.get(record.detail_url, headers=_HEADERS)
-        except (httpx.HTTPError, SourceError):
+        except httpx.HTTPError:
             # A single flaky/404 detail page must not abort the whole auction ingest.
             logger.warning("rbi.detail_fetch_failed", prid=record.prid)
             return None
@@ -125,7 +133,10 @@ def parse_index(content: bytes, *, source: str) -> list[RbiAuctionRecord]:
 
 
 def parse_detail_date(content: bytes) -> dt.date | None:
-    """Extract the ``Date : Mon DD, YYYY`` from an auction detail page."""
+    """Extract the ``Date : Mon DD, YYYY`` press-release date from an auction detail page.
+
+    This is the *publication* date, not necessarily the auction date — see the module note.
+    """
     root = cast("HtmlElement", fromstring(content))
     text = " ".join(root.text_content().split())
     match = _DATE_RE.search(text)

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import datetime as dt
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, cast
 
@@ -84,42 +85,54 @@ class CdslSource(MetricsCollector):
         """
         self.reset_metrics()
         content = self.fetch_snapshot(as_of)
-        records = list(parse_snapshot(content))
+        parsed = parse_snapshot(content)
         self.add_metric(
             as_of.isoformat(),
             bytes_downloaded=len(content),
-            rows_extracted=len(records),
-            rows_parsed=len(records),
+            rows_extracted=parsed.rows_seen,
+            rows_parsed=len(parsed.records),
+            rows_dropped=parsed.rows_seen - len(parsed.records),
         )
-        yield from records
+        yield from parsed.records
 
 
-def parse_snapshot(content: bytes) -> Iterator[SecurityRecord]:
-    """Parse the issuer-report HTML into records (header row located by content)."""
+@dataclass(frozen=True, slots=True)
+class ParsedSnapshot:
+    """Records plus funnel counts from one issuer-report HTML."""
+
+    records: list[SecurityRecord]
+    rows_seen: int
+    """Candidate data rows (enough cells), before ISIN validity filtering."""
+
+    def __iter__(self) -> Iterator[SecurityRecord]:
+        """Iterate the parsed records (keeps ``for r in parse_snapshot(...)`` working)."""
+        return iter(self.records)
+
+
+def parse_snapshot(content: bytes) -> ParsedSnapshot:
+    """Parse the issuer-report HTML into records (data rows located by ISIN content)."""
     root = fromstring(content)
     rows = cast("list[HtmlElement]", root.xpath("//tr[td]"))
-    header_seen = False
-    kept = 0
-    total = 0
+    records: list[SecurityRecord] = []
+    candidates = 0
     for row in rows:
         cells = [_text(c) for c in cast("list[HtmlElement]", row.xpath("./td"))]
         if len(cells) < _MIN_COLS:
             continue
-        total += 1
+        candidates += 1
         isin = cells[_COL_ISIN]
         if len(isin) != 12 or not isin.startswith("IN"):
             continue
-        header_seen = True
-        record = _to_record(cells)
-        if record is not None:
-            kept += 1
-            yield record
-    if not header_seen:
+        records.append(_to_record(cells))
+    if not records:
         raise SourceError("no ISIN rows found in CDSL report (layout changed?)")
-    logger.info("cdsl.parsed", rows=total, kept=kept, dropped=total - kept)
+    logger.info(
+        "cdsl.parsed", rows=candidates, kept=len(records), dropped=candidates - len(records)
+    )
+    return ParsedSnapshot(records=records, rows_seen=candidates)
 
 
-def _to_record(cells: list[str]) -> SecurityRecord | None:
+def _to_record(cells: list[str]) -> SecurityRecord:
     return SecurityRecord(
         isin=cells[_COL_ISIN],
         instrument_type=InstrumentType.CORP,
@@ -144,8 +157,11 @@ def _text(cell: HtmlElement) -> str:
 def _as_float(value: str) -> float | None:
     if not value or value.upper() in {"NA", "N/A", "-"}:
         return None
+    # Coupons come plain ("7.79") and %-suffixed ("10.03%"), sometimes with a footnote
+    # star ("9.24%*") — ~78% of live snapshot rows carry the % suffix.
+    cleaned = value.replace(",", "").rstrip("*").rstrip("%").strip()
     try:
-        return float(value.replace(",", ""))
+        return float(cleaned)
     except ValueError:
         return None
 
@@ -155,7 +171,14 @@ def _as_date(value: str) -> dt.date | None:
     value = value.strip()
     for fmt in ("%d-%b-%Y", "%d-%b-%y", "%d-%m-%Y", "%Y-%m-%d"):
         try:
-            return dt.datetime.strptime(value, fmt).replace(tzinfo=dt.UTC).date()
+            parsed = dt.datetime.strptime(value, fmt).replace(tzinfo=dt.UTC).date()
         except ValueError:
             continue
+        if fmt == "%d-%b-%y" and parsed.year < 2000:
+            # strptime pivots two-digit years 69-99 into 19xx, but nothing in these snapshots
+            # (2017+) matures in the past century: "31-Dec-99" is CDSL's 2099-12-31 perpetual
+            # placeholder (nulled downstream by the model's plausible-maturity window) and any
+            # genuine post-2068 maturity would otherwise be poisoned into the 1900s.
+            parsed = parsed.replace(year=parsed.year + 100)
+        return parsed
     return None

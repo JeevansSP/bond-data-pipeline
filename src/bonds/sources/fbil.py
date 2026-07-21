@@ -88,6 +88,10 @@ class FbilSource(MetricsCollector):
             raise SourceError(f"FBIL {product} download failed for {date}: {exc}") from exc
 
         content = response.content
+        if not content.startswith(b"PK\x03\x04"):
+            # For dates outside the published range FBIL serves an HTML page with HTTP 200.
+            # Don't land it as a mislabeled .xlsx in the data lake — treat as no-data.
+            raise DataUnavailable(f"FBIL {product} returned a non-xlsx body for {date}")
         path = self._raw_path(product, date)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
@@ -106,18 +110,26 @@ class FbilSource(MetricsCollector):
             raise ValueError(f"unsupported FBIL valuation product: {product!r}")
         self.reset_metrics()
         content = self.download(product, date)
-        records = self.parse(content, date=date, instrument=instrument)
+        records, seen = self._parse_with_stats(content, date=date, instrument=instrument)
         self.add_metric(
             f"{product}/{date.isoformat()}",
             bytes_downloaded=len(content),
-            rows_extracted=len(records),
+            rows_extracted=seen,
             rows_parsed=len(records),
+            rows_dropped=seen - len(records),
         )
         return records
 
     def parse(
         self, content: bytes, *, date: dt.date, instrument: InstrumentType
     ) -> list[SovereignValuation]:
+        """Parse a valuation workbook into records (see :meth:`_parse_with_stats`)."""
+        records, _seen = self._parse_with_stats(content, date=date, instrument=instrument)
+        return records
+
+    def _parse_with_stats(
+        self, content: bytes, *, date: dt.date, instrument: InstrumentType
+    ) -> tuple[list[SovereignValuation], int]:
         """Parse a valuation workbook into records.
 
         The header row is located by content (the row whose first cell is ``ISIN``) so we are
@@ -154,7 +166,7 @@ class FbilSource(MetricsCollector):
             records=len(records),
             dropped=seen - len(records),
         )
-        return records
+        return records, seen
 
 
 # ---------------------------------------------------------------------- helpers

@@ -51,4 +51,4 @@ def test_get_exhausts_retries_and_raises() -> None:
     route = respx.get(URL).mock(return_value=httpx.Response(503))
     with ThrottledClient(_settings()) as client, pytest.raises(httpx.HTTPStatusError):
         client.get(URL)
-    assert route.call_count == 3  # max_retries
+    assert route.call_count == 4  # 1 initial attempt + max_retries retries

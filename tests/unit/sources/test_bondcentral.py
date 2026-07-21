@@ -159,3 +159,49 @@ def test_collects_etl_metrics(tmp_path: Path) -> None:
     assert metric.rows_parsed == 2  # two valid ISINs across the two pages
     assert metric.rows_dropped == 1  # the invalid-length ISIN row
     assert metric.bytes_downloaded > 0
+
+
+@respx.mock
+def test_fetch_reference_returns_matching_record(tmp_path: Path) -> None:
+    respx.get(URL).mock(return_value=httpx.Response(200, json=_PAGE_1))
+    record = _source(tmp_path).fetch_reference("INE002A07809")
+    assert record is not None
+    assert record.isin == "INE002A07809"
+    assert record.coupon == pytest.approx(7.79)
+
+
+@respx.mock
+def test_fetch_reference_rejects_mismatched_isin(tmp_path: Path) -> None:
+    # If the API ever ignores the isin filter, enrichment must not write another security's
+    # reference data onto the requested row.
+    respx.get(URL).mock(return_value=httpx.Response(200, json=_PAGE_1))
+    assert _source(tmp_path).fetch_reference("INE999X99999") is None
+
+
+@respx.mock
+def test_fetch_reference_raises_source_error_on_non_json(tmp_path: Path) -> None:
+    from bonds.sources.base import SourceError
+
+    respx.get(URL).mock(return_value=httpx.Response(200, content=b"<html>challenge</html>"))
+    with pytest.raises(SourceError, match="non-JSON"):
+        _source(tmp_path).fetch_reference("INE002A07809")
+
+
+@respx.mock
+def test_fetch_reference_not_covered_returns_none(tmp_path: Path) -> None:
+    respx.get(URL).mock(return_value=httpx.Response(200, json={"data": []}))
+    assert _source(tmp_path).fetch_reference("INE002A07809") is None
+
+
+@respx.mock
+def test_iter_records_skips_non_json_page_and_continues(tmp_path: Path) -> None:
+    # A 200 with a non-JSON body (proxy error page) must be skipped like an HTTP error,
+    # not abort the whole snapshot.
+    respx.get(URL, params={"page": "1", "size": "100"}).mock(
+        return_value=httpx.Response(200, content=b"<html>edge error</html>")
+    )
+    respx.get(URL, params={"page": "2", "size": "100"}).mock(
+        return_value=httpx.Response(200, json=_PAGE_2)
+    )
+    records = list(_source(tmp_path).iter_records(AS_OF, max_pages=2))
+    assert {r.isin for r in records} == {"IN8241O08017"}

@@ -30,6 +30,7 @@ from bonds.http import ThrottledClient
 from bonds.logging import get_logger
 from bonds.models import TradeRecord
 from bonds.quality.metrics import MetricsCollector
+from bonds.sources.base import SourceError
 
 logger = get_logger(__name__)
 
@@ -89,12 +90,13 @@ class CcilSource(MetricsCollector):
                 headers=_POST_HEADERS,
             )
             self._land(as_of, sec_type, response.text)
-            parsed = parse_main(response.text, sec_type, as_of)
+            raw_rows, parsed = parse_main_with_stats(response.text, sec_type, as_of)
             self.add_metric(
                 sec_type,
                 bytes_downloaded=len(response.content),
-                rows_extracted=len(parsed),
+                rows_extracted=raw_rows,
                 rows_parsed=len(parsed),
+                rows_dropped=raw_rows - len(parsed),
             )
             records.extend(parsed)
         return records
@@ -102,9 +104,14 @@ class CcilSource(MetricsCollector):
     def _market_open(self) -> bool:
         response = self._client.post(f"{_RESOURCE_URL}ticker", data={}, headers=_POST_HEADERS)
         try:
-            return str(response.json().get("resultMarketOpenClose", "N")).upper() == "Y"
-        except (ValueError, AttributeError):
-            return False
+            payload = response.json()
+        except ValueError as exc:
+            # A 200 non-JSON body here is an Akamai challenge page, not a market gate.
+            # Treating it as "closed" would record a clean empty day; fail loudly instead.
+            raise SourceError("ccil ticker returned non-JSON (Akamai challenge?)") from exc
+        if not isinstance(payload, dict):
+            raise SourceError("ccil ticker returned unexpected JSON shape (layout changed?)")
+        return str(payload.get("resultMarketOpenClose", "N")).upper() == "Y"
 
     def _land(self, as_of: dt.date, sec_type: str, text: str) -> None:
         path = self._settings.data_dir / "raw" / self.name / as_of.isoformat() / f"{sec_type}.json"
@@ -114,20 +121,27 @@ class CcilSource(MetricsCollector):
 
 def parse_main(text: str, sec_type: str, as_of: dt.date) -> list[TradeRecord]:
     """Best-effort parse of a ``main`` response into trades (shape pending weekday validation)."""
+    return parse_main_with_stats(text, sec_type, as_of)[1]
+
+
+def parse_main_with_stats(
+    text: str, sec_type: str, as_of: dt.date
+) -> tuple[int, list[TradeRecord]]:
+    """As :func:`parse_main`, returning ``(raw_row_count, records)`` for the metrics funnel."""
     if not text or text.strip() == "Undeployed":
-        return []
+        return 0, []
     try:
         payload: Any = json.loads(text)
     except ValueError:
         logger.warning("ccil.unparsed_response", sec_type=sec_type)
-        return []
+        return 0, []
     rows = _extract_rows(payload)
     records: list[TradeRecord] = []
     for row in rows:
         record = _row_to_trade(row, sec_type, as_of)
         if record is not None:
             records.append(record)
-    return records
+    return len(rows), records
 
 
 def _extract_rows(payload: Any) -> list[Any]:

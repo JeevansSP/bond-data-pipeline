@@ -28,6 +28,7 @@ import datetime as dt
 import io
 import re
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Final
 
 from cryptography.hazmat.primitives import padding
@@ -91,13 +92,24 @@ class CcilHistoricalTradesSource(MetricsCollector):
         """Fetch + aggregate one day's NDS-OM trades (holidays return an empty list)."""
         self.reset_metrics()
         csv_text = self.download(as_of, as_of)
-        records = aggregate_trades(csv_text, source=self.name)
+        result = aggregate_trades_with_stats(csv_text, source=self.name)
+        dropped = result.rows_seen - result.rows_used
+        if dropped:
+            # A layout change breaking a fraction of rows would silently skew VWAPs otherwise.
+            logger.warning(
+                "ccil.hist_rows_dropped",
+                as_of=as_of.isoformat(),
+                dropped=dropped,
+                seen=result.rows_seen,
+            )
         self.add_metric(
             as_of.isoformat(),
             bytes_downloaded=len(csv_text.encode()),
-            rows_parsed=len(records),
+            rows_extracted=result.rows_seen,
+            rows_parsed=result.rows_used,
+            rows_dropped=dropped,
         )
-        return records
+        return result.records
 
     def download(self, start: dt.date, end: dt.date) -> str:
         """Download the raw trade CSV for ``[start, end]`` (landing it).
@@ -145,26 +157,47 @@ class CcilHistoricalTradesSource(MetricsCollector):
 
 
 # ---------------------------------------------------------------------- parsing
+@dataclass(frozen=True, slots=True)
+class AggregatedTrades:
+    """Aggregated records plus raw-row funnel counts for one CSV."""
+
+    records: list[TradeRecord]
+    rows_seen: int
+    """Data rows in the CSV (header excluded)."""
+    rows_used: int
+    """Rows that parsed into trades (the rest were malformed and dropped)."""
+
+
 def aggregate_trades(csv_text: str, *, source: str) -> list[TradeRecord]:
     """Parse the trade-by-trade CSV and aggregate to one :class:`TradeRecord` per ISIN per day."""
+    return aggregate_trades_with_stats(csv_text, source=source).records
+
+
+def aggregate_trades_with_stats(csv_text: str, *, source: str) -> AggregatedTrades:
+    """As :func:`aggregate_trades`, also counting raw vs dropped rows for the metrics funnel."""
     if not csv_text.strip():
-        return []
+        return AggregatedTrades(records=[], rows_seen=0, rows_used=0)
     reader = csv.reader(io.StringIO(csv_text))
     next(reader, None)  # drop the header row (columns validated positionally in _parse_row)
 
     # (isin, date) -> aggregation accumulator
     groups: dict[tuple[str, dt.date], _Agg] = defaultdict(_Agg)
+    seen = used = 0
     for row in reader:
+        if not row:
+            continue
+        seen += 1
         parsed = _parse_row(row)
         if parsed is None:
             continue
+        used += 1
         isin, trade_date, desc, face, price, ytm, time_key = parsed
         groups[(isin, trade_date)].add(desc, face, price, ytm, time_key)
 
     records = []
     for (isin, trade_date), agg in groups.items():
         records.append(agg.to_record(isin, trade_date, source))
-    return records
+    return AggregatedTrades(records=records, rows_seen=seen, rows_used=used)
 
 
 class _Agg:
@@ -178,6 +211,7 @@ class _Agg:
         "last_yld",
         "px_num",
         "total_face",
+        "yld_face",
         "yld_num",
     )
 
@@ -186,6 +220,7 @@ class _Agg:
         self.count = 0
         self.total_face = 0.0
         self.px_num = 0.0
+        self.yld_face = 0.0
         self.yld_num = 0.0
         self.last_key: _TimeKey = (-1, -1, -1)
         self.last_px: float | None = None
@@ -205,13 +240,16 @@ class _Agg:
             self.total_face += face
             self.px_num += price * face
             if ytm is not None:
+                # Yield needs its own denominator: a priced trade with a blank/unparseable
+                # yield must not dilute the weighted yield toward zero.
+                self.yld_face += face
                 self.yld_num += ytm * face
             if time_key >= self.last_key:  # ltp/lty = latest trade with a valid price
                 self.last_key, self.last_px, self.last_yld = time_key, price, ytm
 
     def to_record(self, isin: str, trade_date: dt.date, source: str) -> TradeRecord:
         wap = self.px_num / self.total_face if self.total_face else None
-        way = self.yld_num / self.total_face if self.total_face else None
+        way = self.yld_num / self.yld_face if self.yld_face else None
         return TradeRecord(
             isin=isin,
             trade_date=trade_date,
@@ -388,7 +426,9 @@ def _time_key(value: str) -> tuple[int, int, int]:
 
     Integer comparison is padding-agnostic — ``"9:05:00"`` and ``"09:05:00"`` both sort correctly —
     unlike lexical string comparison, which would rank an unpadded 9 AM after 4 PM. Unparseable
-    times sort earliest so they never win the "latest trade" selection.
+    times sort earliest, so they lose to any parseable time; among equal keys (including a group
+    where every time is unparseable) the later row in file order wins, so a group still gets an
+    ``ltp`` rather than none.
     """
     parts = value.strip().split(":")
     if len(parts) != 3:

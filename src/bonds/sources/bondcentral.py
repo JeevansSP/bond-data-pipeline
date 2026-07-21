@@ -64,7 +64,9 @@ class BondCentralSource(MetricsCollector):
             params={"page": str(page), "size": str(size)},
             headers={"Accept": "application/json", "Origin": _ORIGIN},
         )
-        payload: dict[str, Any] = response.json()
+        payload: dict[str, Any] = response.json()  # raises ValueError on a non-JSON 200
+        if not isinstance(payload, dict):
+            raise ValueError(f"page {page}: non-object JSON payload")
         path = self._raw_path(as_of, page)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload), encoding="utf-8")
@@ -82,6 +84,10 @@ class BondCentralSource(MetricsCollector):
 
         Yields:
             One :class:`SecurityRecord` per security.
+
+        Note:
+            This is a generator: funnel metrics are recorded on exhaustion, so callers must
+            consume it fully (the universe pipeline materialises it with ``list()``).
         """
         size = min(size, _MAX_PAGE_SIZE)
         self.reset_metrics()
@@ -91,8 +97,9 @@ class BondCentralSource(MetricsCollector):
         while True:
             try:
                 payload, page_bytes = self._fetch_page(page, size, as_of)
-            except httpx.HTTPError as exc:
-                # A persistently-failing page must not abort the whole snapshot: skip it and go on,
+            except (httpx.HTTPError, ValueError) as exc:
+                # A persistently-failing page — an HTTP error OR a 200 with a non-JSON/malformed
+                # body (proxy error page) — must not abort the whole snapshot: skip it and go on,
                 # capped so a genuine outage still fails loudly.
                 skipped_pages += 1
                 logger.warning("bondcentral.page_skipped", page=page, error=str(exc)[:80])
@@ -152,8 +159,18 @@ class BondCentralSource(MetricsCollector):
             params={"isin": isin, "page": "1", "size": "1"},
             headers={"Accept": "application/json", "Origin": _ORIGIN},
         )
-        items = response.json().get("data") or []
-        return _parse_item(items[0]) if items else None
+        try:
+            payload = response.json()
+        except ValueError as exc:  # challenge/error page mid-enrichment: fail this ISIN cleanly
+            raise SourceError(f"BondCentral reference for {isin}: non-JSON response") from exc
+        items = (payload.get("data") or []) if isinstance(payload, dict) else []
+        record = _parse_item(items[0]) if items else None
+        if record is not None and record.isin != isin:
+            # If the API ever ignores the isin filter, enrichment must not write another
+            # security's coupon/maturity onto the requested row.
+            logger.warning("bondcentral.reference_mismatch", requested=isin, received=record.isin)
+            return None
+        return record
 
 
 # ---------------------------------------------------------------------- parsing

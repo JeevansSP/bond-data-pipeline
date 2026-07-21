@@ -13,7 +13,7 @@ from typing import Self
 
 import httpx
 from tenacity import (
-    retry,
+    Retrying,
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
@@ -35,6 +35,9 @@ class RetryableStatusError(httpx.HTTPStatusError):
 class ThrottledClient:
     """Synchronous HTTP client with per-instance rate limiting and retries.
 
+    Not thread-safe: the throttle state is unsynchronized, so share an instance only within a
+    single thread (all current usage is single-threaded).
+
     Use as a context manager so the underlying connection pool is closed cleanly::
 
         with ThrottledClient() as client:
@@ -45,6 +48,13 @@ class ThrottledClient:
         self._settings = settings or get_settings().http
         self._min_interval = self._settings.min_interval_seconds
         self._last_request_at = 0.0
+        # max_retries means retries: N retries = N+1 total attempts.
+        self._retrying = Retrying(
+            retry=retry_if_exception_type((httpx.TransportError, RetryableStatusError)),
+            wait=wait_exponential(multiplier=1, min=1, max=30),
+            stop=stop_after_attempt(self._settings.max_retries + 1),
+            reraise=True,
+        )
         self._client = httpx.Client(
             timeout=self._settings.timeout_seconds,
             follow_redirects=True,
@@ -117,12 +127,6 @@ class ThrottledClient:
         data: dict[str, str] | None = None,
         no_retry: frozenset[int] = frozenset(),
     ) -> httpx.Response:
-        @retry(
-            retry=retry_if_exception_type((httpx.TransportError, RetryableStatusError)),
-            wait=wait_exponential(multiplier=1, min=1, max=30),
-            stop=stop_after_attempt(self._settings.max_retries),
-            reraise=True,
-        )
         def _do() -> httpx.Response:
             self._throttle()
             response = self._client.request(method, url, params=params, headers=headers, data=data)
@@ -136,4 +140,4 @@ class ThrottledClient:
             response.raise_for_status()
             return response
 
-        return _do()
+        return self._retrying(_do)

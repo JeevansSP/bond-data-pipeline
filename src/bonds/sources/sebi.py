@@ -10,6 +10,7 @@ See ``docs/research/2026-07-18_113141_sebi.gov.in.md``.
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, cast
 
@@ -64,34 +65,51 @@ class SebiSource(MetricsCollector):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
         logger.info("sebi.downloaded", bytes=len(content))
-        records = parse_public_issues(content)
+        parsed = parse_public_issues_with_stats(content)
         self.add_metric(
             "public_issues",
             bytes_downloaded=len(content),
-            rows_extracted=len(records),
-            rows_parsed=len(records),
+            rows_extracted=parsed.rows_seen,
+            rows_parsed=len(parsed.records),
+            rows_dropped=parsed.rows_seen - len(parsed.records),
         )
-        return records
+        return parsed.records
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedIssues:
+    """Records plus funnel counts from one SEBI public-issues page."""
+
+    records: list[PublicIssueRecord]
+    rows_seen: int
+    """Candidate table rows (before header/total/invalid filtering)."""
 
 
 def parse_public_issues(content: bytes) -> list[PublicIssueRecord]:
     """Parse every FY table into public-issue records (skips header/total rows)."""
+    return parse_public_issues_with_stats(content).records
+
+
+def parse_public_issues_with_stats(content: bytes) -> ParsedIssues:
+    """As :func:`parse_public_issues`, also counting raw rows for the metrics funnel."""
     root = fromstring(content)
     tables = cast("list[HtmlElement]", root.xpath("//table"))
     records: list[PublicIssueRecord] = []
+    seen = 0
     for table in tables:
         headers = " ".join(table.text_content().split()).lower()
         if "name of company" not in headers:
             continue
         for row in cast("list[HtmlElement]", table.xpath(".//tr[td]")):
+            seen += 1
             cells = [_text(c) for c in cast("list[HtmlElement]", row.xpath("./td"))]
             record = _to_record(cells)
             if record is not None:
                 records.append(record)
     if not records:
         raise SourceError("no public-issue rows parsed from SEBI page (layout changed?)")
-    logger.info("sebi.parsed", records=len(records))
-    return records
+    logger.info("sebi.parsed", records=len(records), rows=seen)
+    return ParsedIssues(records=records, rows_seen=seen)
 
 
 def _to_record(cells: list[str]) -> PublicIssueRecord | None:

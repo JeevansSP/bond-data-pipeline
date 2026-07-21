@@ -72,6 +72,47 @@ def test_parse_snapshot_handles_both_date_formats() -> None:
     assert record.maturity_date == dt.date(2026, 8, 21)
 
 
+def test_parse_snapshot_handles_percent_suffixed_coupons() -> None:
+    # ~78% of live snapshot rows carry a %-suffixed coupon ("10.03%"), some with a footnote
+    # star ("9.24%*"); both must parse instead of silently dropping to None.
+    rows = (
+        "<tr><td>3</td><td>PCT LTD</td><td>INE123A07AB4</td>"
+        "<td>01-Jan-20</td><td>01-Jan-30</td><td>10.03%</td><td>Annual</td>"
+        "<td>-</td><td>50.00</td><td>50.00</td></tr>"
+        "<tr><td>4</td><td>STAR LTD</td><td>INE456B07CD8</td>"
+        "<td>01-Jan-20</td><td>01-Jan-30</td><td>9.24%*</td><td>Annual</td>"
+        "<td>-</td><td>50.00</td><td>50.00</td></tr>"
+    )
+    html = f"<html><body><table>{_HEADER}{rows}</table></body></html>".encode()
+    records = {r.isin: r for r in parse_snapshot(html)}
+    assert records["INE123A07AB4"].coupon == pytest.approx(10.03)
+    assert records["INE456B07CD8"].coupon == pytest.approx(9.24)
+
+
+def test_parse_snapshot_two_digit_years_never_pivot_into_the_past() -> None:
+    # "31-Dec-99" is CDSL's 2099 perpetual placeholder -> must become None via the model's
+    # plausible-maturity window, NOT 1999-12-31 (a bond that looks 27 years matured).
+    # A genuine post-2068 maturity ("15-Jun-75" -> 2075) must survive.
+    rows = (
+        "<tr><td>5</td><td>PERP LTD</td><td>INE146O08290</td>"
+        "<td>01-Jan-20</td><td>31-Dec-99</td><td>8.5%</td><td>Annual</td>"
+        "<td>-</td><td>50.00</td><td>50.00</td></tr>"
+        "<tr><td>6</td><td>LONG LTD</td><td>INE789C07EF2</td>"
+        "<td>01-Jan-20</td><td>15-Jun-75</td><td>8.5%</td><td>Annual</td>"
+        "<td>-</td><td>50.00</td><td>50.00</td></tr>"
+    )
+    html = f"<html><body><table>{_HEADER}{rows}</table></body></html>".encode()
+    records = {r.isin: r for r in parse_snapshot(html)}
+    assert records["INE146O08290"].maturity_date is None
+    assert records["INE789C07EF2"].maturity_date == dt.date(2075, 6, 15)
+
+
+def test_parse_snapshot_counts_funnel_rows() -> None:
+    parsed = parse_snapshot(_HTML)
+    assert parsed.rows_seen == 2  # the too-few-columns junk row is not a candidate
+    assert len(parsed.records) == 2
+
+
 def test_parse_snapshot_raises_when_no_isin_rows() -> None:
     html = f"<html><body><table>{_HEADER}<tr><td>x</td></tr></table></body></html>".encode()
     with pytest.raises(SourceError, match="ISIN"):

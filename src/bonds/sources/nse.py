@@ -64,7 +64,16 @@ class NseSource(MetricsCollector):
             )
             payload: dict[str, Any] = response.json()
             self._land(as_of, segment, payload)
-            trade_date = _parse_timestamp(payload.get("timestamp")) or as_of
+            trade_date = _parse_timestamp(payload.get("timestamp"))
+            if trade_date is None:
+                # Surface envelope-timestamp drift: silently stamping the run date would
+                # mislabel last-session data whenever the run day isn't the trading day.
+                logger.warning(
+                    "nse.timestamp_unparsed",
+                    segment=segment,
+                    raw=str(payload.get("timestamp"))[:40],
+                )
+                trade_date = as_of
             rows = payload.get("data") or []
             kept = 0
             for row in rows:
