@@ -125,14 +125,23 @@ def test_unavailable_day_is_skipped(database: Database) -> None:
 def test_scd2_attribute_history_records_only_changes(database: Database) -> None:
     with database.session() as s:
         repo = SecurityRepository(s)
-        assert repo.record_attribute(ISIN_A, "rating", "AAA", effective=DATE, source=SOURCE)
+        assert (
+            repo.record_attribute_bulk("rating", {ISIN_A: "AAA"}, effective=DATE, source=SOURCE)
+            == 1
+        )
         # same value -> no new row
-        assert not repo.record_attribute(
-            ISIN_A, "rating", "AAA", effective=DATE + dt.timedelta(days=1), source=SOURCE
+        assert (
+            repo.record_attribute_bulk(
+                "rating", {ISIN_A: "AAA"}, effective=DATE + dt.timedelta(days=1), source=SOURCE
+            )
+            == 0
         )
         # changed value -> new row, previous closed
-        assert repo.record_attribute(
-            ISIN_A, "rating", "AA+", effective=DATE + dt.timedelta(days=5), source=SOURCE
+        assert (
+            repo.record_attribute_bulk(
+                "rating", {ISIN_A: "AA+"}, effective=DATE + dt.timedelta(days=5), source=SOURCE
+            )
+            == 1
         )
 
     with database.session() as s:
@@ -148,6 +157,42 @@ def test_scd2_attribute_history_records_only_changes(database: Database) -> None
     assert [(h.value, h.valid_to) for h in history] == [
         ("AAA", DATE + dt.timedelta(days=4)),
         ("AA+", None),
+    ]
+
+
+def test_scd2_null_records_same_source_withdrawal_only(database: Database) -> None:
+    day2 = DATE + dt.timedelta(days=1)
+    day3 = DATE + dt.timedelta(days=2)
+    with database.session() as s:
+        repo = SecurityRepository(s)
+        repo.record_attribute_bulk("rating", {ISIN_A: "AAA"}, effective=DATE, source=SOURCE)
+        # A different source not carrying the attribute must NOT close it.
+        assert (
+            repo.record_attribute_bulk("rating", {ISIN_A: None}, effective=day2, source="other")
+            == 0
+        )
+        # The source that set it CAN withdraw it.
+        assert (
+            repo.record_attribute_bulk("rating", {ISIN_A: None}, effective=day3, source=SOURCE) == 1
+        )
+        # No history + no value -> nothing recorded (day-1 flood guard).
+        assert (
+            repo.record_attribute_bulk("rating", {ISIN_B: None}, effective=day3, source=SOURCE) == 0
+        )
+
+    with database.session() as s:
+        history = (
+            s.execute(
+                select(SecurityAttributeHistory)
+                .where(SecurityAttributeHistory.isin == ISIN_A)
+                .order_by(SecurityAttributeHistory.valid_from)
+            )
+            .scalars()
+            .all()
+        )
+    assert [(h.value, h.valid_to) for h in history] == [
+        ("AAA", day3 - dt.timedelta(days=1)),
+        (None, None),
     ]
 
 

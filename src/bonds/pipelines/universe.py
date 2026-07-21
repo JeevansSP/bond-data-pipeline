@@ -25,8 +25,10 @@ from bonds.storage.repositories import SecurityRepository
 
 logger = get_logger(__name__)
 
-# Attributes surfaced by connectors that we track over time (SCD-2). Only non-null values are
-# recorded, so day-1 does not flood the table with "unrated" rows.
+# Attributes surfaced by connectors that we track over time (SCD-2). A record carrying ``None``
+# for an attribute records a *withdrawal* iff the open row was set by the same source (a rating
+# withdrawn, a status removed); ISINs with no history and no value record nothing, so day-1 does
+# not flood the table with "unrated" rows. See ``_apply_scd2``.
 TRACKED_ATTRIBUTES: tuple[str, ...] = (
     # BondCentral
     "credit_rating",
@@ -96,11 +98,9 @@ class UniversePipeline:
     ) -> int:
         total = 0
         for attribute in TRACKED_ATTRIBUTES:
-            values = {
-                r.isin: r.attributes[attribute]
-                for r in records
-                if r.attributes.get(attribute) is not None
-            }
+            # None values are included: they close a same-source open row (withdrawal) and are
+            # otherwise no-ops, so an absent-from-this-source attribute is never clobbered.
+            values = {r.isin: r.attributes.get(attribute) for r in records}
             total += repo.record_attribute_bulk(
                 attribute, values, effective=effective, source=self._source.name
             )

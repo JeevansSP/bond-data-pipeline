@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import datetime as dt
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 
-from sqlalchemy import CursorResult, func, select, update
+from sqlalchemy import CursorResult, and_, case, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -60,14 +61,18 @@ def _apply_scd2(
     Returns ``True`` if a change should be recorded. The caller inserts a new open row when
     ``current is None`` or ``effective > current.valid_from`` (a genuine forward change).
 
+    - no history and no value       -> ``False`` (day-1 must not flood with "unrated" rows)
     - unchanged value               -> ``False`` (no-op)
     - ``effective < valid_from``     -> ``False`` (out-of-order backfill; attribute history must be
       ingested chronologically — skip rather than overwrite the newer value or collide)
+    - value withdrawn (``None``) by a *different* source -> ``False`` (a source that simply doesn't
+      carry this attribute — e.g. CDSL never sends ``credit_rating`` — must not close a value
+      another source set; only the source that set it may withdraw it)
     - ``effective == valid_from``    -> update value+source in place, ``True`` (same-day correction)
     - ``effective > valid_from``     -> close the open row, ``True`` (caller opens a new one)
     """
     if current is None:
-        return True
+        return value is not None
     if current.value == value:
         return False
     if effective < current.valid_from:
@@ -78,6 +83,8 @@ def _apply_scd2(
             effective=effective.isoformat(),
             current_from=current.valid_from.isoformat(),
         )
+        return False
+    if value is None and current.source != source:
         return False
     if effective == current.valid_from:
         current.value = value
@@ -130,6 +137,23 @@ class ValuationRepository:
         return len(rows)
 
 
+def _security_row(r: SecurityRecord, *, seen_on: dt.date) -> dict[str, object]:
+    """The ``securities`` insert row for one record (shared by upsert/insert paths)."""
+    return {
+        "isin": r.isin,
+        "instrument_type": r.instrument_type.value,
+        "description": r.description,
+        "issuer": r.issuer,
+        "coupon": r.coupon,
+        "interest_type": r.interest_type,
+        "maturity_date": r.maturity_date,
+        "face_value": r.face_value,
+        "source": r.source,
+        "first_seen": seen_on,
+        "last_seen": seen_on,
+    }
+
+
 class SecurityRepository:
     """Upsert universe securities and maintain SCD-2 attribute history."""
 
@@ -137,25 +161,15 @@ class SecurityRepository:
         self._session = session
 
     def upsert_many(self, records: list[SecurityRecord], *, seen_on: dt.date) -> int:
-        """Upsert securities, setting ``first_seen`` on insert and advancing ``last_seen``."""
+        """Upsert securities, setting ``first_seen`` on insert and advancing ``last_seen``.
+
+        Reference fields (description/issuer/coupon/…) are refreshed but never regressed to
+        NULL: a source snapshot that omits a value (e.g. a BondCentral listing row with a null
+        coupon) must not wipe what another pass — notably enrichment — already filled.
+        """
         if not records:
             return 0
-        rows = [
-            {
-                "isin": r.isin,
-                "instrument_type": r.instrument_type.value,
-                "description": r.description,
-                "issuer": r.issuer,
-                "coupon": r.coupon,
-                "interest_type": r.interest_type,
-                "maturity_date": r.maturity_date,
-                "face_value": r.face_value,
-                "source": r.source,
-                "first_seen": seen_on,
-                "last_seen": seen_on,
-            }
-            for r in records
-        ]
+        rows = [_security_row(r, seen_on=seen_on) for r in records]
         # A single INSERT ... ON CONFLICT cannot touch the same ISIN twice; dedupe (last wins).
         rows = list({r["isin"]: r for r in rows}.values())
         for chunk in _chunks(rows):
@@ -164,12 +178,16 @@ class SecurityRepository:
                 index_elements=["isin"],
                 set_={
                     "instrument_type": stmt.excluded.instrument_type,
-                    "description": stmt.excluded.description,
-                    "issuer": stmt.excluded.issuer,
-                    "coupon": stmt.excluded.coupon,
-                    "interest_type": stmt.excluded.interest_type,
-                    "maturity_date": stmt.excluded.maturity_date,
-                    "face_value": stmt.excluded.face_value,
+                    "description": func.coalesce(stmt.excluded.description, Security.description),
+                    "issuer": func.coalesce(stmt.excluded.issuer, Security.issuer),
+                    "coupon": func.coalesce(stmt.excluded.coupon, Security.coupon),
+                    "interest_type": func.coalesce(
+                        stmt.excluded.interest_type, Security.interest_type
+                    ),
+                    "maturity_date": func.coalesce(
+                        stmt.excluded.maturity_date, Security.maturity_date
+                    ),
+                    "face_value": func.coalesce(stmt.excluded.face_value, Security.face_value),
                     "source": stmt.excluded.source,
                     # Track the true observation window even when dates arrive out of order
                     # (e.g. backfilling an older snapshot after a newer one).
@@ -189,22 +207,7 @@ class SecurityRepository:
         """
         if not records:
             return 0
-        rows = [
-            {
-                "isin": r.isin,
-                "instrument_type": r.instrument_type.value,
-                "description": r.description,
-                "issuer": r.issuer,
-                "coupon": r.coupon,
-                "interest_type": r.interest_type,
-                "maturity_date": r.maturity_date,
-                "face_value": r.face_value,
-                "source": r.source,
-                "first_seen": seen_on,
-                "last_seen": seen_on,
-            }
-            for r in records
-        ]
+        rows = [_security_row(r, seen_on=seen_on) for r in records]
         rows = list({r["isin"]: r for r in rows}.values())
         inserted = 0
         for chunk in _chunks(rows):
@@ -228,7 +231,18 @@ class SecurityRepository:
         for r in records:
             result = self._session.execute(
                 update(Security)
-                .where(Security.isin == r.isin)
+                # Only touch rows that still have a gap — a fully-populated row must not have
+                # its updated_at bumped (and must not count as "enriched").
+                .where(
+                    Security.isin == r.isin,
+                    or_(
+                        Security.coupon.is_(None),
+                        Security.maturity_date.is_(None),
+                        Security.issuer.is_(None),
+                        Security.interest_type.is_(None),
+                        Security.face_value.is_(None),
+                    ),
+                )
                 .values(
                     coupon=func.coalesce(Security.coupon, r.coupon),
                     maturity_date=func.coalesce(Security.maturity_date, r.maturity_date),
@@ -258,68 +272,35 @@ class SecurityRepository:
                 result[isin] = (coupon, maturity, source)
         return result
 
-    def record_attribute(
-        self, isin: str, attribute: str, value: str | None, *, effective: dt.date, source: str
-    ) -> bool:
-        """Append an SCD-2 row iff ``value`` differs from the current one.
-
-        Returns:
-            ``True`` if a change was recorded, ``False`` if the value was unchanged.
-        """
-        # .first() (not scalar_one_or_none) so a legacy multi-open-row state can't crash the run.
-        current = (
-            self._session.execute(
-                select(SecurityAttributeHistory)
-                .where(
-                    SecurityAttributeHistory.isin == isin,
-                    SecurityAttributeHistory.attribute == attribute,
-                    SecurityAttributeHistory.valid_to.is_(None),
-                )
-                .order_by(SecurityAttributeHistory.valid_from.desc())
-            )
-            .scalars()
-            .first()
-        )
-        if not _apply_scd2(current, isin, attribute, value, effective, source):
-            return False
-        if current is None or effective > current.valid_from:
-            self._session.add(
-                SecurityAttributeHistory(
-                    isin=isin,
-                    attribute=attribute,
-                    value=value,
-                    valid_from=effective,
-                    valid_to=None,
-                    source=source,
-                )
-            )
-        return True
-
     def record_attribute_bulk(
         self, attribute: str, values: dict[str, str | None], *, effective: dt.date, source: str
     ) -> int:
         """SCD-2 many ISINs for one ``attribute`` in a single pass.
 
-        Loads all currently-open rows for ``attribute`` once (one query), diffs in memory, and
-        writes only genuine changes. Far cheaper than per-ISIN :meth:`record_attribute` when
-        ingesting a whole universe.
+        Loads the currently-open rows for the batch's ISINs (chunked queries), diffs in memory,
+        and writes only genuine changes. A ``None`` value records a withdrawal — but only when the
+        open row was set by the *same* source (see :func:`_apply_scd2`).
 
         Returns:
             The number of changed values recorded.
         """
         if not values:
             return 0
-        open_rows = (
-            self._session.execute(
-                select(SecurityAttributeHistory).where(
-                    SecurityAttributeHistory.attribute == attribute,
-                    SecurityAttributeHistory.valid_to.is_(None),
+        isins = list(values)
+        current: dict[str, SecurityAttributeHistory] = {}
+        for chunk in _chunks(isins):
+            open_rows = (
+                self._session.execute(
+                    select(SecurityAttributeHistory).where(
+                        SecurityAttributeHistory.attribute == attribute,
+                        SecurityAttributeHistory.valid_to.is_(None),
+                        SecurityAttributeHistory.isin.in_(list(chunk)),
+                    )
                 )
+                .scalars()
+                .all()
             )
-            .scalars()
-            .all()
-        )
-        current = {row.isin: row for row in open_rows}
+            current.update({row.isin: row for row in open_rows})
 
         changes = 0
         for isin, value in values.items():
@@ -358,7 +339,13 @@ class IngestionRunRepository:
         started_at: dt.datetime,
         message: str | None = None,
     ) -> None:
-        """Upsert the terminal audit record for a run (re-running a day overwrites it)."""
+        """Upsert the terminal audit record for a run (re-running a day overwrites it).
+
+        A SUCCESS row is sticky: a later failed/skipped re-run of the same day must not
+        downgrade it to ``failed``/``rows=0`` — the successfully-ingested rows are still in the
+        database, and drift baselines (``previous_row_count``) would otherwise lose the day.
+        A success always overwrites (refreshing the row count).
+        """
         stmt = pg_insert(IngestionRun).values(
             source=source,
             dataset=dataset,
@@ -378,6 +365,7 @@ class IngestionRunRepository:
                 "started_at": stmt.excluded.started_at,
                 "finished_at": stmt.excluded.finished_at,
             },
+            where=(stmt.excluded.status == "success") | (IngestionRun.status != "success"),
         )
         self._session.execute(stmt)
 
@@ -394,19 +382,66 @@ class IngestionRunRepository:
             .limit(1)
         ).scalar_one_or_none()
 
-    def last_processed_date(self, source: str) -> dt.date | None:
-        """Most recent ``run_date`` for ``source`` that reached a terminal success or skip.
+    def dataset_progress(
+        self, source: str, *, skip_retry_cutoff: dt.date
+    ) -> dict[str, DatasetProgress]:
+        """Per-dataset gap-fill facts for every dataset ``source`` has ever written.
 
-        This is the anchor for gap-fill catch-up: skips (holidays/no-data days) count as processed
-        so they are not retried forever, while failed days are excluded so they get re-attempted.
-        Returns ``None`` if the source has never been ingested.
+        The catch-up anchor must be computed *per dataset* (a source like FBIL writes independent
+        ``fbil.gsec``/``fbil.sdl`` runs per day — one product failing must not let the other's
+        success advance the anchor past it) and must re-attempt days that did not terminally
+        succeed:
+
+        * ``processed_through`` — most recent ``run_date`` with a terminal success or skip; skips
+          (holidays/no-data days) count as processed so they are not retried forever.
+        * ``earliest_failed`` — oldest day still marked failed. A failed day would otherwise be
+          shadowed forever once any later day succeeded (``max`` alone never looks back).
+        * ``earliest_recent_skip`` — oldest skip on/after ``skip_retry_cutoff``. FBIL answers
+          HTTP 500 both for holidays and for "not published yet", so a recent skip may just be
+          a premature run and deserves a few re-attempts before it becomes terminal.
         """
-        return self._session.execute(
-            select(func.max(IngestionRun.run_date)).where(
-                IngestionRun.source == source,
-                IngestionRun.status.in_(("success", "skipped")),
+        rows = self._session.execute(
+            select(
+                IngestionRun.dataset,
+                func.max(
+                    case((IngestionRun.status.in_(("success", "skipped")), IngestionRun.run_date))
+                ),
+                func.min(case((IngestionRun.status == "failed", IngestionRun.run_date))),
+                func.min(
+                    case(
+                        (
+                            and_(
+                                IngestionRun.status == "skipped",
+                                IngestionRun.run_date >= skip_retry_cutoff,
+                            ),
+                            IngestionRun.run_date,
+                        )
+                    )
+                ),
             )
-        ).scalar_one_or_none()
+            .where(IngestionRun.source == source)
+            .group_by(IngestionRun.dataset)
+        ).all()
+        return {
+            dataset: DatasetProgress(
+                processed_through=processed,
+                earliest_failed=failed,
+                earliest_recent_skip=recent_skip,
+            )
+            for dataset, processed, failed, recent_skip in rows
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetProgress:
+    """Gap-fill facts for one (source, dataset) — see ``dataset_progress``."""
+
+    processed_through: dt.date | None
+    """Most recent run_date with terminal success/skip (``None`` if never processed)."""
+    earliest_failed: dt.date | None
+    """Oldest run_date still marked failed (``None`` if none)."""
+    earliest_recent_skip: dt.date | None
+    """Oldest skipped run_date on/after the retry cutoff (``None`` if none)."""
 
 
 class PublicIssueRepository:
@@ -563,17 +598,18 @@ class EtlMetricsRepository:
             for m in metrics
         ]
         rows = list({r["artifact"]: r for r in rows}.values())
-        stmt = pg_insert(EtlFileMetric).values(rows)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["source", "dataset", "run_date", "artifact"],
-            set_={
-                "bytes_downloaded": stmt.excluded.bytes_downloaded,
-                "rows_extracted": stmt.excluded.rows_extracted,
-                "rows_parsed": stmt.excluded.rows_parsed,
-                "rows_dropped": stmt.excluded.rows_dropped,
-            },
-        )
-        self._session.execute(stmt)
+        for chunk in _chunks(rows):
+            stmt = pg_insert(EtlFileMetric).values(list(chunk))
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["source", "dataset", "run_date", "artifact"],
+                set_={
+                    "bytes_downloaded": stmt.excluded.bytes_downloaded,
+                    "rows_extracted": stmt.excluded.rows_extracted,
+                    "rows_parsed": stmt.excluded.rows_parsed,
+                    "rows_dropped": stmt.excluded.rows_dropped,
+                },
+            )
+            self._session.execute(stmt)
 
 
 class DataQualityRepository:

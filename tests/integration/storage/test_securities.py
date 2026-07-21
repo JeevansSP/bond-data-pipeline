@@ -81,6 +81,36 @@ def test_enrich_missing_fills_nulls_without_overwriting(db: Database) -> None:
         assert row.issuer == "Original Issuer"  # already set -> preserved
 
 
+def test_upsert_null_reference_fields_do_not_regress_enriched_values(db: Database) -> None:
+    # An enriched row (coupon/maturity filled) must survive a later universe snapshot whose
+    # payload carries nulls for those fields — otherwise nightly upserts undo enrichment daily.
+    with db.session() as s:
+        SecurityRepository(s).upsert_many(
+            [
+                SecurityRecord(
+                    isin=ISIN,
+                    instrument_type=InstrumentType.CORP,
+                    source="bondcentral",
+                    coupon=8.5,
+                    maturity_date=dt.date(2030, 6, 1),
+                    issuer="Issuer Ltd",
+                )
+            ],
+            seen_on=DAY,
+        )
+    with db.session() as s:
+        SecurityRepository(s).upsert_many(
+            [_sec("bondcentral", InstrumentType.CORP, None)],  # null coupon in today's listing
+            seen_on=DAY + dt.timedelta(days=1),
+        )
+    with db.session() as s:
+        row = s.execute(select(Security).where(Security.isin == ISIN)).scalar_one()
+        assert row.coupon == pytest.approx(8.5)  # preserved, not re-nulled
+        assert row.maturity_date == dt.date(2030, 6, 1)
+        assert row.issuer == "Issuer Ltd"
+        assert row.last_seen == DAY + dt.timedelta(days=1)  # still advanced
+
+
 def test_insert_missing_inserts_then_does_not_overwrite(db: Database) -> None:
     # First insert (as if from FBIL) writes the row.
     with db.session() as s:

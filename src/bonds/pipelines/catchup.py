@@ -27,13 +27,18 @@ from bonds.pipelines.sovereign_valuation import SovereignValuationPipeline
 from bonds.pipelines.trade import TradePipeline
 from bonds.pipelines.universe import UniversePipeline
 from bonds.sources.ccil_historical import CcilHistoricalTradesSource, derive_securities
+from bonds.sources.fbil import FbilSource
 from bonds.sources.nse import NseSource
 from bonds.storage import Database
-from bonds.storage.repositories import IngestionRunRepository
+from bonds.storage.repositories import DatasetProgress, IngestionRunRepository
 
 logger = get_logger(__name__)
 
 DEFAULT_MAX_GAP_DAYS = 30
+# A skip may mean "holiday" or "ran before the source published" (FBIL 500s for both). Re-attempt
+# skips this recent; older skips are terminal. Re-fetching a true holiday a few times is one cheap
+# request per attempt, while a premature same-day skip is healed by the evening's scheduled run.
+DEFAULT_SKIP_RETRY_DAYS = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,23 +66,70 @@ def bounded_start(anchor: dt.date | None, *, as_of: dt.date, max_gap_days: int) 
     return max(anchor + dt.timedelta(days=1), floor)
 
 
-def series_start(database: Database, source: str, *, as_of: dt.date, max_gap_days: int) -> dt.date:
-    """First business day to (re)ingest for a date-series ``source`` (see :func:`bounded_start`)."""
-    with database.session() as session:
-        anchor = IngestionRunRepository(session).last_processed_date(source)
-    start = bounded_start(anchor, as_of=as_of, max_gap_days=max_gap_days)
-    if anchor is not None and anchor + dt.timedelta(days=1) < start:
-        # The gap exceeds max_gap_days; days between the anchor and the floor won't be caught up
-        # and will be recorded as processed, so surface it — the operator must run an explicit
-        # backfill for [anchor+1, start) or those days are lost.
-        logger.warning(
-            "catchup.gap_exceeds_cap",
-            source=source,
-            last_processed=anchor.isoformat(),
-            resume_from=start.isoformat(),
-            skipped_days=(start - anchor).days - 1,
-        )
+def dataset_start(progress: DatasetProgress, *, as_of: dt.date, max_gap_days: int) -> dt.date:
+    """First day to (re)ingest for one dataset.
+
+    Resume after the last processed day, but pull back to the oldest still-failed day and the
+    oldest recently-skipped day so those are re-attempted (later, already-successful days re-run
+    too — upserts make that idempotent). Everything is floored at ``as_of - max_gap_days``.
+    """
+    floor = as_of - dt.timedelta(days=max_gap_days)
+    start = bounded_start(progress.processed_through, as_of=as_of, max_gap_days=max_gap_days)
+    for retry in (progress.earliest_failed, progress.earliest_recent_skip):
+        if retry is not None and retry < start:
+            start = max(retry, floor)
     return start
+
+
+def series_start(
+    database: Database,
+    source: str,
+    *,
+    as_of: dt.date,
+    max_gap_days: int,
+    skip_retry_days: int = DEFAULT_SKIP_RETRY_DAYS,
+) -> dt.date:
+    """First business day to (re)ingest for a date-series ``source``.
+
+    Computed per dataset (min across the source's datasets), so one product failing on a day
+    never lets a sibling product's success advance the anchor past it. See :func:`dataset_start`
+    for the per-dataset policy.
+    """
+    skip_retry_cutoff = as_of - dt.timedelta(days=skip_retry_days)
+    with database.session() as session:
+        progress = IngestionRunRepository(session).dataset_progress(
+            source, skip_retry_cutoff=skip_retry_cutoff
+        )
+    if not progress:
+        return bounded_start(None, as_of=as_of, max_gap_days=max_gap_days)
+
+    floor = as_of - dt.timedelta(days=max_gap_days)
+    starts: dict[str, dt.date] = {}
+    for dataset, p in progress.items():
+        start = dataset_start(p, as_of=as_of, max_gap_days=max_gap_days)
+        starts[dataset] = start
+        if p.processed_through is not None and start > p.processed_through + dt.timedelta(days=1):
+            # The gap exceeds max_gap_days; days between the anchor and the floor won't be caught
+            # up and will be recorded as processed, so surface it — the operator must run an
+            # explicit backfill for the lost window or those days are gone.
+            logger.warning(
+                "catchup.gap_exceeds_cap",
+                source=source,
+                dataset=dataset,
+                last_processed=p.processed_through.isoformat(),
+                resume_from=start.isoformat(),
+                skipped_days=(start - p.processed_through).days - 1,
+            )
+        if p.earliest_failed is not None and p.earliest_failed < floor:
+            # Failed days older than the cap are never retried automatically.
+            logger.warning(
+                "catchup.failed_days_below_cap",
+                source=source,
+                dataset=dataset,
+                earliest_failed=p.earliest_failed.isoformat(),
+                floor=floor.isoformat(),
+            )
+    return min(starts.values())
 
 
 def catch_up(
@@ -87,14 +139,16 @@ def catch_up(
     groups: dict[str, list[PipelineResult]] = {}
 
     # --- date-series: gap-fill every missed business day -------------------------------------
-    fbil_start = series_start(database, "fbil", as_of=as_of, max_gap_days=max_gap_days)
+    fbil_start = series_start(database, FbilSource.name, as_of=as_of, max_gap_days=max_gap_days)
     fbil_days = list(business_days(fbil_start, as_of)) if fbil_start <= as_of else []
     logger.info("catchup.fbil", start=fbil_start.isoformat(), n=len(fbil_days))
     groups["Sovereign valuations · FBIL"] = (
         SovereignValuationPipeline(database).backfill(fbil_start, as_of) if fbil_days else []
     )
 
-    ccil_start = series_start(database, "ccil", as_of=as_of, max_gap_days=max_gap_days)
+    ccil_start = series_start(
+        database, CcilHistoricalTradesSource.name, as_of=as_of, max_gap_days=max_gap_days
+    )
     ccil_pipeline = TradePipeline(
         database, source=CcilHistoricalTradesSource(), derive_securities=derive_securities
     )
