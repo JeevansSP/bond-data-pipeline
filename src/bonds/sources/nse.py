@@ -160,29 +160,43 @@ def _as_int(value: Any) -> int | None:
 # (a missing coupon is exactly its selection criterion).
 #
 # Descriptors look like "KRAZYBEE SERVICES LIMITED 10.65 NCD 12AG27 FVRS10LAC" — issuer text,
-# then optionally a coupon and series/date noise. Cut the issuer at the first digit or series
-# marker; take the first decimal-looking number as the coupon.
-_ISSUER_END_RE: Final = re.compile(r"\s+(?:SR\b|SERIES\b|TR\b|\d)")
-_COUPON_RE: Final = re.compile(r"\b(\d{1,2}\.\d{1,4})\b")
+# then optionally a coupon and series/date noise. The issuer is cut at a series/instrument
+# marker, a decimal number (the coupon) or a 4+-digit run (a year) — NOT at bare short digits,
+# which occur inside real legal names ("ONE 97 COMMUNICATIONS LIMITED", "M 3 M INDIA").
+_ISSUER_END_RE: Final = re.compile(
+    r"\s+(?:SR\b|SERIES\b|TR\b|NCD\b|MLD\b|BD\b|FVRS|\d+\.\d|\d{4,})"
+)
+# Coupon: a standalone decimal (not part of a dotted date like "26.09.2025"), sanity-bounded —
+# a wrongly-derived coupon is sticky (it permanently excludes the row from enrichment).
+_COUPON_RE: Final = re.compile(r"(?<![\d.])(\d{1,2}\.\d{1,4})(?![.\d])")
+_COUPON_MAX: Final = 30.0
+_MIN_ISSUER_LEN: Final = 3  # a one-letter "issuer" (real descriptor: just "L") is noise
 
 
 def _derive_issuer(descriptor: str) -> str | None:
     match = _ISSUER_END_RE.search(descriptor)
     issuer = (descriptor[: match.start()] if match else descriptor).strip(" -.,")
-    return issuer or None
+    return issuer if len(issuer) >= _MIN_ISSUER_LEN else None
+
+
+def _derive_coupon(descriptor: str) -> float | None:
+    match = _COUPON_RE.search(descriptor)
+    if not match:
+        return None
+    value = float(match.group(1))
+    return value if 0 < value <= _COUPON_MAX else None
 
 
 def derive_security(isin: str, descriptor: str | None) -> SecurityRecord:
     """Best-effort minimal reference row for one NSE-traded corporate ISIN."""
     desc = (descriptor or "").strip() or None
-    coupon_match = _COUPON_RE.search(desc or "")
     return SecurityRecord(
         isin=isin,
         instrument_type=InstrumentType.CORP,
         source=NseSource.name,
         description=desc,
         issuer=_derive_issuer(desc) if desc else None,
-        coupon=float(coupon_match.group(1)) if coupon_match else None,
+        coupon=_derive_coupon(desc) if desc else None,
     )
 
 

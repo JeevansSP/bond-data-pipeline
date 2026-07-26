@@ -132,7 +132,14 @@ def parse_main_with_stats(
         return 0, []
     try:
         payload: Any = json.loads(text)
-    except ValueError:
+    except ValueError as exc:
+        head = text[:256].lstrip().lower()
+        if head.startswith(("<!doctype", "<html")) or "<body" in head:
+            # Same hardening as the ticker gate: an Akamai challenge page must fail the run
+            # loudly, not be recorded as a clean zero-trade day.
+            raise SourceError(
+                f"ccil main response for {sec_type} is an HTML page (challenge?)"
+            ) from exc
         logger.warning("ccil.unparsed_response", sec_type=sec_type)
         return 0, []
     rows = _extract_rows(payload)

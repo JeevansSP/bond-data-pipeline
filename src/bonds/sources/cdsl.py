@@ -158,8 +158,9 @@ def _as_float(value: str) -> float | None:
     if not value or value.upper() in {"NA", "N/A", "-"}:
         return None
     # Coupons come plain ("7.79") and %-suffixed ("10.03%"), sometimes with a footnote
-    # star ("9.24%*") — ~78% of live snapshot rows carry the % suffix.
-    cleaned = value.replace(",", "").rstrip("*").rstrip("%").strip()
+    # star ("9.24%*") — ~78% of live snapshot rows carry the % suffix. rstrip with a char
+    # set handles either suffix order.
+    cleaned = value.replace(",", "").rstrip("*%").strip()
     try:
         return float(cleaned)
     except ValueError:

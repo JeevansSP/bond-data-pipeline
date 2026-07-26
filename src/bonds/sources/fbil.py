@@ -70,8 +70,11 @@ class FbilSource(MetricsCollector):
             Raw ``.xlsx`` bytes.
 
         Raises:
-            DataUnavailable: If FBIL has no file for that date (holiday/weekend -> HTTP 500).
-            SourceError: On any other HTTP failure.
+            DataUnavailable: If FBIL has no file for that date (holiday/weekend -> HTTP 500,
+                or a 200 with a non-xlsx body for dates outside the published range).
+            SourceError: On any other HTTP *status* failure. Transport errors (timeouts,
+                connection resets surviving the retry budget) propagate as ``httpx`` exceptions;
+                the pipeline's ``execute_run`` records those as FAILED.
         """
         url = f"{_BASE_URL}/{product}/downloadPublished"
         try:

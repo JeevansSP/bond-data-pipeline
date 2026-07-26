@@ -29,8 +29,16 @@ def test_parse_main_handles_undeployed_sentinel() -> None:
     assert parse_main("Undeployed", "CG", AS_OF) == []
 
 
-def test_parse_main_handles_non_json() -> None:
-    assert parse_main("<html>error</html>", "CG", AS_OF) == []
+def test_parse_main_raises_on_html_challenge() -> None:
+    # An Akamai challenge page must fail the run loudly, not become a clean zero-trade day.
+    from bonds.sources.base import SourceError
+
+    with pytest.raises(SourceError, match="HTML"):
+        parse_main("<html><body>Access Denied</body></html>", "CG", AS_OF)
+
+
+def test_parse_main_handles_non_json_non_html() -> None:
+    assert parse_main("definitely not json", "CG", AS_OF) == []
 
 
 def test_parse_main_extracts_trades_from_record_list() -> None:
@@ -86,3 +94,37 @@ def test_fetch_trades_parses_when_market_open(tmp_path: Path) -> None:
     assert len(records) == 3  # one row per Sec Type (CG/SG/TB)
     assert {r.segment for r in records} == {"CG", "SG", "TB"}
     assert (tmp_path / "raw" / "ccil" / "2026-07-18" / "CG.json").exists()
+
+
+@respx.mock
+def test_market_gate_challenge_page_raises(tmp_path: Path) -> None:
+    # A 200 non-JSON ticker body is an Akamai challenge, not "market closed" — must not
+    # record a clean empty day.
+    from bonds.sources.base import SourceError
+
+    respx.get("https://www.ccilindia.com/individual-trades").mock(
+        return_value=httpx.Response(200, text="<html>ok</html>")
+    )
+    respx.post("https://www.ccilindia.com/individual-trades").mock(
+        return_value=httpx.Response(200, text="<html><body>Access Denied</body></html>")
+    )
+    settings = Settings(data_root=tmp_path, http=HttpSettings(min_interval_seconds=0.0))
+    source = CcilSource(client=ThrottledClient(settings.http), settings=settings)
+    with pytest.raises(SourceError, match="non-JSON"):
+        source.fetch_trades(AS_OF)
+
+
+@respx.mock
+def test_market_gate_unexpected_json_shape_raises(tmp_path: Path) -> None:
+    from bonds.sources.base import SourceError
+
+    respx.get("https://www.ccilindia.com/individual-trades").mock(
+        return_value=httpx.Response(200, text="<html>ok</html>")
+    )
+    respx.post("https://www.ccilindia.com/individual-trades").mock(
+        return_value=httpx.Response(200, json=["not", "a", "dict"])
+    )
+    settings = Settings(data_root=tmp_path, http=HttpSettings(min_interval_seconds=0.0))
+    source = CcilSource(client=ThrottledClient(settings.http), settings=settings)
+    with pytest.raises(SourceError, match="shape"):
+        source.fetch_trades(AS_OF)

@@ -246,6 +246,11 @@ class _Agg:
                 self.yld_num += ytm * face
             if time_key >= self.last_key:  # ltp/lty = latest trade with a valid price
                 self.last_key, self.last_px, self.last_yld = time_key, price, ytm
+        elif ytm is not None and ytm != 0 and face > 0:
+            # Yield-only print (e.g. a when-issued quote whose "price" cell held the yield and
+            # was nulled by the repair): no price legs, but it still informs the weighted yield.
+            self.yld_face += face
+            self.yld_num += ytm * face
 
     def to_record(self, isin: str, trade_date: dt.date, source: str) -> TradeRecord:
         wap = self.px_num / self.total_face if self.total_face else None
@@ -265,30 +270,47 @@ class _Agg:
         )
 
 
-# Plausibility bounds for Indian sovereign yields (% p.a.). Historical peak repo-era yields sit
-# well under 20; anything above _YTM_IMPLAUSIBLE is a price in the yield column, not a yield.
+# Plausibility bounds for Indian sovereign quotes. Yields above _YTM_IMPLAUSIBLE are never real
+# (historical repo-era peaks sit well under 20); yields in [_YTM_MIN, 0) are rare but genuine
+# (capital-indexed bonds above redemption printed ~-16.7% in 2002). Prices below
+# _PRICE_MIN_PAR_SEGMENT only occur for deep-discount STRIPS — for every other segment a value
+# that low in the price column is a yield, not a price (verified against 15.7M landed rows).
 _YTM_IMPLAUSIBLE: Final = 40.0
-_PRICE_LOOKS_LIKE_YIELD_MAX: Final = 40.0
+_YTM_MIN: Final = -20.0
+_PRICE_MIN_PAR_SEGMENT: Final = 40.0
 
 
 def _repair_price_yield(
-    price: float | None, ytm: float | None
+    price: float | None, ytm: float | None, *, deep_discount: bool
 ) -> tuple[float | None, float | None]:
-    """Undo CCIL's occasional price/yield column transposition; discard implausible yields.
+    """Undo CCIL's occasional price/yield column garbling; discard what can't be trusted.
 
-    Some sessions (seen on SDL/STRIPS/G-Sec rows across 2002-2023) land with the columns
-    swapped — e.g. price 8.48 / yield 104.23 for a bond trading near 104 at an 8.48% yield.
-    A yield above ``_YTM_IMPLAUSIBLE`` is never a real Indian sovereign yield, so:
+    Verified against all occurrences in 15.7M landed rows:
 
-    * yield implausible and price small enough to *be* a yield -> swap them back;
-    * yield implausible but price plausible (isolated garbled cell) -> drop the yield;
-    * negative yield -> drop (not a real print in this market).
+    * yield implausible and price yield-sized -> a clean transposition: swap back (all 68 real
+      cases genuine, including deep-discount STRIPS at price 6.15 / "yield" 76.35);
+    * yield implausible and price price-sized -> BOTH cells are garbled (in every landed case
+      the "plausible" price was also wrong, e.g. a 91-day T-bill at 86.41 with the true price
+      98.94 sitting in the yield column) -> drop both rather than record a confidently-wrong
+      price;
+    * non-deep-discount segment with a yield-sized price (e.g. when-issued G-Secs quoted
+      price=7.25 / ytm=0.0) -> the price column holds a yield: drop the price, keep the more
+      plausible yield leg;
+    * yield below ``_YTM_MIN`` -> drop the yield (keep genuine capital-indexed negatives).
+
+    ``deep_discount`` (STRIPS) exempts the low-price rule: a 2040 principal strip legitimately
+    trades at 7.79.
     """
     if ytm is not None and ytm > _YTM_IMPLAUSIBLE:
-        if price is not None and 0 < price < _PRICE_LOOKS_LIKE_YIELD_MAX:
+        if price is not None and 0 < price < _PRICE_MIN_PAR_SEGMENT:
             return ytm, price
-        return price, None
-    if ytm is not None and ytm < 0:
+        return None, None
+    if not deep_discount and price is not None and 0 < price < _PRICE_MIN_PAR_SEGMENT:
+        yield_leg = (
+            ytm if ytm is not None and _YTM_MIN <= ytm <= _YTM_IMPLAUSIBLE and ytm != 0 else price
+        )
+        return None, yield_leg
+    if ytm is not None and ytm < _YTM_MIN:
         return price, None
     return price, ytm
 
@@ -302,11 +324,15 @@ def _parse_row(row: list[str]) -> _ParsedRow | None:
     isin = row[2].strip()
     if trade_date is None or len(isin) != 12 or not isin.startswith("IN"):
         return None
-    price, ytm = _repair_price_yield(_as_float(row[5]), _as_float(row[6]))
+    desc = row[3].strip() or None
+    segment = _instrument_segment(desc, isin)
+    price, ytm = _repair_price_yield(
+        _as_float(row[5]), _as_float(row[6]), deep_discount=segment == "STRIPS"
+    )
     return (
         isin,
         trade_date,
-        row[3].strip() or None,
+        desc,
         _as_float(row[4]) or 0.0,
         price,
         ytm,
@@ -403,20 +429,93 @@ def _parse_coupon(desc: str | None, segment: str) -> float | None:
     return float(m.group(1)) if m else None
 
 
-# SDL descriptions carry the full state name between the coupon and a drift-prone marker:
-# "05.60 ANDHRA PRADESH SDL 2014", "09.37 MAHARASHTRA S.D. 2023", "06.97 MAHARASHTRA SGS 2028".
-# Legacy (pre-2012) rows write the coupon with a % ("10.35% ASSAM SDL 2011") and sometimes drop
-# the marker entirely ("10.50% JAMMU & KASHMIR 2011") — the maturity year then bounds the state.
-_SDL_STATE_RE: Final = re.compile(
-    r"^\s*[\d.]+\s*%?\s+(?P<state>[A-Z .&]+?)\s*(?:\b(?:SDL|SGS|SGL)\b|S\.?\s?D\.?L?\.?\s|\d{4})"
+# SDL descriptions carry the state name between the coupon and a drift-prone marker. Across
+# 24 years of naming the marker appears as SDL / SGS / SGL / GS / G.S. / G S / S.D.(L.) /
+# GOVT(. STOCK) / LOAN — or not at all, in which case the 4-digit maturity year bounds the state
+# ("10.50% JAMMU & KASHMIR 2011"). Validated against every distinct SDL description in the
+# landed history (10k+): 31 canonical issuers, zero unmatched.
+_SDL_MARKER: Final = (
+    r"(?:SDL|SGS|SGL|GS|G\.?\s?S\.?|S\.?\s?D\.?L?\.?|GOVT\.?\s*(?:STOCK)?|STOCK|LOAN)"
 )
+_SDL_STATE_RE: Final = re.compile(
+    rf"^\s*[\d.]+\s*%?\s*(?P<state>[A-Z][A-Z .&]*?)\s*(?:\b{_SDL_MARKER}(?=[\s\d.(]|$)|\d{{4}})"
+)
+
+# Observed spelling variants -> canonical state, keyed on the squashed form (A-Z and & only, so
+# "A. P.", "A.P" and "AP" share a key). Unknown states pass through raw rather than being lost.
+_STATE_ALIASES: Final[dict[str, str]] = {
+    "ANDHRA": "ANDHRA PRADESH",
+    "ANDHRAPRADESH": "ANDHRA PRADESH",
+    "AP": "ANDHRA PRADESH",
+    "ARPR": "ARUNACHAL PRADESH",
+    "ARUNACHAL": "ARUNACHAL PRADESH",
+    "ARUNACHALPRADESH": "ARUNACHAL PRADESH",
+    "ARUNPRA": "ARUNACHAL PRADESH",
+    "ARUNACHALPRA": "ARUNACHAL PRADESH",
+    "ARUNACHALPR": "ARUNACHAL PRADESH",
+    "CHATTISGARH": "CHHATTISGARH",
+    "CHATISGAR": "CHHATTISGARH",
+    "CHATTIS": "CHHATTISGARH",
+    "CHHATISGARH": "CHHATTISGARH",
+    "CHHATISHGARH": "CHHATTISGARH",
+    "GUJRAT": "GUJARAT",
+    "HARAYANA": "HARYANA",
+    "HIMACHAL": "HIMACHAL PRADESH",
+    "HIMACHALPRADESH": "HIMACHAL PRADESH",
+    "HP": "HIMACHAL PRADESH",
+    "HIMACHALPR": "HIMACHAL PRADESH",
+    "HIMACHALPRADESHSDL": "HIMACHAL PRADESH",
+    "J&K": "JAMMU & KASHMIR",
+    "JAMMU&KASHMIR": "JAMMU & KASHMIR",
+    "JAMMUANDKASHMIR": "JAMMU & KASHMIR",
+    "JK": "JAMMU & KASHMIR",
+    "JAMMUKASHMIR": "JAMMU & KASHMIR",
+    "JAMMUKASMIR": "JAMMU & KASHMIR",
+    "JHARKAND": "JHARKHAND",
+    "KARN": "KARNATAKA",
+    "KARNATAK": "KARNATAKA",
+    "KER": "KERALA",
+    "KERELA": "KERALA",
+    "MADHYAPRADESH": "MADHYA PRADESH",
+    "MP": "MADHYA PRADESH",
+    "MADHYAPR": "MADHYA PRADESH",
+    "MAHRASTRA": "MAHARASHTRA",
+    "MAHARASTRA": "MAHARASHTRA",
+    "MAH": "MAHARASHTRA",
+    "MAHA": "MAHARASHTRA",
+    "MANI": "MANIPUR",
+    "MEGH": "MEGHALAYA",
+    "MEGHALAY": "MEGHALAYA",
+    "ORISSA": "ODISHA",
+    "ORRISA": "ODISHA",
+    "PONDICHERRY": "PUDUCHERRY",
+    "RAJ": "RAJASTHAN",
+    "RAJSTHAN": "RAJASTHAN",
+    "TAMILNADU": "TAMIL NADU",
+    "TN": "TAMIL NADU",
+    "TELENGANA": "TELANGANA",
+    "UP": "UTTAR PRADESH",
+    "UTTARPRADESH": "UTTAR PRADESH",
+    "UTRANCHAL": "UTTARAKHAND",
+    "UTTARANCHAL": "UTTARAKHAND",
+    "UTRRANCHAL": "UTTARAKHAND",
+    "UTTARC": "UTTARAKHAND",
+    "UTTRANCHAL": "UTTARAKHAND",
+    "WB": "WEST BENGAL",
+    "WBENGAL": "WEST BENGAL",
+    "WESTBENGAL": "WEST BENGAL",
+}
+
+
+def _canonical_state(raw: str) -> str:
+    return _STATE_ALIASES.get(re.sub(r"[^A-Z&]", "", raw), raw)
 
 
 def _sdl_issuer(desc: str | None) -> str | None:
     m = _SDL_STATE_RE.match((desc or "").strip().upper())
     if not m:
         return None
-    state = " ".join(m.group("state").split())
+    state = _canonical_state(" ".join(m.group("state").split()))
     return f"State Government ({state})"
 
 

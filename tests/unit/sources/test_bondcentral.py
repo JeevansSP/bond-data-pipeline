@@ -205,3 +205,20 @@ def test_iter_records_skips_non_json_page_and_continues(tmp_path: Path) -> None:
     )
     records = list(_source(tmp_path).iter_records(AS_OF, max_pages=2))
     assert {r.isin for r in records} == {"IN8241O08017"}
+
+
+@respx.mock
+def test_tail_failures_without_total_pages_keep_the_snapshot(tmp_path: Path) -> None:
+    # If the API ever stops sending total_pages and the last page errors, the skip loop must
+    # not probe ~30 phantom pages and discard the nearly-complete snapshot: after one good
+    # page, 3 consecutive failures with no known total means end-of-feed.
+    page1 = dict(_PAGE_1, pagination_info={"has_next": True})  # no total_pages
+    respx.get(URL, params={"page": "1", "size": "100"}).mock(
+        return_value=httpx.Response(200, json=page1)
+    )
+    for p in range(2, 6):
+        respx.get(URL, params={"page": str(p), "size": "100"}).mock(
+            return_value=httpx.Response(500)
+        )
+    records = list(_source(tmp_path).iter_records(AS_OF))
+    assert {r.isin for r in records} == {"INE002A07809"}  # page 1 kept, no SourceError

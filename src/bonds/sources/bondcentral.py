@@ -92,7 +92,7 @@ class BondCentralSource(MetricsCollector):
         size = min(size, _MAX_PAGE_SIZE)
         self.reset_metrics()
         page = 1
-        total_bytes = total_items = total_kept = skipped_pages = 0
+        total_bytes = total_items = total_kept = skipped_pages = consecutive_failures = 0
         known_total_pages: int | None = None
         while True:
             try:
@@ -102,17 +102,28 @@ class BondCentralSource(MetricsCollector):
                 # body (proxy error page) — must not abort the whole snapshot: skip it and go on,
                 # capped so a genuine outage still fails loudly.
                 skipped_pages += 1
+                consecutive_failures += 1
                 logger.warning("bondcentral.page_skipped", page=page, error=str(exc)[:80])
                 if skipped_pages > _MAX_SKIPPED_PAGES:
                     raise SourceError(
                         f"BondCentral: {skipped_pages} pages failed to fetch; aborting"
                     ) from exc
+                if known_total_pages is None and consecutive_failures >= 3 and total_items > 0:
+                    # Without a known page count we can't tell "broken page" from "past the
+                    # end of the feed": if the final page fails, probing onward would burn the
+                    # whole skip budget on phantom pages and discard a nearly-complete
+                    # snapshot. Three consecutive failures with no total — after at least one
+                    # good page (a dead-from-page-1 outage must still abort loudly, not yield
+                    # an empty "successful" snapshot) -> assume end.
+                    logger.warning("bondcentral.assumed_end_of_feed", page=page)
+                    break
                 if (known_total_pages is not None and page >= known_total_pages) or (
                     max_pages is not None and page >= max_pages
                 ):
                     break
                 page += 1
                 continue
+            consecutive_failures = 0
             items = payload.get("data") or []
             kept = 0
             for item in items:

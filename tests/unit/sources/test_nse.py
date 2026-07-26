@@ -134,3 +134,37 @@ class TestDeriveSecurities:
             ),
         ]
         assert len(derive_securities(trades)) == 1
+
+
+class TestDeriveSecuritiesEdgeCases:
+    """Adversarial descriptors from the re-review (digit words, dotted dates, noise)."""
+
+    def test_issuer_with_interior_digit_words_survives(self) -> None:
+        from bonds.sources.nse import derive_security
+
+        rec = derive_security("INE0TEST0001", "ONE 97 COMMUNICATIONS LIMITED 7.95 NCD 12AG27")
+        assert rec.issuer == "ONE 97 COMMUNICATIONS LIMITED"
+        assert rec.coupon == pytest.approx(7.95)
+
+        rec = derive_security("INE0TEST0002", "M 3 M INDIA PRIVATE LIMITED SR II 10.25 NCD")
+        assert rec.issuer == "M 3 M INDIA PRIVATE LIMITED"
+        assert rec.coupon == pytest.approx(10.25)
+
+    def test_dotted_date_is_not_a_coupon(self) -> None:
+        from bonds.sources.nse import derive_security
+
+        rec = derive_security("INE0TEST0003", "ACME CAPITAL LIMITED NCD 26.09.2025 10.45")
+        assert rec.coupon == pytest.approx(10.45)  # 26.09 (a date fragment) must not win
+
+    def test_implausible_coupon_is_dropped(self) -> None:
+        from bonds.sources.nse import derive_security
+
+        # A wrongly-derived coupon is sticky (blocks enrichment forever) -> bound it.
+        rec = derive_security("INE0TEST0004", "ACME LIMITED SR 4 45.75 NCD")
+        assert rec.coupon is None
+
+    def test_noise_descriptor_yields_no_issuer(self) -> None:
+        from bonds.sources.nse import derive_security
+
+        rec = derive_security("INE0TEST0005", "L")  # real landed descriptor
+        assert rec.issuer is None and rec.coupon is None

@@ -97,7 +97,8 @@ def test_group_with_no_valid_prices_yields_none_wap() -> None:
     csv_text = _HEADER + "17-07-2026,10:00:00,IN2220190127,SGS 2028,50000000.000,0,6,NRML\n"
     (rec,) = aggregate_trades(csv_text, source="ccil")
     assert rec.no_of_trades == 1
-    assert rec.wap is None and rec.way is None and rec.ltp is None  # no ZeroDivisionError
+    assert rec.wap is None and rec.ltp is None  # no ZeroDivisionError
+    assert rec.way == pytest.approx(6.0)  # the valid yield leg still informs the weighted yield
 
 
 def test_column_shift_row_is_rejected() -> None:
@@ -297,19 +298,45 @@ class TestRepairPriceYield:
         assert rec.wap == pytest.approx(104.2283)
         assert rec.way == pytest.approx(8.48)
 
-    def test_implausible_yield_with_plausible_price_is_discarded(self) -> None:
-        # Real example (IN002012X024, 2012-08-22): price 83.93 (plausible T-Bill),
-        # yield 98.43 (garbage) -> keep the price, drop the yield.
+    def test_double_garbled_row_drops_both_legs(self) -> None:
+        # Real example (IN002012X024, 2012-08-22): price 83.93 and yield 98.43 — verified in
+        # every landed occurrence that the "plausible" price cell is ALSO wrong (the true price,
+        # 98.94-style, sits in the yield column). Neither leg can be trusted -> record the trade
+        # with no price and no yield rather than a confidently-wrong price.
         csv = (
             _HEADER
             + "22-08-2012,10:00:00,IN002012X024,091 DTB 02112012,50000000,83.9307,98.4262,O\n"
         )
         rec = aggregate_trades(csv, source="ccil")[0]
-        assert rec.ltp == pytest.approx(83.9307)
-        assert rec.lty is None
-        assert rec.way is None
+        assert rec.no_of_trades == 1
+        assert rec.ltp is None and rec.wap is None
+        assert rec.lty is None and rec.way is None
 
-    def test_negative_yield_is_discarded(self) -> None:
+    def test_yield_in_price_column_is_reclassified(self) -> None:
+        # Real example (11-01-2019 "NI GOVT. STOCK 2029"): when-issued trades quoted in yield —
+        # price=7.25, ytm=0.0. 7.25 must not enter wap/ltp as a price; it IS the yield.
+        csv = _HEADER + "11-01-2019,10:00:00,IN0020180488,NI GOVT. STOCK 2029,50000000,7.25,0.0,O\n"
+        rec = aggregate_trades(csv, source="ccil")[0]
+        assert rec.ltp is None and rec.wap is None
+        assert rec.way == pytest.approx(7.25)  # yield-only print still informs the weighted yield
+
+    def test_deep_discount_strips_low_price_is_kept(self) -> None:
+        # A 2040 principal strip legitimately trades at 7.79 with a ~9% yield — the low-price
+        # reclassification must NOT fire for STRIPS.
+        csv = _HEADER + "20-10-2011,10:00:00,IN0020110066,GS02JUL2040C,50000000,7.79,9.09,O\n"
+        rec = aggregate_trades(csv, source="ccil")[0]
+        assert rec.segment == "STRIPS"
+        assert rec.ltp == pytest.approx(7.79)
+        assert rec.lty == pytest.approx(9.09)
+
+    def test_capital_indexed_negative_yield_is_kept(self) -> None:
+        # Real print: 6% capital-indexed bond above redemption near maturity, yield -16.73.
+        row = "15-05-2002,10:00:00,IN0020020017,6% CAPITAL INDEXED BONDS 2002,50000000,121.4,-16.73,O\n"  # noqa: E501
+        rec = aggregate_trades(_HEADER + row, source="ccil")[0]
+        assert rec.ltp == pytest.approx(121.4)
+        assert rec.lty == pytest.approx(-16.73)
+
+    def test_absurd_negative_yield_is_discarded(self) -> None:
         csv = (
             _HEADER
             + "09-12-2013,10:00:00,IN2220190127,09.37 GUJARAT SDL 2023,50000000,101.5,-50.76,O\n"
@@ -335,6 +362,24 @@ class TestRepairPriceYield:
         ("09.37 MAHARASHTRA S.D. 2023", "State Government (MAHARASHTRA)"),
         ("06.97 MAHARASHTRA SGS 2028", "State Government (MAHARASHTRA)"),
         ("07.33 JAMMU & KASHMIR SDL 2029", "State Government (JAMMU & KASHMIR)"),
+        # Legacy marker drift (all real formats from the landed history).
+        ("8.84% Maharashtra GS 2022", "State Government (MAHARASHTRA)"),
+        ("7.83% GUJARAT G.S. 2012", "State Government (GUJARAT)"),
+        ("7.39% MAHARASHTRA G S 2015", "State Government (MAHARASHTRA)"),
+        ("9.40% PUNJAB GOVT. STOCK 2011", "State Government (PUNJAB)"),
+        ("12.47% PUNJAB GOVT.STOCK 2009", "State Government (PUNJAB)"),
+        ("13.05% ORISSA GOVT LOAN 2007", "State Government (ODISHA)"),
+        ("12.50% MEGHALAYA SDL2008", "State Government (MEGHALAYA)"),
+        ("8.33%GUJARAT GS 2020", "State Government (GUJARAT)"),
+        ("7.80% A.P. SDL(APL) 2012", "State Government (ANDHRA PRADESH)"),
+        # Alias canonicalisation: abbreviations and typos collapse to one issuer per state.
+        ("10.35%  A. P. SDL 2011", "State Government (ANDHRA PRADESH)"),
+        ("8.29% Ar.Pr. GS 2020", "State Government (ARUNACHAL PRADESH)"),
+        ("8.58% W.Bengal GS 2020", "State Government (WEST BENGAL)"),
+        ("8.00% MAHRASTRA GS 2018", "State Government (MAHARASHTRA)"),
+        ("7.95% UTRANCHAL GS 2016", "State Government (UTTARAKHAND)"),
+        ("6.95% TAMILNADU GS 2018", "State Government (TAMIL NADU)"),
+        ("10.50% JAMMU & KASHMIR 2011", "State Government (JAMMU & KASHMIR)"),
         ("garbage with no state marker", None),
         (None, None),
     ],
