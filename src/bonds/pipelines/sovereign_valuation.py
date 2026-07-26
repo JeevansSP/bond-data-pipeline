@@ -60,7 +60,7 @@ class SovereignValuationPipeline:
         return [self._run_product(product, date) for product in self._products]
 
     def backfill(self, start: dt.date, end: dt.date) -> list[PipelineResult]:
-        """Ingest every configured product across ``[start, end]`` (weekdays only)."""
+        """Ingest every configured product across ``[start, end]`` (Mon-Sat; Sundays excluded)."""
         results: list[PipelineResult] = []
         for day in business_days(start, end):
             results.extend(self.run_date(day))
@@ -103,6 +103,8 @@ _SOVEREIGN_FACE_VALUE = 100.0
 
 def _to_security(v: SovereignValuation) -> SecurityRecord:
     """Derive a universe :class:`SecurityRecord` from a valuation row, enriching identity."""
+    # An unknown coupon is not the same as zero-coupon: leave interest_type unknown too.
+    interest_type = None if v.coupon is None else ("Zero" if v.coupon == 0.0 else "Fixed")
     return SecurityRecord(
         isin=v.isin,
         instrument_type=v.instrument_type,
@@ -110,17 +112,23 @@ def _to_security(v: SovereignValuation) -> SecurityRecord:
         description=v.description,
         issuer=_sovereign_issuer(v),
         coupon=v.coupon,
-        interest_type="Zero" if v.coupon in (None, 0.0) else "Fixed",
+        interest_type=interest_type,
         maturity_date=v.maturity_date,
         face_value=_SOVEREIGN_FACE_VALUE,
     )
 
 
-def _sovereign_issuer(v: SovereignValuation) -> str:
-    """Derive the issuer: GoI for G-Secs; the issuing state (from the description) for SDLs."""
-    if v.instrument_type is InstrumentType.SDL and v.description:
-        # SDL descriptions look like "07.83 GJ SDL 2026" -> state code is the 2nd token.
-        parts = v.description.split()
-        if len(parts) >= 2 and len(parts[1]) == 2 and parts[1].isalpha():
-            return f"State Government ({parts[1].upper()})"
+def _sovereign_issuer(v: SovereignValuation) -> str | None:
+    """Derive the issuer: GoI for G-Secs; the issuing state (from the description) for SDLs.
+
+    An SDL whose description doesn't carry the expected state code yields ``None`` — an unknown
+    issuer, never a wrong "Government of India".
+    """
+    if v.instrument_type is InstrumentType.SDL:
+        if v.description:
+            # SDL descriptions look like "07.83 GJ SDL 2026" -> state code is the 2nd token.
+            parts = v.description.split()
+            if len(parts) >= 2 and len(parts[1]) == 2 and parts[1].isalpha():
+                return f"State Government ({parts[1].upper()})"
+        return None
     return "Government of India"

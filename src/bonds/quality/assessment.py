@@ -172,11 +172,15 @@ def check_consistency(conn: Connection) -> list[QualityCheck]:
         "SELECT count(*) FROM securities "
         "WHERE upper(interest_type) LIKE '%ZERO%' AND coupon IS NOT NULL AND coupon > 0",
     )
-    # Implausible-looking sovereign/corp yields in trades: the CCIL transposition guard nulls
-    # these at parse time now, so anything remaining is either old data or a new pattern.
+    # Implausible sovereign yields in CCIL trades: the parse-time repair guard nulls these now,
+    # so anything remaining is old data or a new garbling pattern. Scoped to CCIL only — NSE
+    # corporate (distressed) paper can legitimately print yields far above 40, and a permanently
+    # red WARN on legit data trains users to ignore warnings. Bounds match the repair guard
+    # (capital-indexed bonds have printed genuine negatives down to ~-17).
     implausible_yields = _scalar(
         conn,
-        "SELECT count(*) FROM trades WHERE lty IS NOT NULL AND (lty < 0 OR lty > 40)",
+        "SELECT count(*) FROM trades "
+        "WHERE source='ccil' AND lty IS NOT NULL AND (lty < -20 OR lty > 40)",
     )
     matured_active = _scalar(
         conn,
@@ -199,7 +203,7 @@ def check_consistency(conn: Connection) -> list[QualityCheck]:
             Level.WARN,
             passed=implausible_yields == 0,
             observed=implausible_yields,
-            detail="lty < 0 or > 40 — transposed/garbled source columns",
+            detail="ccil lty < -20 or > 40 — transposed/garbled source columns",
         ),
         QualityCheck(
             "matured_but_status_active",

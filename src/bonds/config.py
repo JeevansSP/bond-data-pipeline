@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Repository root = three levels up from this file (src/bonds/config.py -> repo root).
+# NOTE: layout-coupled — correct for the editable/src checkout this project runs from; a wheel
+# install would resolve this under site-packages' parent. Fine for the current deployment model.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 # Resolve .env against the repo root, NOT the process CWD — `uv run bonds ...` from any other
 # directory must see the same configuration as the daily script (which cd's into the repo).
@@ -29,9 +31,13 @@ class DatabaseSettings(BaseSettings):
 
     @property
     def url(self) -> str:
-        """SQLAlchemy URL for the psycopg (v3) driver (credentials URL-escaped)."""
-        user = quote_plus(self.user)
-        password = quote_plus(self.password)  # '@', '/', '#', '%' etc. must not break the URL
+        """SQLAlchemy URL for the psycopg (v3) driver (credentials URL-escaped).
+
+        ``quote`` with no safe chars, NOT ``quote_plus``: SQLAlchemy's URL parser unquotes with
+        ``unquote``, so a plus-encoded space would arrive at the server as a literal ``+``.
+        """
+        user = quote(self.user, safe="")
+        password = quote(self.password, safe="")  # '@', '/', '#', '%', ' ' must not break the URL
         return f"postgresql+psycopg://{user}:{password}@{self.host}:{self.port}/{self.name}"
 
 

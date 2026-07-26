@@ -20,7 +20,9 @@ cd "$REPO_DIR"
 LOG_DIR="$REPO_DIR/data/logs"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/ingest-$(date +%Y-%m-%d).log"
-log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$*" | tee -a "$LOG_FILE"; }
+# `|| true`: under set -eo pipefail an unwritable LOG_FILE (permissions/disk full) would
+# otherwise kill the script on the very first log line, with no diagnostic anywhere.
+log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$*" | tee -a "$LOG_FILE" || true; }
 
 # --- single-instance lock (mkdir is atomic on POSIX; steal it only if the holder has died) ---
 # flock(1) isn't on stock macOS, so this stays a mkdir lock, hardened against the races that
@@ -44,12 +46,21 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
       exit 0
     fi
   elif kill -0 "$holder_pid" 2>/dev/null \
-      && ps -p "$holder_pid" -o command= 2>/dev/null | grep -q "run_daily_ingest"; then
+      && ps -p "$holder_pid" -o command= 2>/dev/null | grep -Eq "bash .*run_daily_ingest\.sh"; then
+    # The command-line anchor matters: a bare name match would false-positive on PID reuse by
+    # e.g. `vim run_daily_ingest.sh` and silently skip the day's ingest.
     log "another ingest is running (pid $holder_pid); exiting"
     exit 0
   fi
-  log "clearing stale lock"
-  rm -rf "$LOCK_DIR"
+  # Steal by atomic rename: of two concurrent stealers exactly one wins the mv; the loser's
+  # mv fails and it exits. A naive rm+mkdir here lets the loser's rm destroy the winner's
+  # freshly-acquired lock (and the winner's EXIT trap then destroys a third runner's lock).
+  if ! mv "$LOCK_DIR" "$LOCK_DIR.stale.$$" 2>/dev/null; then
+    log "another process is stealing the stale lock; exiting"
+    exit 0
+  fi
+  rm -rf "$LOCK_DIR.stale.$$"
+  log "cleared stale lock"
   if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     log "another process took the lock; exiting"
     exit 0
@@ -60,6 +71,13 @@ trap 'rm -rf "$LOCK_DIR"' EXIT
 
 # --- prune old ingest logs (the dated files grow unbounded otherwise) ---
 find "$LOG_DIR" -name 'ingest-*.log' -mtime +30 -delete 2>/dev/null || true
+# launchd's own stdout/stderr files are appended forever and launchd never rotates them;
+# truncate in place (deleting would orphan launchd's open file descriptor).
+for lf in "$LOG_DIR"/launchd.out.log "$LOG_DIR"/launchd.err.log; do
+  if [ -f "$lf" ] && [ "$(wc -c <"$lf" 2>/dev/null || echo 0)" -gt 5242880 ]; then
+    : >"$lf"
+  fi
+done
 
 # --- ensure the Postgres container is up and accepting connections ---
 if command -v docker >/dev/null 2>&1; then
@@ -90,7 +108,7 @@ if command -v caffeinate >/dev/null 2>&1; then
 fi
 
 # --- run the idempotent catch-up ingest (reads .env from the repo dir) ---
-log "=== bonds ingest catch-up ${KEEP_AWAKE:+(sleep held off)}==="
+log "=== bonds ingest catch-up ${KEEP_AWAKE:+(sleep held off) }==="
 # $KEEP_AWAKE is deliberately unquoted: it is a fixed two-word literal (or empty, which must
 # expand to nothing rather than an empty argument).
 # shellcheck disable=SC2086

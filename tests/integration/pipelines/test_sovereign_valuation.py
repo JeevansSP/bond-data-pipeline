@@ -225,3 +225,32 @@ def test_nonpositive_price_coerced_to_null_not_crash(database: Database) -> None
     with database.session() as s:
         row = s.execute(select(Valuation).where(Valuation.isin == ISIN_A)).scalar_one()
     assert row.price is None and row.ytm == 5.0
+
+
+def test_scd2_mass_withdrawal_is_suppressed(database: Database) -> None:
+    # One flaky upstream night serving empty ratings for the whole universe must not write
+    # thousands of junk withdrawal rows: batches withdrawing > max(20, 10%) are suppressed.
+    isins = [f"INTESTMW{i:04d}" for i in range(30)]
+    with database.session() as s:
+        repo = SecurityRepository(s)
+        repo.record_attribute_bulk(
+            "rating", dict.fromkeys(isins, "AAA"), effective=DATE, source=SOURCE
+        )
+        # All 30 suddenly None -> mass withdrawal -> suppressed entirely.
+        changes = repo.record_attribute_bulk(
+            "rating", dict.fromkeys(isins), effective=DATE + dt.timedelta(days=1), source=SOURCE
+        )
+        assert changes == 0
+    with database.session() as s:
+        still_open = (
+            s.execute(
+                select(SecurityAttributeHistory).where(
+                    SecurityAttributeHistory.isin.in_(isins),
+                    SecurityAttributeHistory.valid_to.is_(None),
+                    SecurityAttributeHistory.value == "AAA",
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(still_open) == 30  # nothing was withdrawn

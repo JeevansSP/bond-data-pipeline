@@ -40,6 +40,8 @@ TRACKED_ATTRIBUTES: tuple[str, ...] = (
     "amount_outstanding_cr",
     "amount_issued_cr",
     "payment_frequency",
+    "issuance_date",
+    "embedded_option",
 )
 
 

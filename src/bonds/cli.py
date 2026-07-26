@@ -329,7 +329,7 @@ def ingest_ccil_trades_backfill(
     start: Annotated[dt.datetime, typer.Option(formats=["%Y-%m-%d"], help="Start (inclusive).")],
     end: Annotated[dt.datetime, typer.Option(formats=["%Y-%m-%d"], help="End (inclusive).")],
 ) -> None:
-    """Backfill CCIL NDS-OM trades across a date range (weekdays; holidays return 0 rows)."""
+    """Backfill CCIL NDS-OM trades across a date range (Mon-Sat; holidays return 0 rows)."""
     _init_logging()
     first, last = _date_range(start, end)
     db = Database()
@@ -391,7 +391,7 @@ def backfill_sovereign_valuation(
     ],
     end: Annotated[dt.datetime, typer.Option(formats=["%Y-%m-%d"], help="End date (inclusive).")],
 ) -> None:
-    """Backfill FBIL sovereign valuations across a date range (weekdays; holidays auto-skip)."""
+    """Backfill FBIL sovereign valuations across a date range (Mon-Sat; holidays auto-skip)."""
     _init_logging()
     first, last = _date_range(start, end)
     results = SovereignValuationPipeline(Database()).backfill(first, last)

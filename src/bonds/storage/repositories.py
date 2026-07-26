@@ -82,7 +82,10 @@ def _apply_scd2(
     if current.value == value:
         return False
     if effective < current.valid_from:
-        logger.warning(
+        # Debug, not warning: an out-of-order backfill (e.g. an old half-yearly CDSL snapshot
+        # ingested after newer BondCentral history) hits this once per ISIN — tens of thousands
+        # of lines in one run at warning level.
+        logger.debug(
             "scd2.out_of_order_skipped",
             isin=isin,
             attribute=attribute,
@@ -222,7 +225,7 @@ class SecurityRepository:
                 .values(list(chunk))
                 .on_conflict_do_nothing(index_elements=["isin"])
                 # RETURNING emits only actually-inserted rows, giving a true insert count —
-                # cursor.rowcount is -1 here (SQLAlchemy runs multi-row VALUES as executemany).
+                # the driver reports rowcount -1 for this statement shape.
                 .returning(Security.isin)
             )
             inserted += len(self._session.execute(stmt).all())
@@ -234,22 +237,27 @@ class SecurityRepository:
         Used to backfill coupon/maturity/issuer from an enrichment source (BondCentral) onto rows
         an upstream (CDSL) left sparse. Returns the number of rows touched.
         """
-        touched = 0
+        filled = 0
         for r in records:
+            # Only touch rows where THIS record fills a gap: for each field the record actually
+            # carries, the stored value must be NULL. Anything else is a no-op UPDATE that bumps
+            # updated_at, writes a dead tuple, and inflates the audited "enriched" count.
+            gap_conditions = [
+                column.is_(None)
+                for column, value in (
+                    (Security.coupon, r.coupon),
+                    (Security.maturity_date, r.maturity_date),
+                    (Security.issuer, r.issuer),
+                    (Security.interest_type, r.interest_type),
+                    (Security.face_value, r.face_value),
+                )
+                if value is not None
+            ]
+            if not gap_conditions:
+                continue  # the record carries nothing fillable
             result = self._session.execute(
                 update(Security)
-                # Only touch rows that still have a gap — a fully-populated row must not have
-                # its updated_at bumped (and must not count as "enriched").
-                .where(
-                    Security.isin == r.isin,
-                    or_(
-                        Security.coupon.is_(None),
-                        Security.maturity_date.is_(None),
-                        Security.issuer.is_(None),
-                        Security.interest_type.is_(None),
-                        Security.face_value.is_(None),
-                    ),
-                )
+                .where(Security.isin == r.isin, or_(*gap_conditions))
                 .values(
                     coupon=func.coalesce(Security.coupon, r.coupon),
                     maturity_date=func.coalesce(Security.maturity_date, r.maturity_date),
@@ -259,8 +267,8 @@ class SecurityRepository:
                 )
             )
             if isinstance(result, CursorResult):
-                touched += max(result.rowcount, 0)
-        return touched
+                filled += max(result.rowcount, 0)
+        return filled
 
     def load_reference(
         self, isins: list[str]
@@ -286,7 +294,11 @@ class SecurityRepository:
 
         Loads the currently-open rows for the batch's ISINs (chunked queries), diffs in memory,
         and writes only genuine changes. A ``None`` value records a withdrawal — but only when the
-        open row was set by the *same* source (see :func:`_apply_scd2`).
+        open row was set by the *same* source (see :func:`_apply_scd2`), and only when withdrawals
+        are not anomalously widespread: one flaky upstream night serving empty ratings for the
+        whole universe would otherwise write thousands of junk close/reopen rows, so a batch whose
+        withdrawal count exceeds ``max(20, 10%)`` of its size has ALL withdrawals suppressed
+        (individual value changes still apply) and a loud warning emitted.
 
         Returns:
             The number of changed values recorded.
@@ -309,8 +321,28 @@ class SecurityRepository:
             )
             current.update({row.isin: row for row in open_rows})
 
+        withdrawals = sum(
+            1
+            for isin, value in values.items()
+            if value is None
+            and (row := current.get(isin)) is not None
+            and row.value is not None
+            and row.source == source
+        )
+        suppress_withdrawals = withdrawals > max(20, len(values) // 10)
+        if suppress_withdrawals:
+            logger.warning(
+                "scd2.mass_withdrawal_suppressed",
+                attribute=attribute,
+                source=source,
+                withdrawals=withdrawals,
+                batch=len(values),
+            )
+
         changes = 0
         for isin, value in values.items():
+            if value is None and suppress_withdrawals:
+                continue
             existing = current.get(isin)
             if not _apply_scd2(existing, isin, attribute, value, effective, source):
                 continue
@@ -631,15 +663,16 @@ class DataQualityRepository:
             return
         # Guard the conflict key so a duplicate check_name in one batch can't 'affect a row twice'.
         rows = list({(r["dataset"], r["run_date"], r["check_name"]): r for r in rows}.values())
-        stmt = pg_insert(DataQualityCheck).values(rows)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["dataset", "run_date", "check_name"],
-            set_={
-                "source": stmt.excluded.source,
-                "level": stmt.excluded.level,
-                "passed": stmt.excluded.passed,
-                "observed": stmt.excluded.observed,
-                "detail": stmt.excluded.detail,
-            },
-        )
-        self._session.execute(stmt)
+        for chunk in _chunks(rows):
+            stmt = pg_insert(DataQualityCheck).values(list(chunk))
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["dataset", "run_date", "check_name"],
+                set_={
+                    "source": stmt.excluded.source,
+                    "level": stmt.excluded.level,
+                    "passed": stmt.excluded.passed,
+                    "observed": stmt.excluded.observed,
+                    "detail": stmt.excluded.detail,
+                },
+            )
+            self._session.execute(stmt)
