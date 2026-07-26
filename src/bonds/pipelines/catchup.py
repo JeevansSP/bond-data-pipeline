@@ -16,6 +16,7 @@ re-running — whether twice in a day or after an outage — converges rather th
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from bonds.calendar import business_days
@@ -23,7 +24,7 @@ from bonds.logging import get_logger
 from bonds.pipelines.base import PipelineResult
 from bonds.pipelines.public_issue import PublicIssuePipeline
 from bonds.pipelines.rbi_auction import RbiAuctionPipeline
-from bonds.pipelines.sovereign_valuation import SovereignValuationPipeline
+from bonds.pipelines.sovereign_valuation import DEFAULT_PRODUCTS, SovereignValuationPipeline
 from bonds.pipelines.trade import TradePipeline
 from bonds.pipelines.universe import UniversePipeline
 from bonds.sources.ccil_historical import CcilHistoricalTradesSource, derive_securities
@@ -73,12 +74,17 @@ def dataset_start(progress: DatasetProgress, *, as_of: dt.date, max_gap_days: in
     Resume after the last processed day, but pull back to the oldest still-failed day and the
     oldest recently-skipped day so those are re-attempted (later, already-successful days re-run
     too — upserts make that idempotent). Everything is floored at ``as_of - max_gap_days``.
+
+    A retry candidate *below* the floor is unreachable and must be ignored entirely: pulling the
+    start to the floor for it would re-ingest a rolling ``max_gap_days`` window every night,
+    forever, without ever re-running (and thus never healing) the failed day itself. Those days
+    are surfaced by the ``catchup.failed_days_below_cap`` warning instead.
     """
     floor = as_of - dt.timedelta(days=max_gap_days)
     start = bounded_start(progress.processed_through, as_of=as_of, max_gap_days=max_gap_days)
     for retry in (progress.earliest_failed, progress.earliest_recent_skip):
-        if retry is not None and retry < start:
-            start = max(retry, floor)
+        if retry is not None and floor <= retry < start:
+            start = retry
     return start
 
 
@@ -89,17 +95,29 @@ def series_start(
     as_of: dt.date,
     max_gap_days: int,
     skip_retry_days: int = DEFAULT_SKIP_RETRY_DAYS,
+    expected_datasets: Iterable[str] = (),
 ) -> dt.date:
     """First business day to (re)ingest for a date-series ``source``.
 
     Computed per dataset (min across the source's datasets), so one product failing on a day
     never lets a sibling product's success advance the anchor past it. See :func:`dataset_start`
     for the per-dataset policy.
+
+    ``expected_datasets`` names the datasets the source *should* be writing: one with no history
+    at all (e.g. a newly added FBIL product) gets the full backfill window rather than being
+    silently invisible to the min() over historical datasets.
     """
     skip_retry_cutoff = as_of - dt.timedelta(days=skip_retry_days)
     with database.session() as session:
         progress = IngestionRunRepository(session).dataset_progress(
             source, skip_retry_cutoff=skip_retry_cutoff
+        )
+    for dataset in expected_datasets:
+        progress.setdefault(
+            dataset,
+            DatasetProgress(
+                processed_through=None, earliest_failed=None, earliest_recent_skip=None
+            ),
         )
     if not progress:
         return bounded_start(None, as_of=as_of, max_gap_days=max_gap_days)
@@ -140,7 +158,13 @@ def catch_up(
     groups: dict[str, list[PipelineResult]] = {}
 
     # --- date-series: gap-fill every missed business day -------------------------------------
-    fbil_start = series_start(database, FbilSource.name, as_of=as_of, max_gap_days=max_gap_days)
+    fbil_start = series_start(
+        database,
+        FbilSource.name,
+        as_of=as_of,
+        max_gap_days=max_gap_days,
+        expected_datasets=[f"{FbilSource.name}.{p}" for p in DEFAULT_PRODUCTS],
+    )
     fbil_days = list(business_days(fbil_start, as_of)) if fbil_start <= as_of else []
     logger.info("catchup.fbil", start=fbil_start.isoformat(), n=len(fbil_days))
     groups["Sovereign valuations · FBIL"] = (
@@ -148,7 +172,11 @@ def catch_up(
     )
 
     ccil_start = series_start(
-        database, CcilHistoricalTradesSource.name, as_of=as_of, max_gap_days=max_gap_days
+        database,
+        CcilHistoricalTradesSource.name,
+        as_of=as_of,
+        max_gap_days=max_gap_days,
+        expected_datasets=[f"{CcilHistoricalTradesSource.name}.trades"],
     )
     ccil_pipeline = TradePipeline(
         database, source=CcilHistoricalTradesSource(), derive_securities=derive_securities

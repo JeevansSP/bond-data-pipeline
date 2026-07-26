@@ -134,3 +134,17 @@ def test_series_start_old_skips_are_terminal(db: Database) -> None:
     _record(db, f"{SOURCE}.trades", dt.date(2026, 7, 10), "skipped")
     _record(db, f"{SOURCE}.trades", dt.date(2026, 7, 13), "success")
     assert series_start(db, SOURCE, as_of=AS_OF, max_gap_days=30) == dt.date(2026, 7, 14)
+
+
+def test_series_start_gives_new_expected_dataset_the_full_window(db: Database) -> None:
+    # An existing dataset is current, but a newly-added product has no history: the source-level
+    # start must fall back to the floor for it, not silently reflect only the veteran dataset.
+    _record(db, f"{SOURCE}.gsec", AS_OF, "success")
+    start = series_start(
+        db,
+        SOURCE,
+        as_of=AS_OF,
+        max_gap_days=30,
+        expected_datasets=[f"{SOURCE}.gsec", f"{SOURCE}.newproduct"],
+    )
+    assert start == AS_OF - dt.timedelta(days=30)

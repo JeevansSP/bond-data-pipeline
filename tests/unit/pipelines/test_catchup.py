@@ -59,9 +59,17 @@ class TestDatasetStart:
         p = _progress(processed=dt.date(2026, 7, 17), failed=dt.date(2026, 7, 14))
         assert dataset_start(p, as_of=AS_OF, max_gap_days=30) == dt.date(2026, 7, 14)
 
-    def test_failed_day_older_than_cap_is_clamped_to_floor(self) -> None:
+    def test_failed_day_older_than_cap_is_ignored_not_clamped(self) -> None:
+        # A failed day below the floor is unreachable: clamping the start to the floor for it
+        # would re-ingest a rolling 31-day window EVERY night forever while never actually
+        # re-running (healing) the failed day. It must not affect the start at all.
         p = _progress(processed=dt.date(2026, 7, 16), failed=dt.date(2026, 1, 2))
-        assert dataset_start(p, as_of=AS_OF, max_gap_days=30) == dt.date(2026, 6, 17)
+        assert dataset_start(p, as_of=AS_OF, max_gap_days=30) == dt.date(2026, 7, 17)
+
+    def test_failed_day_exactly_at_floor_is_retried(self) -> None:
+        floor = AS_OF - dt.timedelta(days=30)
+        p = _progress(processed=dt.date(2026, 7, 16), failed=floor)
+        assert dataset_start(p, as_of=AS_OF, max_gap_days=30) == floor
 
     def test_recent_skip_is_retried(self) -> None:
         # Premature same-day run recorded a skip before the source published; the evening's
@@ -139,7 +147,7 @@ def test_catch_up_gap_fills_series_and_refreshes_snapshots(
     monkeypatch.setattr(
         catchup,
         "series_start",
-        lambda db, source, *, as_of, max_gap_days, skip_retry_days=3: starts[source],
+        lambda db, source, *, as_of, max_gap_days, **kw: starts[source],
     )
 
     report = catch_up(object(), as_of=AS_OF)  # type: ignore[arg-type]
@@ -171,7 +179,7 @@ def test_catch_up_with_nothing_to_gap_fill_still_refreshes_snapshots(
     monkeypatch.setattr(
         catchup,
         "series_start",
-        lambda db, source, *, as_of, max_gap_days, skip_retry_days=3: AS_OF + dt.timedelta(days=1),
+        lambda db, source, *, as_of, max_gap_days, **kw: AS_OF + dt.timedelta(days=1),
     )
 
     report = catch_up(object(), as_of=AS_OF)  # type: ignore[arg-type]
