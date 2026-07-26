@@ -77,9 +77,24 @@ else
   log "WARN: docker not on PATH; assuming Postgres is already reachable"
 fi
 
+# --- hold off idle sleep for the duration of the ingest (macOS) ---
+# The ingest is long and network-bound, so idle sleep suspends it mid-flight: on 2026-07-25 a
+# BondCentral universe pull that normally finishes in ~5 minutes spanned 16.8 hours of wall clock
+# across repeated sleep/wake cycles (the data still landed — every write is an idempotent upsert —
+# but the run held the lock all night). `caffeinate -i` blocks *idle* system sleep only while the
+# ingest runs; it cannot stop a lid close or an explicit sleep, which the catch-up self-heals from
+# on the next run. Absent on Linux, where the systemd unit runs unattended anyway.
+KEEP_AWAKE=""
+if command -v caffeinate >/dev/null 2>&1; then
+  KEEP_AWAKE="caffeinate -i"
+fi
+
 # --- run the idempotent catch-up ingest (reads .env from the repo dir) ---
-log "=== bonds ingest catch-up ==="
-if uv run bonds ingest catch-up >>"$LOG_FILE" 2>&1; then
+log "=== bonds ingest catch-up ${KEEP_AWAKE:+(sleep held off)}==="
+# $KEEP_AWAKE is deliberately unquoted: it is a fixed two-word literal (or empty, which must
+# expand to nothing rather than an empty argument).
+# shellcheck disable=SC2086
+if $KEEP_AWAKE uv run bonds ingest catch-up >>"$LOG_FILE" 2>&1; then
   log "ingest completed OK"
   date '+%Y-%m-%dT%H:%M:%S%z' >"$LOG_DIR/last-success.txt"
 else

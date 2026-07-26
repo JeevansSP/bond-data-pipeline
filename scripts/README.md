@@ -3,6 +3,7 @@ Scheduling the daily bonds ingest as a self-healing service.
 
 2026-07-18_193000 : initial version (runner + launchd + systemd, idempotent catch-up)
 2026-07-21_112001 : hardened lock (acquisition race, PID reuse), 30-day log pruning, raised systemd timeout, documented launchd log-dir prerequisite
+2026-07-26_153131 : runner wraps the ingest in caffeinate -i on macOS (idle sleep stretched a ~5-min run across 16.8 h on 2026-07-25)
 ```
 
 # Daily ingest service
@@ -23,7 +24,8 @@ Two pieces make that work:
 
 2. **`run_daily_ingest.sh`** — a wrapper the scheduler actually calls. It takes a single-instance
    lock (no overlapping runs), brings up the Postgres container and waits for it, runs the
-   catch-up, and logs to `data/logs/ingest-YYYY-MM-DD.log` (plus `data/logs/last-success.txt`).
+   catch-up (under `caffeinate -i` on macOS so idle sleep can't suspend it mid-run), and logs to
+   `data/logs/ingest-YYYY-MM-DD.log` (plus `data/logs/last-success.txt`).
 
 Try it by hand first:
 
