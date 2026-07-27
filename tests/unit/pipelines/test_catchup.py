@@ -88,15 +88,16 @@ class TestDatasetStart:
 
 
 # ---------------------------------------------------------------- catch_up() orchestration
-class _FakeSovereignPipeline:
-    calls: ClassVar[list[tuple[dt.date, dt.date]]] = []
+def _backfill_pipeline(label: str, calls: dict[str, list[tuple[dt.date, dt.date]]]) -> type:
+    class _Fake:
+        def __init__(self, database: Any) -> None:
+            pass
 
-    def __init__(self, database: Any) -> None:
-        pass
+        def backfill(self, start: dt.date, end: dt.date) -> list[PipelineResult]:
+            calls.setdefault(label, []).append((start, end))
+            return [PipelineResult(start, label, RunStatus.SUCCESS, rows=1)]
 
-    def backfill(self, start: dt.date, end: dt.date) -> list[PipelineResult]:
-        self.calls.append((start, end))
-        return [PipelineResult(start, "fbil.gsec", RunStatus.SUCCESS, rows=1)]
+    return _Fake
 
 
 class _FakeTradePipeline:
@@ -123,12 +124,32 @@ def _snapshot_pipeline(label: str, runs: dict[str, list[dt.date]]) -> type:
 
 
 @pytest.fixture
-def orchestration(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[dt.date]]:
+def backfill_calls() -> dict[str, list[tuple[dt.date, dt.date]]]:
+    return {}
+
+
+@pytest.fixture
+def orchestration(
+    monkeypatch: pytest.MonkeyPatch, backfill_calls: dict[str, list[tuple[dt.date, dt.date]]]
+) -> dict[str, list[dt.date]]:
     """Patch every pipeline catch_up() constructs with call-recording fakes."""
     snapshot_runs: dict[str, list[dt.date]] = {}
-    _FakeSovereignPipeline.calls = []
     _FakeTradePipeline.runs = {}
-    monkeypatch.setattr(catchup, "SovereignValuationPipeline", _FakeSovereignPipeline)
+    monkeypatch.setattr(
+        catchup, "SovereignValuationPipeline", _backfill_pipeline("fbil_vals", backfill_calls)
+    )
+    monkeypatch.setattr(
+        catchup, "YieldCurvePipeline", _backfill_pipeline("fbil_curves", backfill_calls)
+    )
+    monkeypatch.setattr(
+        catchup, "BseCorporateTradePipeline", _backfill_pipeline("bse_ct", backfill_calls)
+    )
+    monkeypatch.setattr(
+        catchup, "NseCorporateTradePipeline", _backfill_pipeline("nse_ct", backfill_calls)
+    )
+    monkeypatch.setattr(
+        catchup, "NseBondReportPipeline", _backfill_pipeline("nse_report", backfill_calls)
+    )
     monkeypatch.setattr(catchup, "TradePipeline", _FakeTradePipeline)
     monkeypatch.setattr(catchup, "UniversePipeline", _snapshot_pipeline("universe", snapshot_runs))
     monkeypatch.setattr(
@@ -141,22 +162,46 @@ def orchestration(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[dt.date]]:
 
 
 def test_catch_up_gap_fills_series_and_refreshes_snapshots(
-    orchestration: dict[str, list[dt.date]], monkeypatch: pytest.MonkeyPatch
+    orchestration: dict[str, list[dt.date]],
+    backfill_calls: dict[str, list[tuple[dt.date, dt.date]]],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    starts = {"fbil": dt.date(2026, 7, 16), "ccil": dt.date(2026, 7, 15)}
+    # series_start is keyed by the pipeline's first expected dataset — several pipelines
+    # share a source name (fbil valuations vs curves), so the source alone is ambiguous.
+    starts = {
+        "fbil.gsec": dt.date(2026, 7, 16),
+        "fbil.curve.gsec": dt.date(2026, 7, 16),
+        "ccil.trades": dt.date(2026, 7, 15),
+        "bse.corp_trades": dt.date(2026, 7, 17),
+        "nse.corp_trades_ts": dt.date(2026, 7, 17),
+        "nse_cbm.trades": dt.date(2026, 7, 16),
+        "nse_cbr.bond_report": dt.date(2026, 7, 17),
+    }
     monkeypatch.setattr(
         catchup,
         "series_start",
-        lambda db, source, *, as_of, max_gap_days, **kw: starts[source],
+        lambda db, source, *, as_of, max_gap_days, expected_datasets=(), **kw: starts[
+            next(iter(expected_datasets))
+        ],
     )
 
     report = catch_up(object(), as_of=AS_OF)  # type: ignore[arg-type]
 
-    # FBIL: one backfill spanning [start, as_of].
-    assert _FakeSovereignPipeline.calls == [(dt.date(2026, 7, 16), AS_OF)]
-    # CCIL: one run per business day in [start, as_of] (Wed 15th .. Fri 17th).
+    # Backfill pipelines: one call each spanning [start, as_of].
+    assert backfill_calls == {
+        "fbil_vals": [(dt.date(2026, 7, 16), AS_OF)],
+        "fbil_curves": [(dt.date(2026, 7, 16), AS_OF)],
+        "bse_ct": [(dt.date(2026, 7, 17), AS_OF)],
+        "nse_ct": [(dt.date(2026, 7, 17), AS_OF)],
+        "nse_report": [(dt.date(2026, 7, 17), AS_OF)],
+    }
+    # Per-day trade pipelines: one run per business day in [start, as_of].
     assert _FakeTradePipeline.runs["CcilHistoricalTradesSource"] == [
         dt.date(2026, 7, 15),
+        dt.date(2026, 7, 16),
+        dt.date(2026, 7, 17),
+    ]
+    assert _FakeTradePipeline.runs["NseCbmDailySource"] == [
         dt.date(2026, 7, 16),
         dt.date(2026, 7, 17),
     ]
@@ -169,13 +214,16 @@ def test_catch_up_gap_fills_series_and_refreshes_snapshots(
     assert _FakeTradePipeline.runs["NseSource"] == [AS_OF]
     # The report flattens all group results.
     assert report.as_of == AS_OF
-    assert len(report.results) == 1 + 3 + 4  # fbil backfill + 3 ccil days + 4 snapshots
+    # 5 backfills + 3 ccil days + 2 cbm days + 4 snapshots
+    assert len(report.results) == 5 + 3 + 2 + 4
 
 
 def test_catch_up_with_nothing_to_gap_fill_still_refreshes_snapshots(
-    orchestration: dict[str, list[dt.date]], monkeypatch: pytest.MonkeyPatch
+    orchestration: dict[str, list[dt.date]],
+    backfill_calls: dict[str, list[tuple[dt.date, dt.date]]],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Both series already current: start is tomorrow (> as_of) -> zero gap-fill work.
+    # Every series already current: start is tomorrow (> as_of) -> zero gap-fill work.
     monkeypatch.setattr(
         catchup,
         "series_start",
@@ -184,8 +232,14 @@ def test_catch_up_with_nothing_to_gap_fill_still_refreshes_snapshots(
 
     report = catch_up(object(), as_of=AS_OF)  # type: ignore[arg-type]
 
-    assert _FakeSovereignPipeline.calls == []
+    assert backfill_calls == {}
     assert "CcilHistoricalTradesSource" not in _FakeTradePipeline.runs
+    assert "NseCbmDailySource" not in _FakeTradePipeline.runs
     assert report.groups["Sovereign valuations · FBIL"] == []
+    assert report.groups["Yield curves · FBIL"] == []
     assert report.groups["G-Sec/T-Bill trades · CCIL"] == []
+    assert report.groups["Corp trades (trade-level) · BSE"] == []
+    assert report.groups["Corp trades (trade-level) · NSE"] == []
+    assert report.groups["Corp trades (daily archive) · NSE"] == []
+    assert report.groups["Bond master · NSE report"] == []
     assert len(report.results) == 4  # snapshots only
