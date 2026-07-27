@@ -59,9 +59,10 @@ def check_uniqueness(conn: Connection) -> list[QualityCheck]:
             "segment HAVING count(*)>1) x",
         ),
         (
+            # Superseded rows are legitimate history; only the current version must be unique.
             "valuations",
-            "SELECT count(*) FROM (SELECT 1 FROM valuations GROUP BY isin,quote_date,"
-            "source HAVING count(*)>1) x",
+            "SELECT count(*) FROM (SELECT 1 FROM valuations WHERE superseded_at IS NULL "
+            "GROUP BY isin,quote_date,source HAVING count(*)>1) x",
         ),
         (
             "securities",
@@ -93,7 +94,7 @@ def check_referential_integrity(conn: Connection) -> list[QualityCheck]:
     val_orphans = _scalar(
         conn,
         "SELECT count(distinct v.isin) FROM valuations v LEFT JOIN securities s ON s.isin=v.isin "
-        "WHERE s.isin IS NULL",
+        "WHERE s.isin IS NULL AND v.superseded_at IS NULL",
     )
     return [
         QualityCheck(
@@ -123,9 +124,12 @@ def check_referential_integrity(conn: Connection) -> list[QualityCheck]:
 def check_completeness(conn: Connection) -> list[QualityCheck]:
     """Null-rate thresholds on fields that should be populated."""
     checks: list[QualityCheck] = []
-    val_total = _scalar(conn, "SELECT count(*) FROM valuations")
+    val_total = _scalar(conn, "SELECT count(*) FROM valuations WHERE superseded_at IS NULL")
     if val_total:
-        null_px = _scalar(conn, "SELECT count(*) FROM valuations WHERE price IS NULL")
+        null_px = _scalar(
+            conn,
+            "SELECT count(*) FROM valuations WHERE superseded_at IS NULL AND price IS NULL",
+        )
         rate = null_px / val_total
         checks.append(
             QualityCheck(
@@ -234,6 +238,7 @@ def check_cross_source(conn: Connection) -> list[QualityCheck]:
               SELECT abs(t.wap - v.price) AS px_diff
               FROM trades t JOIN valuations v
                 ON v.isin=t.isin AND v.quote_date=t.trade_date AND v.source='fbil'
+               AND v.superseded_at IS NULL
               WHERE t.source='ccil' AND t.segment IN ('GSEC','SDL')
                 AND t.wap IS NOT NULL AND v.price IS NOT NULL
             )

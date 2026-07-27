@@ -25,6 +25,9 @@ from bonds.calendar import business_days
 from bonds.config import get_settings
 from bonds.logging import configure_logging, get_logger
 from bonds.pipelines import (
+    BseCorporateTradePipeline,
+    NseBondReportPipeline,
+    NseCorporateTradePipeline,
     PipelineResult,
     PublicIssuePipeline,
     RbiAuctionPipeline,
@@ -32,6 +35,7 @@ from bonds.pipelines import (
     SovereignValuationPipeline,
     TradePipeline,
     UniversePipeline,
+    YieldCurvePipeline,
 )
 from bonds.pipelines.catchup import DEFAULT_MAX_GAP_DAYS, catch_up
 from bonds.pipelines.enrichment import EnrichmentPipeline
@@ -44,6 +48,7 @@ from bonds.sources.ccil_historical import CcilHistoricalTradesSource, derive_sec
 from bonds.sources.cdsl import CdslSource
 from bonds.sources.nse import NseSource
 from bonds.sources.nse import derive_securities as derive_nse_securities
+from bonds.sources.nse_cbm import NseCbmDailySource
 from bonds.storage import Database
 
 app = typer.Typer(add_completion=False, help="Indian bond market data pipelines.")
@@ -399,6 +404,129 @@ def backfill_sovereign_valuation(
         typer.echo(f"backfill {first}..{last}: no business days in range — nothing to do")
         return
     _summarise(results, label=f"backfill {first}..{last}")
+
+
+@ingest_app.command("yield-curves")
+def ingest_yield_curves(
+    date: Annotated[
+        dt.datetime | None,
+        typer.Option(formats=["%Y-%m-%d"], help="Business date (default: today)."),
+    ] = None,
+) -> None:
+    """Ingest FBIL yield curves (G-Sec Par Yield, GOI ZCYC, SDL ZCYC) for a single date."""
+    _init_logging()
+    day = _day(date)
+    results = YieldCurvePipeline(Database()).run_date(day)
+    _summarise(results, label=f"yield-curves {day.isoformat()}")
+
+
+@ingest_app.command("yield-curves-backfill")
+def backfill_yield_curves(
+    start: Annotated[
+        dt.datetime, typer.Option(formats=["%Y-%m-%d"], help="Start date (inclusive).")
+    ],
+    end: Annotated[dt.datetime, typer.Option(formats=["%Y-%m-%d"], help="End date (inclusive).")],
+) -> None:
+    """Backfill FBIL yield curves across a date range (lake-first; holidays auto-skip)."""
+    _init_logging()
+    first, last = _date_range(start, end)
+    results = YieldCurvePipeline(Database()).backfill(first, last)
+    if not results:
+        typer.echo(f"backfill {first}..{last}: no business days in range — nothing to do")
+        return
+    _summarise(results, label=f"yield-curves backfill {first}..{last}")
+
+
+@ingest_app.command("nse-bond-report")
+def ingest_nse_bond_report(
+    date: Annotated[
+        dt.datetime | None,
+        typer.Option(formats=["%Y-%m-%d"], help="Business date (default: today)."),
+    ] = None,
+) -> None:
+    """Ingest the NSE corporate bond report (day count, coupon dates, rating) for one date."""
+    _init_logging()
+    day = _day(date)
+    result = NseBondReportPipeline(Database()).run_date(day)
+    _summarise([result], label=f"nse-bond-report {day.isoformat()}")
+
+
+@ingest_app.command("nse-bond-report-backfill")
+def backfill_nse_bond_report(
+    start: Annotated[
+        dt.datetime, typer.Option(formats=["%Y-%m-%d"], help="Start date (inclusive).")
+    ],
+    end: Annotated[dt.datetime, typer.Option(formats=["%Y-%m-%d"], help="End date (inclusive).")],
+) -> None:
+    """Backfill the NSE bond report chronologically (SCD-2 needs date order; lake-first)."""
+    _init_logging()
+    first, last = _date_range(start, end)
+    results = NseBondReportPipeline(Database()).backfill(first, last)
+    if not results:
+        typer.echo(f"backfill {first}..{last}: no business days in range — nothing to do")
+        return
+    _summarise(results, label=f"nse-bond-report backfill {first}..{last}")
+
+
+@ingest_app.command("cbm-trades-backfill")
+def backfill_cbm_trades(
+    start: Annotated[
+        dt.datetime, typer.Option(formats=["%Y-%m-%d"], help="Start date (inclusive).")
+    ],
+    end: Annotated[dt.datetime, typer.Option(formats=["%Y-%m-%d"], help="End date (inclusive).")],
+) -> None:
+    """Backfill NSE CBM daily trade summaries (per-ISIN, back to ~2008; lake-first)."""
+    _init_logging()
+    first, last = _date_range(start, end)
+    pipeline = TradePipeline(Database(), source=NseCbmDailySource())
+    results = [pipeline.run(day) for day in business_days(first, last)]
+    if not results:
+        typer.echo(f"backfill {first}..{last}: no business days in range — nothing to do")
+        return
+    _summarise(results, label=f"cbm-trades backfill {first}..{last}")
+
+
+@ingest_app.command("corporate-trades")
+def ingest_corporate_trades(
+    date: Annotated[
+        dt.datetime | None,
+        typer.Option(formats=["%Y-%m-%d"], help="Business date (default: today)."),
+    ] = None,
+) -> None:
+    """Ingest trade-level corporate trades (BSE day + NSE window) for a single date."""
+    _init_logging()
+    day = _day(date)
+    database = Database()
+    results = [
+        BseCorporateTradePipeline(database).run_date(day),
+        NseCorporateTradePipeline(database).run_date(day),
+    ]
+    _summarise(results, label=f"corporate-trades {day.isoformat()}")
+
+
+@ingest_app.command("corporate-trades-backfill")
+def backfill_corporate_trades(
+    start: Annotated[
+        dt.datetime, typer.Option(formats=["%Y-%m-%d"], help="Start date (inclusive).")
+    ],
+    end: Annotated[dt.datetime, typer.Option(formats=["%Y-%m-%d"], help="End date (inclusive).")],
+    exchange: Annotated[
+        str, typer.Option(help="Which feed to backfill: bse, nse, or both.")
+    ] = "both",
+) -> None:
+    """Backfill trade-level corporate trades (lake-first; holidays auto-skip)."""
+    _init_logging()
+    first, last = _date_range(start, end)
+    database = Database()
+    results: list[PipelineResult] = []
+    if exchange in ("bse", "both"):
+        results.extend(BseCorporateTradePipeline(database).backfill(first, last))
+    if exchange in ("nse", "both"):
+        results.extend(NseCorporateTradePipeline(database).backfill(first, last))
+    if not results:
+        typer.echo(f"backfill {first}..{last}: nothing to do (check --exchange)")
+        return
+    _summarise(results, label=f"corporate-trades backfill {first}..{last}")
 
 
 if __name__ == "__main__":

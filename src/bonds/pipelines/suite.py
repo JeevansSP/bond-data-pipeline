@@ -11,14 +11,21 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from bonds.pipelines.base import PipelineResult, RunStatus
+from bonds.pipelines.bond_report import NseBondReportPipeline
+from bonds.pipelines.corporate_trade import (
+    BseCorporateTradePipeline,
+    NseCorporateTradePipeline,
+)
 from bonds.pipelines.public_issue import PublicIssuePipeline
 from bonds.pipelines.rbi_auction import RbiAuctionPipeline
 from bonds.pipelines.sovereign_valuation import SovereignValuationPipeline
 from bonds.pipelines.trade import TradePipeline
 from bonds.pipelines.universe import UniversePipeline
+from bonds.pipelines.yield_curve import YieldCurvePipeline
 from bonds.sources.ccil_historical import CcilHistoricalTradesSource, derive_securities
 from bonds.sources.nse import NseSource
 from bonds.sources.nse import derive_securities as derive_nse_securities
+from bonds.sources.nse_cbm import NseCbmDailySource
 from bonds.storage import Database
 
 
@@ -65,8 +72,16 @@ def default_suite(
             lambda: [UniversePipeline(database).run(as_of, max_pages=max_universe_pages)],
         ),
         IngestStep(
+            "Bond master · NSE report",
+            lambda: [NseBondReportPipeline(database).run_date(as_of)],
+        ),
+        IngestStep(
             "Sovereign valuations · FBIL",
             lambda: SovereignValuationPipeline(database).run_date(as_of),
+        ),
+        IngestStep(
+            "Yield curves · FBIL",
+            lambda: YieldCurvePipeline(database).run_date(as_of),
         ),
         IngestStep(
             "Public issues · SEBI",
@@ -83,6 +98,18 @@ def default_suite(
                     database, source=NseSource(), derive_securities=derive_nse_securities
                 ).run(as_of)
             ],
+        ),
+        IngestStep(
+            "Corp trades (daily archive) · NSE",
+            lambda: [TradePipeline(database, source=NseCbmDailySource()).run(as_of)],
+        ),
+        IngestStep(
+            "Corp trades (trade-level) · BSE",
+            lambda: [BseCorporateTradePipeline(database).run_date(as_of)],
+        ),
+        IngestStep(
+            "Corp trades (trade-level) · NSE",
+            lambda: [NseCorporateTradePipeline(database).run_date(as_of)],
         ),
         IngestStep(
             "G-Sec/T-Bill trades · CCIL",

@@ -73,6 +73,67 @@ class SovereignValuation(BaseModel):
         return _plausible_maturity(v)
 
 
+class CorporateTradeRecord(BaseModel):
+    """One corporate-bond transaction (RFQ or OTC-reported) from an exchange reporting feed.
+
+    Trade-level grain — the regulatory 15-day traded-price rule references the rate of a
+    specific recorded transaction, so daily per-ISIN aggregates are not a substitute.
+    ``deal_type`` carries BSE's single flag; NSE reports seller/buyer sides separately.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    isin: str = Field(min_length=12, max_length=12)
+    trade_date: dt.date
+    source: str
+    trade_time: dt.datetime | None = None
+    listed: str | None = None
+    deal_type: str | None = None
+    seller_deal_type: str | None = None
+    buyer_deal_type: str | None = None
+    issuer: str | None = None
+    description: str | None = None
+    coupon: float | None = None
+    price: float | None = None
+    trade_yield: float | None = None
+    yield_type: str | None = None
+    outside_yield_range: str | None = None
+    put_call_date: dt.date | None = None
+    trade_value_lakh: float | None = None
+    settlement_date: dt.date | None = None
+    settlement_status: str | None = None
+    venue: str | None = None
+    """Reporting venue flag: ``RFQ`` vs ``OTC``/``Reported``."""
+    remarks: str | None = None
+
+    @field_validator("price")
+    @classmethod
+    def _price_positive_or_none(cls, v: float | None) -> float | None:
+        return v if v is None or v > 0 else None
+
+
+class YieldCurvePoint(BaseModel):
+    """One tenor point of a published yield curve for a single business date.
+
+    ``curve`` is the canonical curve key (e.g. ``gsec_par``, ``gsec_zcyc``, ``sdl_zcyc``);
+    yields are % p.a. in both the semi-annual and annualized conventions FBIL publishes.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    curve: str
+    quote_date: dt.date
+    tenor_years: float = Field(gt=0)
+    source: str
+    ytm_semi_annual: float | None = None
+    ytm_annualized: float | None = None
+
+    @field_validator("ytm_semi_annual", "ytm_annualized")
+    @classmethod
+    def _yield_nonneg_or_none(cls, v: float | None) -> float | None:
+        return v if v is None or v >= 0 else None
+
+
 class TradeRecord(BaseModel):
     """A per-ISIN secondary-market trade summary for one session (e.g. NSE corporate bonds)."""
 

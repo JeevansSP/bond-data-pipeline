@@ -3,7 +3,7 @@
 Tables:
     securities                  Current universe state, one row per ISIN (pillar 1).
     security_attribute_history  SCD-2 effective-dated attribute changes, e.g. rating (pillar 2).
-    valuations                  Daily per-ISIN price/YTM history (pillar 3, FBIL).
+    valuations                  Daily per-ISIN price/YTM history, append-only/bitemporal (pillar 3).
     ingestion_runs              Audit log of every pipeline run.
 """
 
@@ -19,12 +19,14 @@ from sqlalchemy import (
     Date,
     DateTime,
     Float,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
     event,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -112,17 +114,33 @@ class SecurityAttributeHistory(Base):
 
 
 class Valuation(Base):
-    """One security's end-of-day price/YTM for one business date (pillar 3)."""
+    """One security's end-of-day price/YTM as published for one business date (pillar 3).
+
+    Append-only (bitemporal): a source restating a date's price never overwrites history.
+    The stale row is closed by stamping ``superseded_at`` and a fresh row is inserted, so
+    "what did we believe on date X" is always answerable. The current belief for a key is
+    the row with ``superseded_at IS NULL`` (enforced by a partial unique index);
+    ``loaded_at`` records when each version was ingested.
+    """
 
     __tablename__ = "valuations"
     __table_args__ = (
         CheckConstraint("price IS NULL OR price > 0", name="ck_valuation_price_positive"),
         CheckConstraint("ytm IS NULL OR ytm >= 0", name="ck_valuation_ytm_nonneg"),
+        Index(
+            "uq_valuations_current",
+            "isin",
+            "quote_date",
+            "source",
+            unique=True,
+            postgresql_where=text("superseded_at IS NULL"),
+        ),
     )
 
-    isin: Mapped[str] = mapped_column(String(12), primary_key=True)
-    quote_date: Mapped[dt.date] = mapped_column(Date, primary_key=True, index=True)
-    source: Mapped[str] = mapped_column(String(32), primary_key=True)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    isin: Mapped[str] = mapped_column(String(12), index=True)
+    quote_date: Mapped[dt.date] = mapped_column(Date, index=True)
+    source: Mapped[str] = mapped_column(String(32))
     instrument_type: Mapped[str] = mapped_column(String(8), index=True)
     description: Mapped[str | None] = mapped_column(Text)
     coupon: Mapped[float | None] = mapped_column(Float)
@@ -132,6 +150,41 @@ class Valuation(Base):
     loaded_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    superseded_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class YieldCurve(Base):
+    """One tenor point of a published yield curve for one business date.
+
+    Append-only/bitemporal like :class:`Valuation`: restatements close the current row via
+    ``superseded_at`` instead of overwriting. Current curve = ``superseded_at IS NULL``.
+    """
+
+    __tablename__ = "yield_curves"
+    __table_args__ = (
+        CheckConstraint("tenor_years > 0", name="ck_yield_curve_tenor_positive"),
+        Index(
+            "uq_yield_curves_current",
+            "curve",
+            "quote_date",
+            "tenor_years",
+            "source",
+            unique=True,
+            postgresql_where=text("superseded_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    curve: Mapped[str] = mapped_column(String(24), index=True)
+    quote_date: Mapped[dt.date] = mapped_column(Date, index=True)
+    tenor_years: Mapped[float] = mapped_column(Float)
+    source: Mapped[str] = mapped_column(String(32))
+    ytm_semi_annual: Mapped[float | None] = mapped_column(Float)
+    ytm_annualized: Mapped[float | None] = mapped_column(Float)
+    loaded_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    superseded_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Trade(Base):
@@ -151,6 +204,46 @@ class Trade(Base):
     trade_value: Mapped[float | None] = mapped_column(Float)
     wap: Mapped[float | None] = mapped_column(Float)
     way: Mapped[float | None] = mapped_column(Float)
+    loaded_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class CorporateTrade(Base):
+    """One corporate-bond transaction (RFQ or OTC-reported) from an exchange feed.
+
+    Trade-level grain, unlike :class:`Trade` (per-ISIN session summaries). There is no
+    natural transaction key across venues, so idempotency is delete-and-replace per
+    ``(source, trade_date window)`` at load time rather than an upsert.
+    """
+
+    __tablename__ = "corporate_trades"
+    __table_args__ = (
+        CheckConstraint("price IS NULL OR price > 0", name="ck_corp_trade_price_positive"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    isin: Mapped[str] = mapped_column(String(12), index=True)
+    trade_date: Mapped[dt.date] = mapped_column(Date, index=True)
+    source: Mapped[str] = mapped_column(String(32), index=True)
+    trade_time: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=False))
+    listed: Mapped[str | None] = mapped_column(String(16))
+    deal_type: Mapped[str | None] = mapped_column(String(32))
+    seller_deal_type: Mapped[str | None] = mapped_column(String(32))
+    buyer_deal_type: Mapped[str | None] = mapped_column(String(32))
+    issuer: Mapped[str | None] = mapped_column(Text)
+    description: Mapped[str | None] = mapped_column(Text)
+    coupon: Mapped[float | None] = mapped_column(Float)
+    price: Mapped[float | None] = mapped_column(Float)
+    trade_yield: Mapped[float | None] = mapped_column(Float)
+    yield_type: Mapped[str | None] = mapped_column(String(8))
+    outside_yield_range: Mapped[str | None] = mapped_column(String(8))
+    put_call_date: Mapped[dt.date | None] = mapped_column(Date)
+    trade_value_lakh: Mapped[float | None] = mapped_column(Float)
+    settlement_date: Mapped[dt.date | None] = mapped_column(Date)
+    settlement_status: Mapped[str | None] = mapped_column(String(24))
+    venue: Mapped[str | None] = mapped_column(String(16))
+    remarks: Mapped[str | None] = mapped_column(Text)
     loaded_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

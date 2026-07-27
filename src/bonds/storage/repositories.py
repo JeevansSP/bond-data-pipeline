@@ -11,17 +11,19 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from sqlalchemy import CursorResult, and_, case, func, or_, select, update
+from sqlalchemy import CursorResult, and_, case, delete, func, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from bonds.logging import get_logger
 from bonds.models import (
+    CorporateTradeRecord,
     PublicIssueRecord,
     RbiAuctionRecord,
     SecurityRecord,
     SovereignValuation,
     TradeRecord,
+    YieldCurvePoint,
 )
 
 if TYPE_CHECKING:
@@ -30,6 +32,7 @@ if TYPE_CHECKING:
     # before bonds.quality.
     from bonds.quality.metrics import FileMetric
 from bonds.storage.schema import (
+    CorporateTrade,
     DataQualityCheck,
     EtlFileMetric,
     IngestionRun,
@@ -39,6 +42,7 @@ from bonds.storage.schema import (
     SecurityAttributeHistory,
     Trade,
     Valuation,
+    YieldCurve,
 )
 
 logger = get_logger(__name__)
@@ -104,13 +108,28 @@ def _apply_scd2(
 
 
 class ValuationRepository:
-    """Persist daily per-ISIN valuations (idempotent per ``(isin, quote_date, source)``)."""
+    """Persist daily per-ISIN valuations, append-only per ``(isin, quote_date, source)``.
+
+    Re-running a date with identical values is a no-op. A *changed* value (source
+    restatement) closes the current row (``superseded_at``) and inserts a new one, so
+    prior published values remain queryable for audit.
+    """
+
+    # Fields whose change constitutes a restatement (vs. cosmetic re-parse noise).
+    _VERSIONED_FIELDS = (
+        "instrument_type",
+        "description",
+        "coupon",
+        "maturity_date",
+        "price",
+        "ytm",
+    )
 
     def __init__(self, session: Session) -> None:
         self._session = session
 
     def upsert_many(self, valuations: list[SovereignValuation]) -> int:
-        """Insert or refresh a batch of valuations. Returns the number of rows written."""
+        """Write a batch of valuations. Returns the number of new row versions inserted."""
         if not valuations:
             return 0
         rows = [
@@ -127,22 +146,172 @@ class ValuationRepository:
             }
             for v in valuations
         ]
-        # A single INSERT ... ON CONFLICT cannot touch the same key twice; dedupe (last wins).
+        # The same key may not be touched twice in one batch; dedupe (last wins).
         rows = list({(r["isin"], r["quote_date"], r["source"]): r for r in rows}.values())
+        written = 0
         for chunk in _chunks(rows):
-            stmt = pg_insert(Valuation).values(list(chunk))
-            stmt = stmt.on_conflict_do_update(
-                index_elements=["isin", "quote_date", "source"],
-                set_={
-                    "instrument_type": stmt.excluded.instrument_type,
-                    "description": stmt.excluded.description,
-                    "coupon": stmt.excluded.coupon,
-                    "maturity_date": stmt.excluded.maturity_date,
-                    "price": stmt.excluded.price,
-                    "ytm": stmt.excluded.ytm,
-                },
+            written += self._write_chunk(chunk)
+        return written
+
+    def _write_chunk(self, chunk: Sequence[dict[str, str | float | dt.date | None]]) -> int:
+        by_key = {(r["isin"], r["quote_date"], r["source"]): r for r in chunk}
+        current = self._session.execute(
+            select(Valuation).where(
+                tuple_(Valuation.isin, Valuation.quote_date, Valuation.source).in_(
+                    list(by_key.keys())
+                ),
+                Valuation.superseded_at.is_(None),
             )
-            self._session.execute(stmt)
+        ).scalars()
+        superseded_ids: list[int] = []
+        for row in current:
+            incoming = by_key[(row.isin, row.quote_date, row.source)]
+            if all(getattr(row, f) == incoming[f] for f in self._VERSIONED_FIELDS):
+                del by_key[(row.isin, row.quote_date, row.source)]  # unchanged -> no-op
+            else:
+                superseded_ids.append(row.id)  # restated -> close current, insert fresh
+        if superseded_ids:
+            self._session.execute(
+                update(Valuation)
+                .where(Valuation.id.in_(superseded_ids))
+                .values(superseded_at=func.now())
+            )
+            logger.info("valuations.superseded", rows=len(superseded_ids))
+        remaining = list(by_key.values())
+        if remaining:
+            self._session.execute(pg_insert(Valuation).values(remaining))
+        return len(remaining)
+
+
+class YieldCurveRepository:
+    """Persist yield-curve points, append-only per ``(curve, quote_date, tenor_years, source)``.
+
+    Same bitemporal discipline as :class:`ValuationRepository`: identical re-runs are
+    no-ops; changed values close the current row and insert a fresh version.
+    """
+
+    _VERSIONED_FIELDS = ("ytm_semi_annual", "ytm_annualized")
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def upsert_many(self, points: list[YieldCurvePoint]) -> int:
+        """Write a batch of curve points. Returns the number of new row versions inserted."""
+        if not points:
+            return 0
+        rows = [
+            {
+                "curve": p.curve,
+                "quote_date": p.quote_date,
+                "tenor_years": p.tenor_years,
+                "source": p.source,
+                "ytm_semi_annual": p.ytm_semi_annual,
+                "ytm_annualized": p.ytm_annualized,
+            }
+            for p in points
+        ]
+        rows = list(
+            {(r["curve"], r["quote_date"], r["tenor_years"], r["source"]): r for r in rows}.values()
+        )
+        written = 0
+        for chunk in _chunks(rows):
+            written += self._write_chunk(chunk)
+        return written
+
+    def _write_chunk(self, chunk: Sequence[dict[str, str | float | dt.date | None]]) -> int:
+        by_key = {(r["curve"], r["quote_date"], r["tenor_years"], r["source"]): r for r in chunk}
+        current = self._session.execute(
+            select(YieldCurve).where(
+                tuple_(
+                    YieldCurve.curve,
+                    YieldCurve.quote_date,
+                    YieldCurve.tenor_years,
+                    YieldCurve.source,
+                ).in_(list(by_key.keys())),
+                YieldCurve.superseded_at.is_(None),
+            )
+        ).scalars()
+        superseded_ids: list[int] = []
+        for row in current:
+            key = (row.curve, row.quote_date, row.tenor_years, row.source)
+            incoming = by_key[key]
+            if all(getattr(row, f) == incoming[f] for f in self._VERSIONED_FIELDS):
+                del by_key[key]  # unchanged -> no-op
+            else:
+                superseded_ids.append(row.id)  # restated -> close current, insert fresh
+        if superseded_ids:
+            self._session.execute(
+                update(YieldCurve)
+                .where(YieldCurve.id.in_(superseded_ids))
+                .values(superseded_at=func.now())
+            )
+            logger.info("yield_curves.superseded", rows=len(superseded_ids))
+        remaining = list(by_key.values())
+        if remaining:
+            self._session.execute(pg_insert(YieldCurve).values(remaining))
+        return len(remaining)
+
+
+class CorporateTradeRepository:
+    """Persist trade-level corporate trades.
+
+    There is no natural transaction key across venues (BSE publishes no trade id), so
+    idempotency is delete-and-replace over a ``(source, trade-date window)``: reloading a
+    window converges to the file's contents rather than duplicating.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def replace_window(
+        self, source: str, start: dt.date, end: dt.date, trades: list[CorporateTradeRecord]
+    ) -> int:
+        """Replace ``source``'s rows in ``[start, end]`` with ``trades``; returns rows written."""
+        result = self._session.execute(
+            delete(CorporateTrade).where(
+                CorporateTrade.source == source,
+                CorporateTrade.trade_date >= start,
+                CorporateTrade.trade_date <= end,
+            )
+        )
+        deleted = result.rowcount if isinstance(result, CursorResult) else 0
+        if deleted:
+            logger.info(
+                "corporate_trades.replaced",
+                source=source,
+                start=start.isoformat(),
+                end=end.isoformat(),
+                deleted=deleted,
+            )
+        rows = [
+            {
+                "isin": t.isin,
+                "trade_date": t.trade_date,
+                "source": t.source,
+                "trade_time": t.trade_time,
+                "listed": t.listed,
+                "deal_type": t.deal_type,
+                "seller_deal_type": t.seller_deal_type,
+                "buyer_deal_type": t.buyer_deal_type,
+                "issuer": t.issuer,
+                "description": t.description,
+                "coupon": t.coupon,
+                "price": t.price,
+                "trade_yield": t.trade_yield,
+                "yield_type": t.yield_type,
+                "outside_yield_range": t.outside_yield_range,
+                "put_call_date": t.put_call_date,
+                "trade_value_lakh": t.trade_value_lakh,
+                "settlement_date": t.settlement_date,
+                "settlement_status": t.settlement_status,
+                "venue": t.venue,
+                "remarks": t.remarks,
+            }
+            for t in trades
+            if start <= t.trade_date <= end  # never write outside the window being replaced
+        ]
+        for chunk in _chunks(rows):
+            self._session.execute(pg_insert(CorporateTrade).values(list(chunk)))
         return len(rows)
 
 

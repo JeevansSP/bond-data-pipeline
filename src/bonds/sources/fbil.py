@@ -23,11 +23,12 @@ from zipfile import BadZipFile
 import httpx
 import openpyxl
 from openpyxl.utils.exceptions import InvalidFileException
+from openpyxl.worksheet.worksheet import Worksheet
 
 from bonds.config import Settings, get_settings
 from bonds.http import ThrottledClient
 from bonds.logging import get_logger
-from bonds.models import InstrumentType, SovereignValuation
+from bonds.models import InstrumentType, SovereignValuation, YieldCurvePoint
 from bonds.quality.metrics import MetricsCollector
 from bonds.sources.base import DataUnavailable, SourceError
 
@@ -40,7 +41,33 @@ _REFERER: Final = "https://www.fbil.org.in/"
 _PRODUCT_INSTRUMENT: Final[dict[str, InstrumentType]] = {
     "gsec": InstrumentType.GSEC,
     "sdl": InstrumentType.SDL,
+    "strips": InstrumentType.STRIPS,
 }
+
+# Product -> (worksheet title, canonical curve key) for the published yield-curve sheets.
+# The Par Yield curve rides inside the gsec workbook and the GOI ZCYC inside the strips
+# workbook — they are extra sheets, not separate downloads. Titles are matched with
+# spaces/hyphens/underscores stripped: old-format files say "Par-Yield", new say "Par Yield".
+_PRODUCT_CURVE: Final[dict[str, tuple[str, str]]] = {
+    "gsec": ("Par Yield", "gsec_par"),
+    "strips": ("ZCYC", "gsec_zcyc"),
+    "sdlzcyc": ("SDL_ZCYC", "sdl_zcyc"),
+}
+
+# Worksheet title (normalized) -> instrument, for workbooks that mix instrument types.
+_SHEET_INSTRUMENT: Final[dict[str, InstrumentType]] = {
+    "gsec": InstrumentType.GSEC,
+    "special": InstrumentType.GSEC,  # GoI special securities (oil/FCI/recap bonds)
+    "sdl": InstrumentType.SDL,
+    "uday": InstrumentType.SDL,
+    "strips": InstrumentType.STRIPS,
+    "tbill": InstrumentType.TBILL,
+}
+
+
+def _normalize_title(title: str) -> str:
+    """Normalize a sheet title for lookup: lowercase, spaces/hyphens/underscores stripped."""
+    return title.strip().lower().replace(" ", "").replace("-", "").replace("_", "")
 
 
 class FbilSource(MetricsCollector):
@@ -101,6 +128,18 @@ class FbilSource(MetricsCollector):
         logger.info("fbil.downloaded", product=product, date=date.isoformat(), bytes=len(content))
         return content
 
+    def read_or_download(self, product: str, date: dt.date) -> bytes:
+        """Return the raw workbook, serving from the data lake when already landed.
+
+        FBIL publishes one final file per business date, so a landed artifact never needs
+        re-fetching — this makes lake-wide backfills (thousands of dates) network-free.
+        Delete the raw file to force a re-download.
+        """
+        path = self._raw_path(product, date)
+        if path.exists():
+            return path.read_bytes()
+        return self.download(product, date)
+
     # ------------------------------------------------------------------ parsing
     def fetch_valuations(self, product: str, date: dt.date) -> list[SovereignValuation]:
         """Download + parse one product/date into valuation records.
@@ -112,7 +151,7 @@ class FbilSource(MetricsCollector):
         if instrument is None:
             raise ValueError(f"unsupported FBIL valuation product: {product!r}")
         self.reset_metrics()
-        content = self.download(product, date)
+        content = self.read_or_download(product, date)
         records, seen = self._parse_with_stats(content, date=date, instrument=instrument)
         self.add_metric(
             f"{product}/{date.isoformat()}",
@@ -149,15 +188,33 @@ class FbilSource(MetricsCollector):
                 f"FBIL {instrument.value} returned a non-xlsx body for {date}"
             ) from exc
         try:
-            rows, header_index, headers = _find_data_sheet(workbook)
-            columns = _column_map(headers)
             records: list[SovereignValuation] = []
             seen = 0
-            for raw in rows:  # iterator continues *after* the header row
-                seen += 1
-                record = _row_to_valuation(raw, columns, date, instrument, self.name)
-                if record is not None:
-                    records.append(record)
+            sheets = 0
+            # Every ISIN-headed sheet is per-security data: the gsec workbook carries GoI
+            # special securities (oil/FCI/recap bonds) on a "Special" sheet and the sdl
+            # workbook carries UDAY bonds on a "UDAY" sheet alongside the main sheet.
+            # Pre-Feb-2023 workbooks bundle *several* instrument types in one file
+            # (G-Sec + SDL + Special), so each sheet's title picks its instrument; the
+            # product's instrument is only the fallback for unrecognized titles.
+            for title, rows, header_index, headers in _iter_data_sheets(workbook):
+                sheets += 1
+                sheet_instrument = _SHEET_INSTRUMENT.get(_normalize_title(title), instrument)
+                columns = _column_map(headers)
+                for raw in rows:  # iterator continues *after* the header row
+                    seen += 1
+                    record = _row_to_valuation(raw, columns, date, sheet_instrument, self.name)
+                    if record is not None:
+                        records.append(record)
+                logger.debug(
+                    "fbil.sheet_parsed",
+                    sheet=title,
+                    instrument=sheet_instrument.value,
+                    date=date.isoformat(),
+                    header_row=header_index,
+                )
+            if sheets == 0:
+                raise SourceError("could not locate an 'ISIN' header row in any FBIL worksheet")
         finally:
             workbook.close()
 
@@ -165,11 +222,76 @@ class FbilSource(MetricsCollector):
             "fbil.parsed",
             instrument=instrument.value,
             date=date.isoformat(),
-            header_row=header_index,
+            sheets=sheets,
             records=len(records),
             dropped=seen - len(records),
         )
         return records, seen
+
+    # ------------------------------------------------------------------ curves
+    def fetch_curves(self, product: str, date: dt.date) -> list[YieldCurvePoint]:
+        """Fetch + parse one product/date's published yield-curve sheet.
+
+        Raises:
+            ValueError: If ``product`` has no curve sheet mapping.
+        """
+        if product not in _PRODUCT_CURVE:
+            raise ValueError(f"unsupported FBIL curve product: {product!r}")
+        self.reset_metrics()
+        content = self.read_or_download(product, date)
+        points = self.parse_curve(content, product=product, date=date)
+        self.add_metric(
+            f"{product}/{date.isoformat()}",
+            bytes_downloaded=len(content),
+            rows_extracted=len(points),
+            rows_parsed=len(points),
+            rows_dropped=0,
+        )
+        return points
+
+    def parse_curve(self, content: bytes, *, product: str, date: dt.date) -> list[YieldCurvePoint]:
+        """Parse the curve sheet (tenor / semi-annual / annualized) of a product workbook."""
+        sheet_title, curve = _PRODUCT_CURVE[product]
+        try:
+            workbook = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        except (BadZipFile, InvalidFileException) as exc:
+            raise DataUnavailable(f"FBIL {product} returned a non-xlsx body for {date}") from exc
+        try:
+            try:
+                worksheet = _find_sheet(workbook, sheet_title)
+            except SourceError as exc:
+                # Pre-Feb-2023 workbooks use the old single-purpose format without curve
+                # sheets — that's "no curve published for this date", not a broken file.
+                raise DataUnavailable(
+                    f"FBIL {product} workbook for {date} has no {sheet_title!r} sheet"
+                ) from exc
+            points: list[YieldCurvePoint] = []
+            in_data = False
+            for row in worksheet.iter_rows(values_only=True):
+                first = row[0] if row else None
+                if not in_data:
+                    if isinstance(first, str) and first.strip().lower().startswith("tenor"):
+                        in_data = True
+                    continue
+                tenor = _as_float(first)
+                if tenor is None or tenor <= 0:
+                    break  # blank/footer row = end of the tenor grid
+                points.append(
+                    YieldCurvePoint(
+                        curve=curve,
+                        quote_date=date,
+                        tenor_years=tenor,
+                        source=self.name,
+                        ytm_semi_annual=_as_float(_cell(row, 1)),
+                        ytm_annualized=_as_float(_cell(row, 2)),
+                    )
+                )
+            if not in_data:
+                raise SourceError(f"no 'Tenor' header row in FBIL sheet {sheet_title!r}")
+        finally:
+            workbook.close()
+        logger.info("fbil.curve_parsed", curve=curve, date=date.isoformat(), points=len(points))
+        return points
 
 
 # ---------------------------------------------------------------------- helpers
@@ -182,24 +304,32 @@ def _find_header(rows: Iterable[Sequence[object]]) -> tuple[int, Sequence[object
     raise SourceError("could not locate an 'ISIN' header row in FBIL worksheet")
 
 
-def _find_data_sheet(
+def _iter_data_sheets(
     workbook: openpyxl.workbook.Workbook,
-) -> tuple[Iterator[Sequence[object]], int, Sequence[object]]:
-    """Find the first worksheet with an ISIN header.
+) -> Iterator[tuple[str, Iterator[Sequence[object]], int, Sequence[object]]]:
+    """Yield every ISIN-headed worksheet as (title, row iterator, header index, header row).
 
-    Returns its row iterator (positioned just after the header), the header index and the header
-    row. FBIL occasionally saves the workbook with a non-data sheet active (e.g. the "Note on FRB
-    & IIB" tab) while the real data sheet sits alongside, so we search all sheets rather than trust
-    ``workbook.active`` — otherwise a valid data day is wrongly rejected as headerless.
+    The iterator is positioned just after the header. All sheets are searched — FBIL ships
+    per-security data across several tabs (main + Special/UDAY), and occasionally saves the
+    workbook with a non-data sheet active (e.g. the "Note on FRB & IIB" tab), so neither
+    ``workbook.active`` nor first-match can be trusted.
     """
     for worksheet in workbook.worksheets:
         rows: Iterator[Sequence[object]] = worksheet.iter_rows(values_only=True)
         try:
             index, headers = _find_header(rows)
         except SourceError:
-            continue  # this sheet isn't the data sheet; try the next
-        return rows, index, headers
-    raise SourceError("could not locate an 'ISIN' header row in any FBIL worksheet")
+            continue  # this sheet isn't a data sheet; try the next
+        yield worksheet.title, rows, index, headers
+
+
+def _find_sheet(workbook: openpyxl.workbook.Workbook, title: str) -> Worksheet:
+    """Return the worksheet with the given title (case/space/hyphen-insensitive)."""
+    wanted = _normalize_title(title)
+    for worksheet in workbook.worksheets:
+        if _normalize_title(worksheet.title) == wanted:
+            return worksheet
+    raise SourceError(f"FBIL workbook has no sheet titled {title!r}")
 
 
 def _column_map(headers: Sequence[object]) -> dict[str, int]:
@@ -210,7 +340,8 @@ def _column_map(headers: Sequence[object]) -> dict[str, int]:
         "coupon": lambda h: h.startswith("coupon"),
         "maturity": lambda h: h.startswith("maturity"),
         "price": lambda h: h.startswith("price"),
-        "ytm": lambda h: h.startswith("ytm"),
+        # The STRIPS sheet titles its yield column "Yield% (Semi-Annual)" rather than "YTM…".
+        "ytm": lambda h: h.startswith(("ytm", "yield")),
     }
     result: dict[str, int] = {}
     for index, cell in enumerate(headers):

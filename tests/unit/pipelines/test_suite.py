@@ -42,9 +42,14 @@ def test_default_suite_covers_every_daily_source() -> None:
     labels = [s.label for s in steps]
     assert labels == [
         "Universe · BondCentral",
+        "Bond master · NSE report",
         "Sovereign valuations · FBIL",
+        "Yield curves · FBIL",
         "Public issues · SEBI",
         "Auctions · RBI",
         "Corp trades · NSE",
+        "Corp trades (daily archive) · NSE",
+        "Corp trades (trade-level) · BSE",
+        "Corp trades (trade-level) · NSE",
         "G-Sec/T-Bill trades · CCIL",
     ]

@@ -26,7 +26,7 @@ from bonds.sources.fbil import FbilSource
 from bonds.storage import Database
 from bonds.storage.repositories import SecurityRepository, ValuationRepository
 
-DEFAULT_PRODUCTS: tuple[str, ...] = ("gsec", "sdl")
+DEFAULT_PRODUCTS: tuple[str, ...] = ("gsec", "sdl", "strips")
 
 
 class ValuationFetcher(Protocol):
