@@ -80,3 +80,23 @@ def test_floating_benchmark_sets_interest_type(tmp_path: Path) -> None:
     assert r.interest_type == "Floating"
     assert r.attributes["floating_benchmark"] == "MIBOR"
     assert r.attributes["benchmark_spread"] == "0.50"
+
+
+def test_commercial_paper_issue_name_is_not_a_coupon(tmp_path: Path) -> None:
+    # NSE reuses "Issue Name" for a CP's DDMMYY maturity, sometimes with a stray '%'
+    # ("70525%") that would otherwise parse as a 70,525% coupon.
+    cp = (
+        "CP,ABCL,70525%,ABCL CP 07/05/25 Sr 162,ADITYA BIRLA FINANCE LTD,100.00,,"
+        "13-Nov-2024,07-May-2025,,,,,ACTUALby365,,,,0.0000,,,,,,INE860H144I3,Listed"
+    )
+    _land(tmp_path, _PREAMBLE + _HEADER + "\n" + cp + "\n")
+    (r,) = list(_source(tmp_path).iter_records(DATE))
+    assert r.coupon is None
+    assert r.interest_type is None
+
+
+def test_implausible_coupon_is_rejected(tmp_path: Path) -> None:
+    # A non-CP row whose rate field is mis-encoded must yield no coupon, not a junk one.
+    _land(tmp_path, _PREAMBLE + _HEADER + "\n" + _ROW.replace("7.88%", "70525%") + "\n")
+    (r,) = list(_source(tmp_path).iter_records(DATE))
+    assert r.coupon is None

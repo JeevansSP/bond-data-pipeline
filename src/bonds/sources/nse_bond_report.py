@@ -50,6 +50,11 @@ _ATTRIBUTE_COLUMNS: Final = {
 
 _COUPON_RE: Final = re.compile(r"^(\d+(?:\.\d+)?)%$")
 
+# Sectype whose "Issue Name" is a DDMMYY maturity, not a coupon (see _to_record).
+_COMMERCIAL_PAPER: Final = "CP"
+# Plausibility ceiling for a coupon read out of a text field, in percent.
+_COUPON_MAX_PCT: Final = 100.0
+
 
 class NseBondReportSource(MetricsCollector):
     """Fetches and parses the daily NSE corporate bond report."""
@@ -147,7 +152,11 @@ def _to_record(row: list[str], header: dict[str, int], source: str) -> SecurityR
     isin = cell("ISIN")
     if isin is None or len(isin) != 12 or not isin.startswith("IN"):
         return None
-    coupon = _parse_coupon(cell("Issue Name"))
+    # Commercial Paper is a zero-coupon discount instrument and NSE reuses "Issue Name" for
+    # its DDMMYY maturity instead of a rate — sometimes even with a stray '%' ("70525%"),
+    # which would otherwise parse as a 70,525% coupon. Never read a coupon from a CP row.
+    sectype = cell("Sectype")
+    coupon = None if sectype == _COMMERCIAL_PAPER else _parse_coupon(cell("Issue Name"))
     floating = cell("Floating Benchmark")
     interest_type = "Floating" if floating else ("Fixed" if coupon else None)
     next_coupon = _parse_date(cell("Next Coupon Date"))
@@ -172,10 +181,19 @@ def _to_record(row: list[str], header: dict[str, int], source: str) -> SecurityR
 
 
 def _parse_coupon(value: str | None) -> float | None:
+    """Parse a "7.88%"-style Issue Name into a coupon, rejecting implausible rates.
+
+    The ceiling is a backstop against a date or identifier that happens to carry a '%':
+    India's highest genuine distressed coupons sit in the twenties, so anything above
+    ``_COUPON_MAX_PCT`` is a mis-encoded field, not a rate.
+    """
     if value is None:
         return None
     match = _COUPON_RE.match(value)
-    return float(match.group(1)) if match else None
+    if match is None:
+        return None
+    coupon = float(match.group(1))
+    return coupon if coupon <= _COUPON_MAX_PCT else None
 
 
 def _parse_float(value: str | None) -> float | None:
