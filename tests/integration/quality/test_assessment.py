@@ -78,7 +78,12 @@ def test_consistency_checks_report(db: Database) -> None:
         "implausible_trade_yields",
         "matured_but_status_active",
         "coupon_above_25pct",
+        "curve_sparse_days",
+        "corp_trade_price_scale_outliers",
+        "corp_trade_extreme_yields",
     }
     # INFO rows are observations and always pass.
     assert checks["matured_but_status_active"].passed
     assert checks["coupon_above_25pct"].passed
+    assert checks["corp_trade_price_scale_outliers"].passed
+    assert checks["corp_trade_extreme_yields"].passed

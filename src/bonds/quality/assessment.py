@@ -20,6 +20,9 @@ MAX_VALUATION_NULL_PRICE_RATE = 0.05
 MAX_TRADE_NULL_PRICE_RATE = 0.02
 MAX_CROSS_SOURCE_P99_PRICE_DIFF = 3.0  # |CCIL WAP - FBIL price| per 100 face, 99th pctile
 MIN_CROSS_SOURCE_PAIRS = 500  # too few matched pairs -> reconciliation is uninformative
+# Fewest tenor points a published curve day can legitimately carry (sdl_zcyc's grid is 56;
+# gsec 160-205). Below this the workbook parsed only partially.
+MIN_CURVE_POINTS_PER_DAY = 20
 _SOVEREIGN = ("GSEC", "SDL", "TBILL", "STRIPS")
 
 
@@ -68,13 +71,73 @@ def check_uniqueness(conn: Connection) -> list[QualityCheck]:
             "securities",
             "SELECT count(*) FROM (SELECT 1 FROM securities GROUP BY isin HAVING count(*)>1) x",
         ),
+        (
+            "yield_curves",
+            "SELECT count(*) FROM (SELECT 1 FROM yield_curves WHERE superseded_at IS NULL "
+            "GROUP BY curve,quote_date,tenor_years,source HAVING count(*)>1) x",
+        ),
     ]
-    return [
+    checks = [
         QualityCheck(
             f"dup_key_{name}", Level.ERROR, passed=(n := _scalar(conn, sql)) == 0, observed=n
         )
         for name, sql in specs
     ]
+    # corporate_trades has no natural transaction key, and content-based duplicate detection
+    # false-positives on real market structure (a sliced block order prints hundreds of
+    # identical lots — verified against raw files). The honest invariant is audit
+    # reconciliation: the table's row count per loaded window must equal what the most
+    # recent successful load recorded in ingestion_runs. BSE loads one day per run; NSE
+    # loads anchored 7-day windows keyed by the window's end date, where several runs can
+    # cover one window as its clamped end advances — only the latest run per window counts.
+    checks.append(
+        _audit_check(
+            conn,
+            "corp_trades_bse_audit_drift",
+            """
+            SELECT count(*) FROM (
+              SELECT r.run_date
+              FROM ingestion_runs r
+              LEFT JOIN (
+                SELECT trade_date, count(*) AS n FROM corporate_trades
+                WHERE source='bse' GROUP BY trade_date
+              ) t ON t.trade_date = r.run_date
+              WHERE r.dataset='bse.corp_trades' AND r.status='success'
+                AND coalesce(t.n, 0) <> r.rows_ingested
+            ) x
+            """,
+            detail="BSE days whose table rows differ from the audited load count",
+        )
+    )
+    checks.append(
+        _audit_check(
+            conn,
+            "corp_trades_nse_audit_drift",
+            """
+            WITH latest AS (
+              SELECT DISTINCT ON (run_date - ((run_date - DATE '2010-01-04') % 7))
+                     run_date - ((run_date - DATE '2010-01-04') % 7) AS win_start,
+                     run_date, rows_ingested
+              FROM ingestion_runs
+              WHERE dataset='nse.corp_trades_ts' AND status='success'
+              ORDER BY run_date - ((run_date - DATE '2010-01-04') % 7), run_date DESC
+            )
+            SELECT count(*) FROM latest l
+            LEFT JOIN LATERAL (
+              SELECT count(*) AS n FROM corporate_trades
+              WHERE source='nse' AND trade_date BETWEEN l.win_start AND l.run_date
+            ) t ON true
+            WHERE coalesce(t.n, 0) <> l.rows_ingested
+            """,
+            detail="NSE windows whose table rows differ from the audited load count",
+        )
+    )
+    return checks
+
+
+def _audit_check(conn: Connection, name: str, sql: str, *, detail: str) -> QualityCheck:
+    n = _scalar(conn, sql)
+    return QualityCheck(name, Level.ERROR, passed=n == 0, observed=n, detail=detail)
 
 
 def check_referential_integrity(conn: Connection) -> list[QualityCheck]:
@@ -95,6 +158,11 @@ def check_referential_integrity(conn: Connection) -> list[QualityCheck]:
         conn,
         "SELECT count(distinct v.isin) FROM valuations v LEFT JOIN securities s ON s.isin=v.isin "
         "WHERE s.isin IS NULL AND v.superseded_at IS NULL",
+    )
+    trade_level_orphans = _scalar(
+        conn,
+        "SELECT count(distinct t.isin) FROM corporate_trades t "
+        "LEFT JOIN securities s ON s.isin=t.isin WHERE s.isin IS NULL",
     )
     return [
         QualityCheck(
@@ -117,6 +185,16 @@ def check_referential_integrity(conn: Connection) -> list[QualityCheck]:
             passed=corp_orphans == 0,
             observed=corp_orphans,
             detail="corporate trade ISINs missing from securities",
+        ),
+        QualityCheck(
+            "orphan_corp_trades_trade_level",
+            Level.WARN,
+            passed=trade_level_orphans == 0,
+            observed=trade_level_orphans,
+            detail=(
+                "trade-level ISINs missing from securities (mostly the pre-2019 matured "
+                "universe no reference source covers)"
+            ),
         ),
     ]
 
@@ -149,6 +227,34 @@ def check_completeness(conn: Connection) -> list[QualityCheck]:
                 Level.WARN,
                 passed=rate <= MAX_TRADE_NULL_PRICE_RATE,
                 observed=rate,
+            )
+        )
+    ct_total = _scalar(conn, "SELECT count(*) FROM corporate_trades")
+    if ct_total:
+        null_px = _scalar(conn, "SELECT count(*) FROM corporate_trades WHERE price IS NULL")
+        rate = null_px / ct_total
+        checks.append(
+            QualityCheck(
+                "corp_trade_null_price_rate",
+                Level.WARN,
+                passed=rate <= MAX_TRADE_NULL_PRICE_RATE,
+                observed=rate,
+            )
+        )
+    curve_total = _scalar(conn, "SELECT count(*) FROM yield_curves WHERE superseded_at IS NULL")
+    if curve_total:
+        null_y = _scalar(
+            conn,
+            "SELECT count(*) FROM yield_curves "
+            "WHERE superseded_at IS NULL AND ytm_semi_annual IS NULL AND ytm_annualized IS NULL",
+        )
+        checks.append(
+            QualityCheck(
+                "curve_points_without_yield",
+                Level.ERROR,
+                passed=null_y == 0,
+                observed=null_y,
+                detail="curve tenor points carrying no yield in either convention",
             )
         )
     # T-Bills and STRIPS carry an exact maturity in the feed -> every one should parse.
@@ -194,6 +300,26 @@ def check_consistency(conn: Connection) -> list[QualityCheck]:
         "WHERE s.maturity_date < CURRENT_DATE - INTERVAL '365 days'",
     )
     coupon_above_25 = _scalar(conn, "SELECT count(*) FROM securities WHERE coupon > 25")
+    # A curve day with a handful of tenor points is a partially-parsed workbook, not a
+    # published curve — full grids run 56 (sdl_zcyc) to ~205 (gsec) points.
+    sparse_curve_days = _scalar(
+        conn,
+        "SELECT count(*) FROM ("
+        "  SELECT curve, quote_date FROM yield_curves WHERE superseded_at IS NULL"
+        "  GROUP BY curve, quote_date HAVING count(*) < :min_points"
+        ") x",
+        min_points=MIN_CURVE_POINTS_PER_DAY,
+    )
+    # As-published exchange oddities in the trade-level feed, listed for awareness (not our
+    # parse: a handful of prints quote absolute rupees instead of per-100, or carry junk
+    # yields). Kept INFO — a permanently-red WARN on upstream-published data trains users
+    # to ignore warnings.
+    price_scale_outliers = _scalar(conn, "SELECT count(*) FROM corporate_trades WHERE price > 5000")
+    extreme_trade_yields = _scalar(
+        conn,
+        "SELECT count(*) FROM corporate_trades "
+        "WHERE trade_yield IS NOT NULL AND (trade_yield < -20 OR trade_yield > 100)",
+    )
     return [
         QualityCheck(
             "zero_coupon_contradiction",
@@ -225,6 +351,30 @@ def check_consistency(conn: Connection) -> list[QualityCheck]:
             passed=True,
             observed=coupon_above_25,
             detail="verified-legit distressed/high-yield paper; listed for awareness",
+        ),
+        QualityCheck(
+            "curve_sparse_days",
+            Level.WARN,
+            passed=sparse_curve_days == 0,
+            observed=sparse_curve_days,
+            detail=(
+                f"(curve, day)s with < {MIN_CURVE_POINTS_PER_DAY} tenor points — "
+                "a partially-parsed workbook"
+            ),
+        ),
+        QualityCheck(
+            "corp_trade_price_scale_outliers",
+            Level.INFO,
+            passed=True,
+            observed=price_scale_outliers,
+            detail="prints quoting absolute rupees instead of per-100 face (as published)",
+        ),
+        QualityCheck(
+            "corp_trade_extreme_yields",
+            Level.INFO,
+            passed=True,
+            observed=extreme_trade_yields,
+            detail="trade yields < -20% or > 100% as published by the exchange",
         ),
     ]
 
