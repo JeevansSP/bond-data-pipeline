@@ -67,7 +67,17 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   fi
 fi
 echo "$$" >"$LOCK_DIR/pid"
-trap 'rm -rf "$LOCK_DIR"' EXIT
+
+# --- cleanup: always release the lock; stop Postgres only if this run started it ---
+DOCKER_STARTED=0
+cleanup() {
+  if [ "$DOCKER_STARTED" -eq 1 ]; then
+    log "stopping Postgres container"
+    docker compose stop postgres >>"$LOG_FILE" 2>&1 || log "WARN: 'docker compose stop' failed"
+  fi
+  rm -rf "$LOCK_DIR"
+}
+trap cleanup EXIT
 
 # --- prune old ingest logs (the dated files grow unbounded otherwise) ---
 find "$LOG_DIR" -name 'ingest-*.log' -mtime +30 -delete 2>/dev/null || true
@@ -82,7 +92,11 @@ done
 # --- ensure the Postgres container is up and accepting connections ---
 if command -v docker >/dev/null 2>&1; then
   log "starting Postgres container"
-  docker compose up -d postgres >>"$LOG_FILE" 2>&1 || log "WARN: 'docker compose up' failed — is Docker running?"
+  if docker compose up -d postgres >>"$LOG_FILE" 2>&1; then
+    DOCKER_STARTED=1  # stop it in cleanup, even if the ingest itself fails
+  else
+    log "WARN: 'docker compose up' failed — is Docker running?"
+  fi
   for i in $(seq 1 30); do
     if docker compose exec -T postgres pg_isready -q >/dev/null 2>&1; then
       log "Postgres ready"
