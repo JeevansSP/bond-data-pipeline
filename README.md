@@ -1,17 +1,28 @@
 # bonds-pipeline
 
-Daily data pipelines for the Indian bond market — building the dataset behind a hold-to-maturity
-**ladder-strategy backtest**. Sovereign-first (G-Sec / SDL / T-Bill), with corporate data collected
-alongside.
+Daily data pipelines for the Indian bond market — sovereign (G-Sec / SDL / T-Bill / STRIPS) and
+corporate, from raw exchange/benchmark feeds to an audited Postgres warehouse. Originally built
+for a hold-to-maturity **ladder-strategy backtest**; now also the base for regulatory-valuation
+use cases (RBI investment-portfolio Directions), so price history is **bitemporal** and every
+load is audited.
 
 Source-by-source data mapping (endpoints, schemas, quirks) lives in [`docs/research/`](docs/research).
 
-## Pillars
+## What's in the warehouse
 
-1. **Current universe** — daily upsert of securities (`securities`).
-2. **Attribute-change history** — SCD-2 effective-dated changes, e.g. rating/coupon
-   (`security_attribute_history`).
-3. **Valuation history** — per-ISIN daily price & YTM (`valuations`), from **FBIL** (implemented).
+| Table | Grain | Sources | Depth |
+|---|---|---|---|
+| `securities` | one row per ISIN (~56k) | BondCentral, CDSL, FBIL, NSE bond report | current state |
+| `security_attribute_history` | SCD-2 effective-dated values (rating, day-count convention, coupon frequency, next coupon date, status…) | BondCentral, CDSL, NSE bond report | per attribute |
+| `valuations` | per-ISIN daily price/YTM, **append-only bitemporal** (restatements close the old row via `superseded_at`, never overwrite) | FBIL (G-Sec, SDL, STRIPS incl. Special/UDAY sheets) | 2021 → |
+| `yield_curves` | tenor point per curve per day, bitemporal | FBIL (G-Sec Par Yield, GOI ZCYC, SDL ZCYC) | 2023 → |
+| `trades` | per-ISIN session summary | CCIL NDS-OM (2002 →), NSE CBM daily archive (2008 →), NSE live segments | 2002 → |
+| `corporate_trades` | **one row per transaction** (RFQ + OTC-reported) | NSE Trade & Settlement (2014 →), BSE Trade & Settlement (2020 →) | ~4.5M rows |
+| `public_issues`, `rbi_auctions` | primary-market calendars | SEBI, RBI | current |
+| `ingestion_runs`, `etl_file_metrics`, `data_quality_checks` | audit trail of every load, ETL funnel, persisted DQ verdicts | — | per run |
+
+Every raw artifact (xlsx/CSV/JSON) is landed verbatim under `data/raw/<source>/` before parsing;
+loads are lake-first, so backfills re-read the lake instead of re-downloading.
 
 ## Tech stack
 
@@ -32,12 +43,17 @@ src/bonds/
 ├── cli.py               # `bonds` typer CLI
 ├── http/                # ThrottledClient (rate-limit + retry)
 ├── models/              # source-agnostic domain records (pydantic)
-├── sources/             # one connector per provider (fbil implemented; others typed stubs)
-├── storage/             # schema (ORM) · database (engine/session) · repositories (upsert/SCD-2)
-└── pipelines/           # orchestration per pillar (sovereign_valuation implemented)
+├── sources/             # one connector per provider: fbil, bondcentral, cdsl, ccil,
+│                        #   nse (live), nse_cbm, nse_trade_settlement, nse_bond_report,
+│                        #   bse, sebi, rbi
+├── storage/             # schema (ORM) · database (engine/session) · repositories
+│                        #   (upsert / SCD-2 / bitemporal supersede / replace-window)
+├── pipelines/           # orchestration per dataset + suite.py (daily) + catchup.py (scheduler)
+└── quality/             # per-batch checks + DB-wide assessment (`bonds dq assess`)
 migrations/              # Alembic
+scripts/                 # run_daily_ingest.sh + launchd/systemd units (see scripts/README.md)
 tests/                   # unit/ (no DB) + integration/ (needs Postgres, `-m integration`)
-data/                    # gitignored: raw landed files + Postgres volume
+data/                    # gitignored: raw data lake + Postgres volume + logs
 ```
 
 ## Quickstart
@@ -54,26 +70,46 @@ uv run alembic upgrade head              # apply schema
 uv run bonds ingest all                          # full run
 uv run bonds ingest all --max-universe-pages 3   # smoke run
 
-# upsert the corporate securities-master universe (BondCentral) + rating history
-uv run bonds ingest universe                     # full (~25.5k ISINs, ~256 pages)
-uv run bonds ingest universe --max-pages 3       # smoke run (300 bonds)
+# what the scheduler runs: gap-fill every missed day + refresh snapshots, then exit
+uv run bonds ingest catch-up
 
-# ingest one day of FBIL sovereign valuations (G-Sec + SDL)
-uv run bonds ingest sovereign-valuation --date 2026-07-10
-
-# backfill a range (weekdays; market holidays auto-skip)
-uv run bonds ingest sovereign-valuation-backfill --start 2026-07-01 --end 2026-07-10
+# individual pipelines (each also has a *-backfill variant where it's a date series)
+uv run bonds ingest universe                     # BondCentral securities master (~25k ISINs)
+uv run bonds ingest sovereign-valuation          # FBIL G-Sec/SDL/STRIPS prices & YTM
+uv run bonds ingest yield-curves                 # FBIL Par Yield / GOI ZCYC / SDL ZCYC
+uv run bonds ingest corporate-trades             # trade-level BSE day + NSE window
+uv run bonds ingest nse-bond-report              # day count / coupon dates / listing status
+uv run bonds ingest ccil-trades --date 2026-07-10
 ```
 
-Browse the data in **DBeaver** → `localhost:5432`, db/user/pass `bonds` (see `.env`).
+Browse the data in **DBeaver** → `localhost:5433`, db/user/pass `bonds` (see `.env`).
+
+## Scheduling
+
+`scripts/run_daily_ingest.sh` runs `bonds ingest catch-up` under a single-instance lock: it starts
+the Postgres container, holds off idle sleep (macOS `caffeinate`), ingests, then **stops the
+container again** on exit. Installed as a launchd agent (21:00 IST daily + on-load catch-up after
+downtime) — see [`scripts/README.md`](scripts/README.md) for launchd/systemd installation. Missed
+days self-heal: `catch-up` resumes each date-series dataset from its last audited run, bounded to
+30 days, and retries recent skips/failures.
 
 ## Data quality
 
-Every ingest runs checks and persists them to `data_quality_checks` (ISIN check-digit, price/YTM
-range, null-rate ceilings, row-count drift vs the previous run) so quality is monitored, not assumed.
-`CHECK` constraints back-stop bad prices/YTMs at the DB. Use the **`active_securities`** view as the
-investable universe — it excludes matured and non-ACTIVE securities (the ladder must never hold a
-dead bond). For a point-in-time backtest, filter by the as-of date directly instead of the view.
+Two layers, both persisted:
+
+- **Per-ingest checks** run inside every load and land in `data_quality_checks` (ISIN check-digit,
+  price/YTM range, null-rate ceilings, row-count drift vs the previous run).
+- **`uv run bonds dq assess`** runs warehouse-wide invariants: duplicate-key checks (current rows
+  only, for the bitemporal tables), referential integrity against the securities master,
+  completeness floors, consistency (zero-coupon contradictions, sparse curve days, implausible
+  yields), audit reconciliation (`corporate_trades` row counts must equal what `ingestion_runs`
+  recorded per loaded window), and CCIL-vs-FBIL cross-source price reconciliation. Exits 1 on any
+  ERROR.
+
+`CHECK` constraints back-stop bad prices/YTMs at the DB. Use the **`active_securities`** view as
+the investable universe — it excludes matured and non-ACTIVE securities (the ladder must never
+hold a dead bond). For a point-in-time backtest, filter by the as-of date directly instead; for
+"what did we believe on date X", query `valuations`/`yield_curves` including superseded rows.
 
 ## Development
 
@@ -85,6 +121,3 @@ make test        # unit tests + coverage floor
 make test-int    # integration tests (needs Postgres up)
 make check       # everything the pre-push hook runs
 ```
-
-Scheduling is left to the OS: once the pipeline is stable, wrap
-`uv run bonds ingest sovereign-valuation` in a systemd service + timer (or cron).
