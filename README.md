@@ -82,7 +82,7 @@ uv run bonds ingest nse-bond-report              # day count / coupon dates / li
 uv run bonds ingest ccil-trades --date 2026-07-10
 ```
 
-Browse the data in **DBeaver** → `localhost:5433`, db/user/pass `bonds` (see `.env`).
+Browse the data in **DBeaver** → `localhost:5418`, db/user/pass `bonds` (see `.env`).
 
 ## Scheduling
 
