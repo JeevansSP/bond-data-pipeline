@@ -202,7 +202,7 @@ def test_sovereign_securities_are_enriched(database: Database) -> None:
         sec = s.execute(select(Security).where(Security.isin == ISIN_A)).scalar_one()
     assert sec.face_value == 100.0  # sovereign default
     assert sec.issuer == "Government of India"
-    assert sec.interest_type == "Fixed"  # non-zero coupon
+    assert sec.interest_type == "FIXED"  # non-zero coupon, canonicalized by the validator
 
 
 def test_nonpositive_price_coerced_to_null_not_crash(database: Database) -> None:

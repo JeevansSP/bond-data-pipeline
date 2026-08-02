@@ -9,6 +9,7 @@ from bonds.models.records import (
     SovereignValuation,
     TradeRecord,
     YieldCurvePoint,
+    normalize_interest_type,
 )
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "SovereignValuation",
     "TradeRecord",
     "YieldCurvePoint",
+    "normalize_interest_type",
 ]

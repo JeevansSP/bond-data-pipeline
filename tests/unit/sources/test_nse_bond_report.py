@@ -55,7 +55,7 @@ def test_iter_records_maps_fields(tmp_path: Path) -> None:
     assert r.isin == "INE238A08484"
     assert r.instrument_type is InstrumentType.CORP
     assert r.coupon == pytest.approx(7.88)  # parsed from "7.88%"
-    assert r.interest_type == "Fixed"
+    assert r.interest_type == "FIXED"  # validator canonicalizes the source's "Fixed"
     assert r.maturity_date == dt.date(2032, 12, 13)
     assert r.face_value == pytest.approx(100.0)
     assert r.attributes["day_count_convention"] == "ACTUALby365"
@@ -77,7 +77,7 @@ def test_floating_benchmark_sets_interest_type(tmp_path: Path) -> None:
     row = _ROW.replace("ACTUALby365,,,", "ACTUALby365,MIBOR,0.50,")
     _land(tmp_path, _PREAMBLE + _HEADER + "\n" + row + "\n")
     (r,) = list(_source(tmp_path).iter_records(DATE))
-    assert r.interest_type == "Floating"
+    assert r.interest_type == "FLOATING"  # validator canonicalizes the source's "Floating"
     assert r.attributes["floating_benchmark"] == "MIBOR"
     assert r.attributes["benchmark_spread"] == "0.50"
 

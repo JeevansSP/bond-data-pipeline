@@ -24,6 +24,9 @@ MIN_CROSS_SOURCE_PAIRS = 500  # too few matched pairs -> reconciliation is uninf
 # gsec 160-205). Below this the workbook parsed only partially.
 MIN_CURVE_POINTS_PER_DAY = 20
 _SOVEREIGN = ("GSEC", "SDL", "TBILL", "STRIPS")
+# Canonical interest_type vocabulary (NULL allowed); anything else is a raw source string a
+# new/regressed source wrote past the normalizer.
+CANONICAL_INTEREST_TYPES = ("FIXED", "ZERO", "FLOATING", "OTHER")
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,6 +275,22 @@ def check_completeness(conn: Connection) -> list[QualityCheck]:
                 observed=missing,
             )
         )
+    # Sovereign paper has a uniform ₹100 face; NULL means a derivation path forgot to set it.
+    # SGB is deliberately excluded — its face is the gold-linked issue price.
+    sov_no_face = _scalar(
+        conn,
+        "SELECT count(*) FROM securities WHERE instrument_type = ANY(:segs) AND face_value IS NULL",
+        segs=list(_SOVEREIGN),
+    )
+    checks.append(
+        QualityCheck(
+            "sovereign_missing_face_value",
+            Level.WARN,
+            passed=sov_no_face == 0,
+            observed=sov_no_face,
+            detail="GSEC/SDL/TBILL/STRIPS rows without the uniform 100 face value",
+        )
+    )
     return checks
 
 
@@ -281,6 +300,18 @@ def check_consistency(conn: Connection) -> list[QualityCheck]:
         conn,
         "SELECT count(*) FROM securities "
         "WHERE upper(interest_type) LIKE '%ZERO%' AND coupon IS NOT NULL AND coupon > 0",
+    )
+    # STRIPS are zero-coupon by construction; a positive coupon is a parse/merge defect
+    # (seen once: a principal strip inheriting its parent bond's coupon from a CCIL descriptor).
+    strips_with_coupon = _scalar(
+        conn,
+        "SELECT count(*) FROM securities WHERE instrument_type='STRIPS' AND coupon > 0",
+    )
+    noncanonical_interest = _scalar(
+        conn,
+        "SELECT count(*) FROM securities "
+        "WHERE interest_type IS NOT NULL AND NOT (interest_type = ANY(:canon))",
+        canon=list(CANONICAL_INTEREST_TYPES),
     )
     # Implausible sovereign yields in CCIL trades: the parse-time repair guard nulls these now,
     # so anything remaining is old data or a new garbling pattern. Scoped to CCIL only — NSE
@@ -327,6 +358,23 @@ def check_consistency(conn: Connection) -> list[QualityCheck]:
             passed=zero_coupon_conflict == 0,
             observed=zero_coupon_conflict,
             detail="interest_type says zero-coupon but coupon > 0 (source contradiction)",
+        ),
+        QualityCheck(
+            "strips_with_nonzero_coupon",
+            Level.ERROR,
+            passed=strips_with_coupon == 0,
+            observed=strips_with_coupon,
+            detail="STRIPS are zero-coupon by construction; coupon > 0 is a parse/merge defect",
+        ),
+        QualityCheck(
+            "interest_type_noncanonical",
+            Level.ERROR,
+            passed=noncanonical_interest == 0,
+            observed=noncanonical_interest,
+            detail=(
+                "interest_type outside the canonical set "
+                f"{{{', '.join(CANONICAL_INTEREST_TYPES)}}} — a source wrote raw strings"
+            ),
         ),
         QualityCheck(
             "implausible_trade_yields",

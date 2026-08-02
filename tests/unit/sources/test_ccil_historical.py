@@ -177,8 +177,9 @@ def test_derive_security_tbill_parses_maturity_and_zero_coupon() -> None:
     sec = derive_security("IN0020260099", "DTB 15012027", "TBILL")
     assert sec is not None
     assert sec.instrument_type is InstrumentType.TBILL
-    assert sec.coupon == 0.0 and sec.interest_type == "ZERO_COUPON"
+    assert sec.coupon == 0.0 and sec.interest_type == "ZERO"  # validator canonicalizes
     assert sec.maturity_date == dt.date(2027, 1, 15)
+    assert sec.face_value == 100.0  # sovereign Rs 100 par convention
     assert sec.issuer == "Government of India" and sec.source == "ccil"
 
 
@@ -216,9 +217,11 @@ def test_derive_security_sdl_state_issuer_and_sgb() -> None:
     sdl = derive_security("IN2220190127", "06.97 MAHARASHTRA SGS 2028", "SDL")
     assert sdl is not None and sdl.instrument_type is InstrumentType.SDL
     assert sdl.issuer == "State Government (MAHARASHTRA)"
+    assert sdl.face_value == 100.0
     sgb = derive_security("IN0020210228", "02.50 SGB 2029 SERIES VIII", "SGB")
     assert sgb is not None and sgb.instrument_type is InstrumentType.SGB
     assert sgb.coupon == pytest.approx(2.50)
+    assert sgb.face_value is None  # gold-linked issue price, not the Rs 100 par convention
 
 
 def test_derive_securities_dedupes_by_isin() -> None:

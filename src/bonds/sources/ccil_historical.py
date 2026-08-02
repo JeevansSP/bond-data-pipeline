@@ -389,6 +389,10 @@ _SEGMENT_TYPE: Final = {
 }
 _CENTRAL_SEGMENTS: Final = frozenset({"GSEC", "TBILL", "STRIPS", "SGB"})
 _ZERO_COUPON_SEGMENTS: Final = frozenset({"TBILL", "STRIPS"})
+# Sovereign convention: Rs 100 face value (same constant FBIL's valuation path uses). SGB is
+# excluded — its face is the gold-linked issue price (e.g. "... FV 4791"), not in this feed.
+_PAR_FACE_SEGMENTS: Final = frozenset({"GSEC", "SDL", "TBILL", "STRIPS"})
+_SOVEREIGN_FACE_VALUE: Final = 100.0
 _LEAD_COUPON_RE: Final = re.compile(r"^\s*(\d{1,2}\.\d{1,3})\b")
 _SLASH_DATE_RE: Final = re.compile(r"\b(\d{2})/(\d{2})/(\d{4})\b")  # DD/MM/YYYY
 _COMPACT_DATE_RE: Final = re.compile(r"\b(\d{2})(\d{2})(\d{4})\b")  # DDMMYYYY, e.g. DTB 15012027
@@ -537,6 +541,7 @@ def derive_security(isin: str, descriptor: str | None, segment: str) -> Security
         coupon=_parse_coupon(descriptor, segment),
         interest_type="ZERO_COUPON" if segment in _ZERO_COUPON_SEGMENTS else "FIXED",
         maturity_date=_parse_maturity(descriptor, segment),
+        face_value=_SOVEREIGN_FACE_VALUE if segment in _PAR_FACE_SEGMENTS else None,
     )
 
 

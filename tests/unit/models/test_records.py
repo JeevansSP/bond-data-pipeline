@@ -7,7 +7,12 @@ import datetime as dt
 import pytest
 from pydantic import ValidationError
 
-from bonds.models import InstrumentType, SecurityRecord, SovereignValuation
+from bonds.models import (
+    InstrumentType,
+    SecurityRecord,
+    SovereignValuation,
+    normalize_interest_type,
+)
 
 
 def test_valuation_is_frozen() -> None:
@@ -74,11 +79,60 @@ def test_implausible_maturity_coerced_to_none(
     assert r.maturity_date == expected
 
 
-def test_interest_type_truncated_to_column_width() -> None:
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # FIXED bucket
+        ("Fixed", "FIXED"),
+        ("FIXED", "FIXED"),
+        ("Fixed Interest", "FIXED"),
+        # ZERO bucket
+        ("ZERO_COUPON", "ZERO"),
+        ("Zero Interest", "ZERO"),
+        ("No Interest", "ZERO"),
+        ("Zero", "ZERO"),
+        # FLOATING bucket (rate/index/inflation-linked floaters)
+        ("Floating", "FLOATING"),
+        ("Variable Interest", "FLOATING"),
+        ("Variable-Others", "FLOATING"),
+        ("Variable-Index Linked", "FLOATING"),
+        ("Variable - Mibor Linked", "FLOATING"),
+        ("Variable-Inflation", "FLOATING"),
+        # OTHER bucket (market-linked debentures + explicit N/A)
+        ("Variable-Equity Linked", "OTHER"),
+        ("Variable- Commodity linked", "OTHER"),
+        ("Not Applicable", "OTHER"),
+        # Unknown non-empty vocabulary must never crash: it maps to OTHER
+        ("Step-Up Coupon", "OTHER"),
+        ("X" * 60, "OTHER"),  # would previously have needed VARCHAR(48) truncation
+        # Whitespace robustness
+        ("  fixed  interest ", "FIXED"),
+        # NULL/empty stays None
+        (None, None),
+        ("", None),
+        ("   ", None),
+    ],
+)
+def test_normalize_interest_type(raw: str | None, expected: str | None) -> None:
+    assert normalize_interest_type(raw) == expected
+
+
+def test_security_record_normalizes_interest_type() -> None:
     r = SecurityRecord(
         isin="IN1520160061",
         instrument_type=InstrumentType.CORP,
         source="bondcentral",
-        interest_type="X" * 60,  # longer than VARCHAR(48)
+        interest_type="Fixed Interest",
     )
-    assert r.interest_type is not None and len(r.interest_type) == 48
+    assert r.interest_type == "FIXED"
+    unknown = SecurityRecord(
+        isin="IN1520160061",
+        instrument_type=InstrumentType.CORP,
+        source="bondcentral",
+        interest_type="Brand New Category",
+    )
+    assert unknown.interest_type == "OTHER"
+    absent = SecurityRecord(
+        isin="IN1520160061", instrument_type=InstrumentType.CORP, source="bondcentral"
+    )
+    assert absent.interest_type is None

@@ -75,6 +75,8 @@ def test_consistency_checks_report(db: Database) -> None:
         checks = {c.name: c for c in check_consistency(conn)}
     assert set(checks) == {
         "zero_coupon_contradiction",
+        "strips_with_nonzero_coupon",
+        "interest_type_noncanonical",
         "implausible_trade_yields",
         "matured_but_status_active",
         "coupon_above_25pct",
@@ -87,3 +89,16 @@ def test_consistency_checks_report(db: Database) -> None:
     assert checks["coupon_above_25pct"].passed
     assert checks["corp_trade_price_scale_outliers"].passed
     assert checks["corp_trade_extreme_yields"].passed
+    # Regression guards for the interest_type/coupon normalization: presence + level only —
+    # their passed status depends on whether the repair migration has been applied.
+    assert checks["strips_with_nonzero_coupon"].level is Level.ERROR
+    assert checks["interest_type_noncanonical"].level is Level.ERROR
+
+
+def test_completeness_checks_include_sovereign_face_value(db: Database) -> None:
+    from bonds.quality.assessment import check_completeness
+
+    with db.engine.connect() as conn:
+        checks = {c.name: c for c in check_completeness(conn)}
+    assert "sovereign_missing_face_value" in checks
+    assert checks["sovereign_missing_face_value"].level is Level.WARN

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 from enum import StrEnum
+from typing import Final
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -19,6 +20,57 @@ def _plausible_maturity(value: dt.date | None) -> dt.date | None:
     if value is not None and not (_MATURITY_MIN <= value <= _MATURITY_MAX):
         return None
     return value
+
+
+# Canonical interest-type vocabulary. Sources spell this 15+ ways ("Fixed", "FIXED",
+# "Fixed Interest", "ZERO_COUPON", "Variable - Mibor Linked", ...), so every raw value is
+# collapsed to exactly one of FIXED / ZERO / FLOATING / OTHER (or None) at record-construction
+# time. Keys are matched case-insensitively with whitespace collapsed.
+_INTEREST_TYPE_CANONICAL: Final[dict[str, str]] = {
+    # Plain fixed-coupon paper.
+    "fixed": "FIXED",
+    "fixed interest": "FIXED",
+    # Zero-coupon / discount paper.
+    "zero": "ZERO",
+    "zero_coupon": "ZERO",
+    "zero interest": "ZERO",
+    "no interest": "ZERO",
+    # Rate/index/inflation-linked floaters.
+    "floating": "FLOATING",
+    "variable interest": "FLOATING",
+    "variable-others": "FLOATING",
+    "variable-index linked": "FLOATING",
+    "variable - mibor linked": "FLOATING",
+    "variable-inflation": "FLOATING",
+    # Market-linked debentures (equity/commodity payoffs, not rate floaters) and explicit N/A.
+    "variable-equity linked": "OTHER",
+    "variable- commodity linked": "OTHER",
+    "not applicable": "OTHER",
+}
+
+
+def normalize_interest_type(raw: str | None) -> str | None:
+    """Map any raw source interest-type spelling to the canonical vocabulary.
+
+    Returns exactly one of ``FIXED``, ``ZERO``, ``FLOATING``, ``OTHER`` or ``None``:
+
+    - FIXED: ``fixed``, ``fixed interest``
+    - ZERO: ``zero_coupon``, ``zero interest``, ``no interest``, ``zero``
+    - FLOATING: ``floating``, ``variable interest``, ``variable-others``,
+      ``variable-index linked``, ``variable - mibor linked``, ``variable-inflation``
+    - OTHER: ``variable-equity linked``, ``variable- commodity linked``, ``not applicable``,
+      and ANY unrecognized non-empty value (new source vocab must never crash ingestion)
+    - None: NULL/empty/whitespace-only input stays None
+
+    Matching is case-insensitive with surrounding whitespace stripped and internal runs of
+    whitespace collapsed to a single space.
+    """
+    if raw is None:
+        return None
+    key = " ".join(raw.split()).lower()
+    if not key:
+        return None
+    return _INTEREST_TYPE_CANONICAL.get(key, "OTHER")
 
 
 class InstrumentType(StrEnum):
@@ -220,7 +272,12 @@ class SecurityRecord(BaseModel):
 
     @field_validator("interest_type")
     @classmethod
-    def _interest_type_fits_column(cls, v: str | None) -> str | None:
-        # securities.interest_type is VARCHAR(48); a longer source value (some BondCentral corp
-        # categories) is truncated rather than overflowing and failing the whole batch.
-        return v[:48] if v is not None else None
+    def _interest_type_canonical(cls, v: str | None) -> str | None:
+        """Normalize to the canonical vocabulary (see :func:`normalize_interest_type`).
+
+        Every source constructs a SecurityRecord, so mapping here keeps the whole universe on
+        one vocabulary without per-source edits. The canonical values are all far shorter than
+        the VARCHAR(48) column, so the old truncation guard is subsumed (unknown long values
+        collapse to ``OTHER``).
+        """
+        return normalize_interest_type(v)
