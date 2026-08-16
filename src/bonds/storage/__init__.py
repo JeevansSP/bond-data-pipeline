@@ -1,8 +1,9 @@
 """Persistence layer: SQLAlchemy schema, engine/session management, and repositories."""
 
-from bonds.storage.database import Database
+from bonds.storage.database import Crud, Database
 from bonds.storage.schema import (
     Base,
+    CorporateTrade,
     DataQualityCheck,
     EtlFileMetric,
     IngestionRun,
@@ -12,10 +13,13 @@ from bonds.storage.schema import (
     SecurityAttributeHistory,
     Trade,
     Valuation,
+    YieldCurve,
 )
 
 __all__ = [
     "Base",
+    "CorporateTrade",
+    "Crud",
     "DataQualityCheck",
     "Database",
     "EtlFileMetric",
@@ -26,4 +30,5 @@ __all__ = [
     "SecurityAttributeHistory",
     "Trade",
     "Valuation",
+    "YieldCurve",
 ]

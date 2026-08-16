@@ -20,6 +20,7 @@ dependencies = [
     "rich>=13.7",
     "structlog>=24.4",
     "ipykernel>=7.3.0",
+    "pandas>=3.0.5",
 ]
 
 [project.scripts]
