@@ -29,9 +29,10 @@ from lxml.html import HtmlElement, fromstring
 from bonds.config import Settings, get_settings
 from bonds.http import ThrottledClient
 from bonds.logging import get_logger
-from bonds.models import RbiAuctionRecord
+from bonds.models import RbiAuctionRecord, RbiAuctionResultRecord
 from bonds.quality.metrics import MetricsCollector
 from bonds.sources.base import SourceError
+from bonds.sources.rbi_auction_result import parse_auction_results
 
 logger = get_logger(__name__)
 
@@ -67,6 +68,10 @@ class RbiSource(MetricsCollector):
         self.reset_metrics()
         self._settings = settings or get_settings()
         self._client = client or ThrottledClient(self._settings.http)
+        # fetch_auctions downloads every detail page to read its date, and fetch_auction_results
+        # wants the same bodies. Cached per instance so one nightly pass costs one fetch per
+        # release rather than two; share the instance to make it one for the whole run.
+        self._detail_cache: dict[str, bytes] = {}
 
     def _raw_path(self, as_of: dt.date) -> Path:
         return self._settings.data_dir / "raw" / self.name / f"auctions_{as_of.isoformat()}.html"
@@ -96,16 +101,82 @@ class RbiSource(MetricsCollector):
         logger.info("rbi.parsed", auctions=len(enriched), with_date=dated)
         return enriched
 
+    def fetch_auction_results(
+        self, auctions: list[RbiAuctionRecord]
+    ) -> list[RbiAuctionResultRecord]:
+        """Fetch and parse the "Full Auction Result" release behind each result announcement.
+
+        Only the *full* result releases carry per-security figures; the companion "Cut-off"
+        releases are a one-line summary and the announcements are a calendar. Filtering on the
+        title (see :func:`is_full_result`) avoids a request per calendar entry.
+
+        A single unreachable release is logged and skipped rather than aborting the batch — one
+        flaky press-release page must not cost the whole day's results.
+        """
+        results: list[RbiAuctionResultRecord] = []
+        for auction in auctions:
+            if not auction.detail_url or not is_full_result(auction.title):
+                continue
+            content = self._detail_body(auction.detail_url, prid=auction.prid)
+            if content is None:
+                continue
+            path = self._settings.data_dir / "raw" / self.name / "results" / f"{auction.prid}.html"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            parsed = parse_auction_results(
+                content,
+                prid=auction.prid,
+                source=self.name,
+                auction_date=auction.auction_date,
+                auction_type=auction.auction_type,
+            )
+            self.add_metric(
+                f"result/{auction.prid}",
+                bytes_downloaded=len(content),
+                rows_extracted=len(parsed),
+                rows_parsed=len(parsed),
+            )
+            results.extend(parsed)
+        logger.info("rbi.results_parsed", securities=len(results))
+        return results
+
+    def _detail_body(self, url: str, *, prid: str) -> bytes | None:
+        """Fetch a press-release body, reusing anything already downloaded this run.
+
+        A single flaky/404 page must not abort the whole ingest, so a failure is logged and
+        returns ``None`` rather than raising.
+        """
+        if url in self._detail_cache:
+            return self._detail_cache[url]
+        try:
+            response = self._client.get(url, headers=_HEADERS)
+        except httpx.HTTPError:
+            logger.warning("rbi.detail_fetch_failed", prid=prid)
+            return None
+        self._detail_cache[url] = response.content
+        return response.content
+
     def _detail_date(self, record: RbiAuctionRecord) -> dt.date | None:
         if not record.detail_url:
             return None
-        try:
-            detail = self._client.get(record.detail_url, headers=_HEADERS)
-        except httpx.HTTPError:
-            # A single flaky/404 detail page must not abort the whole auction ingest.
-            logger.warning("rbi.detail_fetch_failed", prid=record.prid)
-            return None
-        return parse_detail_date(detail.content)
+        content = self._detail_body(record.detail_url, prid=record.prid)
+        return parse_detail_date(content) if content is not None else None
+
+
+def is_full_result(title: str) -> bool:
+    """Whether a press-release title is a *full* auction result (per-security figures).
+
+    RBI publishes two releases per auction: a "Cut-off" summary and a "Full Auction Result" with
+    the per-security table. Only the latter is worth fetching. Underwriting and buyback results
+    are excluded — they are auctions of a different thing (commission bids, repurchases) and do
+    not carry the notified/cut-off shape this parser reads.
+    """
+    lowered = title.lower()
+    if "underwriting" in lowered or "buyback" in lowered:
+        return False
+    return "full auction result" in lowered or (
+        "auction result" in lowered and "cut-off" not in lowered and "cut off" not in lowered
+    )
 
 
 def parse_index(content: bytes, *, source: str) -> list[RbiAuctionRecord]:

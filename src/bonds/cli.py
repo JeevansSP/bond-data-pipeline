@@ -26,19 +26,23 @@ from bonds.config import get_settings
 from bonds.logging import configure_logging, get_logger
 from bonds.pipelines import (
     BseCorporateTradePipeline,
+    LiquidityPipeline,
     NseBondReportPipeline,
     NseCorporateTradePipeline,
     PipelineResult,
     PublicIssuePipeline,
     RbiAuctionPipeline,
+    RbiAuctionResultPipeline,
     RunStatus,
     SovereignValuationPipeline,
+    SpreadMatrixPipeline,
     TradePipeline,
     UniversePipeline,
     YieldCurvePipeline,
 )
 from bonds.pipelines.catchup import DEFAULT_MAX_GAP_DAYS, catch_up
 from bonds.pipelines.enrichment import EnrichmentPipeline
+from bonds.pipelines.spread_matrix import DEFAULT_LOOKBACK_DAYS
 from bonds.pipelines.suite import StepOutcome, default_suite, summarize
 from bonds.pipelines.universe import UniverseFetcher
 from bonds.quality.assessment import AssessmentReport, run_assessment
@@ -308,7 +312,9 @@ def ingest_nse_trades(
     _init_logging()
     day = _day(as_of)
     result = TradePipeline(
-        Database(), source=NseSource(), derive_securities=derive_nse_securities
+        Database(),
+        source=NseSource(),
+        derive_securities=derive_nse_securities,
     ).run(day)
     _summarise([result], label=f"nse-trades {day.isoformat()}")
 
@@ -527,6 +533,90 @@ def backfill_corporate_trades(
         typer.echo(f"backfill {first}..{last}: nothing to do (check --exchange)")
         return
     _summarise(results, label=f"corporate-trades backfill {first}..{last}")
+
+
+@ingest_app.command("liquidity")
+def ingest_liquidity(
+    as_of: Annotated[
+        dt.datetime | None,
+        typer.Option(formats=["%Y-%m-%d"], help="As-of business date (default: today)."),
+    ] = None,
+) -> None:
+    """Recompute per-ISIN traded-liquidity metrics (15-day cap + active-market verdicts)."""
+    _init_logging()
+    day = _day(as_of)
+    result = LiquidityPipeline(Database()).run(day)
+    _summarise([result], label=f"liquidity {day.isoformat()}")
+
+
+@ingest_app.command("liquidity-backfill")
+def backfill_liquidity(
+    start: Annotated[
+        dt.datetime, typer.Option(formats=["%Y-%m-%d"], help="Start date (inclusive).")
+    ],
+    end: Annotated[dt.datetime, typer.Option(formats=["%Y-%m-%d"], help="End date (inclusive).")],
+) -> None:
+    """Recompute liquidity metrics for every business day in a range (point-in-time history)."""
+    _init_logging()
+    first, last = _date_range(start, end)
+    pipeline = LiquidityPipeline(Database())
+    results = [pipeline.run(day) for day in business_days(first, last)]
+    if not results:
+        typer.echo(f"backfill {first}..{last}: no business days in range — nothing to do")
+        return
+    _summarise(results, label=f"liquidity backfill {first}..{last}")
+
+
+@ingest_app.command("spread-matrix")
+def ingest_spread_matrix(
+    quote_date: Annotated[
+        dt.datetime | None,
+        typer.Option(formats=["%Y-%m-%d"], help="Quote date (default: today)."),
+    ] = None,
+    lookback_days: Annotated[
+        int, typer.Option(help="Trailing window of prints per cell.")
+    ] = DEFAULT_LOOKBACK_DAYS,
+) -> None:
+    """Recompute the trade-derived corporate spread matrix (rating x tenor)."""
+    _init_logging()
+    day = _day(quote_date)
+    result = SpreadMatrixPipeline(Database(), lookback_days=lookback_days).run(day)
+    _summarise([result], label=f"spread-matrix {day.isoformat()}")
+
+
+@ingest_app.command("spread-matrix-backfill")
+def backfill_spread_matrix(
+    start: Annotated[
+        dt.datetime, typer.Option(formats=["%Y-%m-%d"], help="Start date (inclusive).")
+    ],
+    end: Annotated[dt.datetime, typer.Option(formats=["%Y-%m-%d"], help="End date (inclusive).")],
+    lookback_days: Annotated[
+        int, typer.Option(help="Trailing window of prints per cell.")
+    ] = DEFAULT_LOOKBACK_DAYS,
+) -> None:
+    """Recompute the spread matrix for every business day in a range."""
+    _init_logging()
+    first, last = _date_range(start, end)
+    pipeline = SpreadMatrixPipeline(Database(), lookback_days=lookback_days)
+    results = [pipeline.run(day) for day in business_days(first, last)]
+    if not results:
+        typer.echo(f"backfill {first}..{last}: no business days in range — nothing to do")
+        return
+    _summarise(results, label=f"spread-matrix backfill {first}..{last}")
+
+
+@ingest_app.command("rbi-auction-results")
+def ingest_rbi_auction_results(
+    as_of: Annotated[
+        dt.datetime | None,
+        typer.Option(formats=["%Y-%m-%d"], help="Snapshot date (default: today)."),
+    ] = None,
+) -> None:
+    """Ingest per-security RBI auction outcomes (notified/accepted amounts, cut-off yields)."""
+    _init_logging()
+    day = _day(as_of)
+    result = RbiAuctionResultPipeline(Database()).run(day)
+    _summarise([result], label=f"rbi-auction-results {day.isoformat()}")
 
 
 if __name__ == "__main__":

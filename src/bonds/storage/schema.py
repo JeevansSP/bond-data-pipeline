@@ -5,6 +5,8 @@ Tables:
     security_attribute_history  SCD-2 effective-dated attribute changes, e.g. rating (pillar 2).
     valuations                  Daily per-ISIN price/YTM history, append-only/bitemporal (pillar 3).
     ingestion_runs              Audit log of every pipeline run.
+    security_liquidity          Derived per-ISIN traded-liquidity metrics as at a business date.
+    corporate_spread_matrix     Derived daily rating x tenor spread grid, from actual prints.
 """
 
 from __future__ import annotations
@@ -359,5 +361,128 @@ class DataQualityCheck(Base):
     observed: Mapped[float | None] = mapped_column(Float)
     detail: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class SecurityLiquidity(Base):
+    """Per-ISIN traded-liquidity metrics as at one business date.
+
+    Derived, not ingested: recomputed from ``corporate_trades`` (trade-level) and ``trades``
+    (per-session summaries) for a given as-of date. It exists as a table rather than a view
+    because every question asked of it is point-in-time — "was this instrument's market active
+    on 31 March", "was there a print within 15 days of the valuation date" — and a view keyed to
+    ``CURRENT_DATE`` cannot answer those a quarter later.
+
+    This is the dataset behind two RBI obligations: the fair-value-hierarchy active-market test
+    (trade frequency and volume per instrument, clause 4(1)) and the 15-day traded-price cap on
+    corporate valuations (clause 78(1)(i)(c)).
+    """
+
+    __tablename__ = "security_liquidity"
+    __table_args__ = (
+        CheckConstraint(
+            "days_since_trade IS NULL OR days_since_trade >= 0",
+            name="ck_liquidity_days_since_trade",
+        ),
+        Index("ix_security_liquidity_as_of_active", "as_of_date", "active_market"),
+    )
+
+    isin: Mapped[str] = mapped_column(String(12), primary_key=True)
+    as_of_date: Mapped[dt.date] = mapped_column(Date, primary_key=True, index=True)
+    instrument_type: Mapped[str] = mapped_column(String(12), index=True)
+    last_trade_date: Mapped[dt.date | None] = mapped_column(Date)
+    days_since_trade: Mapped[int | None] = mapped_column(Integer)
+    last_price: Mapped[float | None] = mapped_column(Float)
+    last_yield: Mapped[float | None] = mapped_column(Float)
+    prints_1m: Mapped[int] = mapped_column(Integer, default=0)
+    prints_3m: Mapped[int] = mapped_column(Integer, default=0)
+    prints_12m: Mapped[int] = mapped_column(Integer, default=0)
+    days_traded_1m: Mapped[int] = mapped_column(Integer, default=0)
+    days_traded_3m: Mapped[int] = mapped_column(Integer, default=0)
+    days_traded_12m: Mapped[int] = mapped_column(Integer, default=0)
+    turnover_1m: Mapped[float | None] = mapped_column(Float)
+    turnover_3m: Mapped[float | None] = mapped_column(Float)
+    turnover_12m: Mapped[float | None] = mapped_column(Float)
+    traded_within_15d: Mapped[bool] = mapped_column(Boolean, default=False)
+    active_market: Mapped[bool] = mapped_column(Boolean, default=False)
+    computed_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class CorporateSpreadPoint(Base):
+    """One (rating, tenor bucket) cell of the daily corporate spread matrix.
+
+    FIMMDA publishes the market's reference spread matrix, but its spreads are poll-derived down
+    to AA- and, below that, fixed for three months from a trailing three-month traded level. This
+    table is the same grid computed from actual prints in ``corporate_trades`` — trade-weighted
+    yield in the cell, minus the G-Sec par yield at the cell's tenor.
+
+    Thin cells are kept rather than suppressed: ``trade_count`` and ``isin_count`` are the
+    caller's basis for deciding whether a cell is usable, and a silently-absent cell is
+    indistinguishable from a cell nobody computed.
+    """
+
+    __tablename__ = "corporate_spread_matrix"
+    __table_args__ = (
+        UniqueConstraint("quote_date", "rating", "tenor_bucket", name="uq_corp_spread_cell"),
+        CheckConstraint("tenor_bucket > 0", name="ck_corp_spread_tenor_positive"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    quote_date: Mapped[dt.date] = mapped_column(Date, index=True)
+    rating: Mapped[str] = mapped_column(String(8), index=True)
+    tenor_bucket: Mapped[float] = mapped_column(Float)
+    trade_count: Mapped[int] = mapped_column(Integer)
+    isin_count: Mapped[int] = mapped_column(Integer)
+    notional_lakh: Mapped[float | None] = mapped_column(Float)
+    wavg_yield_pct: Mapped[float] = mapped_column(Float)
+    median_yield_pct: Mapped[float | None] = mapped_column(Float)
+    cg_yield_pct: Mapped[float] = mapped_column(Float)
+    spread_bp: Mapped[float] = mapped_column(Float)
+    lookback_days: Mapped[int] = mapped_column(Integer)
+    computed_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class RbiAuctionResult(Base):
+    """One security's outcome in an RBI auction, from a "Full Auction Result" press release.
+
+    ``rbi_auctions`` records that an auction was announced; this records what it cleared at.
+    Keyed on (prid, security) because one release covers every security in that day's auction —
+    two G-Sec lines, three T-Bill tenors, or thirty state loans.
+
+    The cut-off is the primary-market pricing reference: the level at which the sovereign
+    actually placed paper on the day, against which the secondary curve in ``yield_curves`` and
+    the marks in ``valuations`` can be judged.
+    """
+
+    __tablename__ = "rbi_auction_results"
+    __table_args__ = (
+        CheckConstraint(
+            "notified_amount_cr IS NULL OR notified_amount_cr >= 0",
+            name="ck_auction_result_notified_non_negative",
+        ),
+    )
+
+    prid: Mapped[str] = mapped_column(String(16), primary_key=True)
+    security: Mapped[str] = mapped_column(String(80), primary_key=True)
+    source: Mapped[str] = mapped_column(String(32))
+    auction_date: Mapped[dt.date | None] = mapped_column(Date, index=True)
+    auction_type: Mapped[str | None] = mapped_column(String(24), index=True)
+    tenor_note: Mapped[str | None] = mapped_column(Text)
+    notified_amount_cr: Mapped[float | None] = mapped_column(Float)
+    bids_received_count: Mapped[int | None] = mapped_column(Integer)
+    bids_received_amount_cr: Mapped[float | None] = mapped_column(Float)
+    bids_accepted_count: Mapped[int | None] = mapped_column(Integer)
+    bids_accepted_amount_cr: Mapped[float | None] = mapped_column(Float)
+    cut_off_price: Mapped[float | None] = mapped_column(Float)
+    cut_off_yield: Mapped[float | None] = mapped_column(Float)
+    wavg_price: Mapped[float | None] = mapped_column(Float)
+    wavg_yield: Mapped[float | None] = mapped_column(Float)
+    partial_allotment_pct: Mapped[float | None] = mapped_column(Float)
+    loaded_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

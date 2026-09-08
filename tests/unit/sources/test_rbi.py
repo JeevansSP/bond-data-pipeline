@@ -94,6 +94,7 @@ def test_detail_date_survives_http_error() -> None:
 
     src = RbiSource.__new__(RbiSource)
     src._client = MagicMock()
+    src._detail_cache = {}  # bypassing __init__ means the body cache must be set up by hand
     req = httpx.Request("GET", "https://www.rbi.org.in/x")
     src._client.get.side_effect = httpx.HTTPStatusError(
         "404", request=req, response=httpx.Response(404, request=req)

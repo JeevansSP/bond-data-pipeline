@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 from typing import Any, ClassVar
 
@@ -9,10 +10,26 @@ import pytest
 
 from bonds.pipelines import catchup
 from bonds.pipelines.base import PipelineResult, RunStatus
-from bonds.pipelines.catchup import bounded_start, catch_up, dataset_start
+from bonds.pipelines.catchup import (
+    bounded_start,
+    catch_up,
+    cdsl_snapshot_due,
+    dataset_start,
+    latest_half_yearly_snapshot,
+)
 from bonds.storage.repositories import DatasetProgress
 
 AS_OF = dt.date(2026, 7, 17)
+
+# Source instances handed to each fake pipeline, so instance sharing can be asserted.
+_SOURCES_SEEN: dict[str, list[Any]] = {}
+
+
+class _FakeDatabase:
+    """Stands in for Database: session() yields a placeholder, no engine required."""
+
+    def session(self) -> Any:
+        return contextlib.nullcontext(object())
 
 
 @pytest.mark.parametrize(
@@ -103,8 +120,16 @@ def _backfill_pipeline(label: str, calls: dict[str, list[tuple[dt.date, dt.date]
 class _FakeTradePipeline:
     runs: ClassVar[dict[str, list[dt.date]]] = {}
 
-    def __init__(self, database: Any, *, source: Any, derive_securities: Any = None) -> None:
+    def __init__(
+        self,
+        database: Any,
+        *,
+        source: Any,
+        derive_securities: Any = None,
+        date_series: bool = True,
+    ) -> None:
         self._name = type(source).__name__
+        self.date_series = date_series
 
     def run(self, day: dt.date) -> PipelineResult:
         self.runs.setdefault(self._name, []).append(day)
@@ -113,12 +138,14 @@ class _FakeTradePipeline:
 
 def _snapshot_pipeline(label: str, runs: dict[str, list[dt.date]]) -> type:
     class _Fake:
-        def __init__(self, database: Any) -> None:
-            pass
+        def __init__(self, database: Any, *, source: Any = None) -> None:
+            # UniversePipeline serves two connectors: BondCentral daily and CDSL half-yearly.
+            self._label = label if source is None else f"{label}_{type(source).__name__}"
+            _SOURCES_SEEN.setdefault(self._label, []).append(source)
 
         def run(self, day: dt.date) -> PipelineResult:
-            runs.setdefault(label, []).append(day)
-            return PipelineResult(day, label, RunStatus.SUCCESS, rows=1)
+            runs.setdefault(self._label, []).append(day)
+            return PipelineResult(day, self._label, RunStatus.SUCCESS, rows=1)
 
     return _Fake
 
@@ -135,6 +162,7 @@ def orchestration(
     """Patch every pipeline catch_up() constructs with call-recording fakes."""
     snapshot_runs: dict[str, list[dt.date]] = {}
     _FakeTradePipeline.runs = {}
+    _SOURCES_SEEN.clear()
     monkeypatch.setattr(
         catchup, "SovereignValuationPipeline", _backfill_pipeline("fbil_vals", backfill_calls)
     )
@@ -157,6 +185,16 @@ def orchestration(
     )
     monkeypatch.setattr(
         catchup, "RbiAuctionPipeline", _snapshot_pipeline("rbi_auctions", snapshot_runs)
+    )
+    monkeypatch.setattr(catchup, "cdsl_snapshot_due", lambda db, *, as_of: None)
+    monkeypatch.setattr(
+        catchup, "RbiAuctionResultPipeline", _snapshot_pipeline("rbi_results", snapshot_runs)
+    )
+    monkeypatch.setattr(
+        catchup, "LiquidityPipeline", _snapshot_pipeline("liquidity", snapshot_runs)
+    )
+    monkeypatch.setattr(
+        catchup, "SpreadMatrixPipeline", _snapshot_pipeline("spread_matrix", snapshot_runs)
     )
     return snapshot_runs
 
@@ -209,13 +247,17 @@ def test_catch_up_gap_fills_series_and_refreshes_snapshots(
     assert orchestration == {
         "universe": [AS_OF],
         "public_issues": [AS_OF],
-        "rbi_auctions": [AS_OF],
+        "rbi_auctions_RbiSource": [AS_OF],
+        "rbi_results_RbiSource": [AS_OF],
+        # Derived products recompute for as_of *after* the tapes above are current.
+        "liquidity": [AS_OF],
+        "spread_matrix": [AS_OF],
     }
     assert _FakeTradePipeline.runs["NseSource"] == [AS_OF]
     # The report flattens all group results.
     assert report.as_of == AS_OF
-    # 5 backfills + 3 ccil days + 2 cbm days + 4 snapshots
-    assert len(report.results) == 5 + 3 + 2 + 4
+    # 5 backfills + 3 ccil days + 2 cbm days + 7 snapshot/derived runs
+    assert len(report.results) == 5 + 3 + 2 + 7
 
 
 def test_catch_up_with_nothing_to_gap_fill_still_refreshes_snapshots(
@@ -242,4 +284,126 @@ def test_catch_up_with_nothing_to_gap_fill_still_refreshes_snapshots(
     assert report.groups["Corp trades (trade-level) · NSE"] == []
     assert report.groups["Corp trades (daily archive) · NSE"] == []
     assert report.groups["Bond master · NSE report"] == []
-    assert len(report.results) == 4  # snapshots only
+    assert len(report.results) == 7  # snapshot + derived runs only
+
+
+@pytest.mark.parametrize(
+    ("as_of", "expected"),
+    [
+        # Between snapshots -> the 31-Mar one is the latest due.
+        (dt.date(2026, 9, 7), dt.date(2026, 3, 31)),
+        # On the report date itself.
+        (dt.date(2026, 9, 30), dt.date(2026, 9, 30)),
+        (dt.date(2026, 10, 1), dt.date(2026, 9, 30)),
+        # The day before 31-Mar still points at last September.
+        (dt.date(2026, 3, 30), dt.date(2025, 9, 30)),
+        (dt.date(2026, 3, 31), dt.date(2026, 3, 31)),
+        # Early January reaches back across the year boundary.
+        (dt.date(2026, 1, 5), dt.date(2025, 9, 30)),
+    ],
+)
+def test_latest_half_yearly_snapshot(as_of: dt.date, expected: dt.date) -> None:
+    assert latest_half_yearly_snapshot(as_of) == expected
+
+
+class _FakeResult:
+    def __init__(self, value: int) -> None:
+        self._value = value
+
+    def scalar_one(self) -> int:
+        return self._value
+
+
+class _CountingDatabase:
+    """Stands in for Database: session().execute() reports how many successful loads exist."""
+
+    def __init__(self, successful_loads: int) -> None:
+        self._successful_loads = successful_loads
+
+    def session(self) -> Any:
+        outer = self
+
+        class _Session:
+            def execute(self, *_a: Any, **_k: Any) -> _FakeResult:
+                return _FakeResult(outer._successful_loads)
+
+            def __enter__(self) -> Any:
+                return self
+
+            def __exit__(self, *_a: Any) -> None:
+                return None
+
+        return _Session()
+
+
+@pytest.mark.parametrize(
+    ("successful_loads", "expected"),
+    [
+        # Never loaded successfully -> the latest due snapshot.
+        (0, dt.date(2026, 3, 31)),
+        # Already loaded -> nothing to do for six months.
+        (1, None),
+    ],
+)
+def test_cdsl_snapshot_due(successful_loads: int, expected: dt.date | None) -> None:
+    db = _CountingDatabase(successful_loads)
+    assert cdsl_snapshot_due(db, as_of=dt.date(2026, 9, 7)) == expected  # type: ignore[arg-type]
+
+
+def test_a_skipped_cdsl_attempt_stays_due() -> None:
+    """Regression: an unpublished report date must remain due after being skipped.
+
+    The check originally keyed on ``dataset_progress().processed_through``, which is the newest
+    run_date with a success **or a skip**. CDSL posts the 31-Mar/30-Sep file days late, so the
+    first attempt recorded SKIPPED at the snapshot's own run_date, advanced that anchor to the
+    snapshot, and every later night then saw "already processed" — missing the file for six
+    months, the exact staleness the scheduling was added to fix. Keying on a *successful* load
+    is what makes the retry real, and a skip count of zero successes proves it.
+    """
+    db = _CountingDatabase(0)
+    assert cdsl_snapshot_due(db, as_of=dt.date(2026, 9, 7)) == dt.date(2026, 3, 31)  # type: ignore[arg-type]
+
+
+def test_catch_up_runs_the_due_cdsl_snapshot(
+    orchestration: dict[str, list[dt.date]],
+    backfill_calls: dict[str, list[tuple[dt.date, dt.date]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = dt.date(2026, 3, 31)
+    monkeypatch.setattr(catchup, "cdsl_snapshot_due", lambda db, *, as_of: snapshot)
+    monkeypatch.setattr(
+        catchup,
+        "series_start",
+        lambda db, source, *, as_of, max_gap_days, **kw: AS_OF + dt.timedelta(days=1),
+    )
+
+    report = catch_up(object(), as_of=AS_OF)  # type: ignore[arg-type]
+
+    # The CDSL snapshot runs for its own report date, not for as_of.
+    assert orchestration["universe_CdslSource"] == [snapshot]
+    assert orchestration["universe"] == [AS_OF]
+    assert len(report.groups["Amount outstanding · CDSL"]) == 1
+
+
+def test_both_rbi_pipelines_share_one_source(
+    orchestration: dict[str, list[dt.date]],
+    backfill_calls: dict[str, list[tuple[dt.date, dt.date]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both RBI pipelines must be handed the same connector instance.
+
+    Each sweeps the same undated press-release index and then fetches every entry's detail page.
+    The source caches those bodies per instance, so sharing it is what turns three passes over
+    rbi.org.in per release into one; two instances would silently restore the duplicate traffic.
+    """
+    monkeypatch.setattr(
+        catchup,
+        "series_start",
+        lambda db, source, *, as_of, max_gap_days, **kw: AS_OF + dt.timedelta(days=1),
+    )
+
+    catch_up(object(), as_of=AS_OF)  # type: ignore[arg-type]
+
+    calendar = _SOURCES_SEEN["rbi_auctions_RbiSource"][0]
+    results = _SOURCES_SEEN["rbi_results_RbiSource"][0]
+    assert calendar is results

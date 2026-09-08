@@ -42,6 +42,8 @@ def test_run_assessment_returns_all_dimensions_no_error(db: Database) -> None:
         "Completeness",
         "Consistency",
         "Cross-source reconciliation",
+        "Freshness",
+        "Derived products",
     }
     assert not report.has_error  # the loaded warehouse is clean
 
@@ -83,6 +85,8 @@ def test_consistency_checks_report(db: Database) -> None:
         "curve_sparse_days",
         "corp_trade_price_scale_outliers",
         "corp_trade_extreme_yields",
+        "sdl_issuer_noncanonical",
+        "sovereign_instrument_isin_mismatch",
     }
     # INFO rows are observations and always pass.
     assert checks["matured_but_status_active"].passed
@@ -102,3 +106,35 @@ def test_completeness_checks_include_sovereign_face_value(db: Database) -> None:
         checks = {c.name: c for c in check_completeness(conn)}
     assert "sovereign_missing_face_value" in checks
     assert checks["sovereign_missing_face_value"].level is Level.WARN
+
+
+def test_freshness_catches_a_series_that_falls_behind(db: Database) -> None:
+    from bonds.quality.assessment import check_freshness
+
+    with db.engine.connect() as conn:
+        checks = {c.name: c for c in check_freshness(conn)}
+    # One check per daily series, plus the high-water mark and the empty-successful-day checks.
+    assert "warehouse_high_water_mark" in checks
+    assert {
+        "stale_series_valuations",
+        "stale_series_yield_curves",
+        "stale_series_trades_ccil",
+        "stale_series_trades_nse_cbm",
+        "stale_series_corp_trades_nse",
+        "stale_series_corp_trades_bse",
+    } <= set(checks)
+    # The lag is measured against the newest date anywhere in the warehouse, so a machine that
+    # was off for a week does not light up every series — only one that fell behind its siblings.
+    assert all(c.observed is not None and c.observed >= 0 for c in checks.values())
+
+
+def test_empty_successful_day_check_is_defined_per_date_series(db: Database) -> None:
+    from bonds.quality.assessment import check_freshness
+
+    with db.engine.connect() as conn:
+        names = {c.name for c in check_freshness(conn)}
+    assert {
+        "empty_successful_days_ccil_trades",
+        "empty_successful_days_nse_cbm_trades",
+        "empty_successful_days_bse_corp_trades",
+    } <= names

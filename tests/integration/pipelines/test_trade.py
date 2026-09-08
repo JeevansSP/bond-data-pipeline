@@ -74,6 +74,10 @@ def test_run_persists_trades(database: Database) -> None:
 
 
 def test_empty_session_is_success_with_zero_rows(database: Database) -> None:
+    # The pipeline cannot tell "the source published nothing" from "we already hold this day and
+    # the bitemporal upsert wrote nothing new" — both return zero rows written. Distinguishing
+    # them is the connector's job: a date-series connector raises DataUnavailable when the
+    # *source* was empty, which the pipeline records as SKIPPED and catch-up re-attempts.
     result = TradePipeline(database, source=FakeTradeSource(empty=True)).run(AS_OF)
     assert result.status is RunStatus.SUCCESS
     assert result.rows == 0
