@@ -49,8 +49,8 @@ def test_parse_maps_fields(tmp_path: Path) -> None:
     assert r.isin == "INE229U07186"
     assert r.trade_date == dt.date(2026, 7, 24)  # from Trade Date & Time
     assert r.trade_time == dt.datetime(2026, 7, 24, 9, 44)
-    assert r.seller_deal_type == "Direct"
-    assert r.buyer_deal_type == "Brokered"
+    assert r.seller_deal_type == "DIRECT"
+    assert r.buyer_deal_type == "BROKERED"
     assert r.coupon == pytest.approx(10.9)
     assert r.price == pytest.approx(100.003)
     assert r.trade_yield == pytest.approx(11.35)
@@ -59,7 +59,7 @@ def test_parse_maps_fields(tmp_path: Path) -> None:
     assert r.trade_value_lakh == pytest.approx(1.0)
     assert r.settlement_date == dt.date(2026, 7, 27)
     assert r.venue == "RFQ"
-    assert r.settlement_status == "Pending"
+    assert r.settlement_status == "PENDING"
 
 
 def test_parse_drops_rows_without_trade_time(tmp_path: Path) -> None:

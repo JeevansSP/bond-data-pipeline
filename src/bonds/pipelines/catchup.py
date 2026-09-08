@@ -10,6 +10,9 @@ invocation self-healing:
   runaway backfill.
 * **Snapshot / latest-session sources** (universe, SEBI public issues, RBI auctions, NSE trades)
   represent current state and are simply refreshed once for ``as_of``.
+* **Derived products** (liquidity metrics, corporate spread matrix) are recomputed for ``as_of``
+  after every source above has been brought current — they are windowed views of the tapes, so
+  running them first would describe yesterday's data.
 
 Every write is idempotent (``ON CONFLICT`` upserts keyed by ``(source, dataset, run_date)``), so
 re-running — whether twice in a day or after an outage — converges rather than duplicating.
@@ -21,6 +24,8 @@ import datetime as dt
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
+from sqlalchemy import func, select
+
 from bonds.calendar import business_days
 from bonds.logging import get_logger
 from bonds.pipelines.base import PipelineResult
@@ -29,22 +34,28 @@ from bonds.pipelines.corporate_trade import (
     BseCorporateTradePipeline,
     NseCorporateTradePipeline,
 )
+from bonds.pipelines.liquidity import LiquidityPipeline
 from bonds.pipelines.public_issue import PublicIssuePipeline
 from bonds.pipelines.rbi_auction import RbiAuctionPipeline
+from bonds.pipelines.rbi_auction_result import RbiAuctionResultPipeline
 from bonds.pipelines.sovereign_valuation import DEFAULT_PRODUCTS, SovereignValuationPipeline
+from bonds.pipelines.spread_matrix import SpreadMatrixPipeline
 from bonds.pipelines.trade import TradePipeline
 from bonds.pipelines.universe import UniversePipeline
 from bonds.pipelines.yield_curve import DEFAULT_CURVE_PRODUCTS, YieldCurvePipeline
 from bonds.sources.bse import BseSource
 from bonds.sources.ccil_historical import CcilHistoricalTradesSource, derive_securities
+from bonds.sources.cdsl import CdslSource
 from bonds.sources.fbil import FbilSource
 from bonds.sources.nse import NseSource
 from bonds.sources.nse import derive_securities as derive_nse_securities
 from bonds.sources.nse_bond_report import NseBondReportSource
 from bonds.sources.nse_cbm import NseCbmDailySource
 from bonds.sources.nse_trade_settlement import NseTradeSettlementSource
+from bonds.sources.rbi import RbiSource
 from bonds.storage import Database
 from bonds.storage.repositories import DatasetProgress, IngestionRunRepository
+from bonds.storage.schema import IngestionRun
 
 logger = get_logger(__name__)
 
@@ -170,6 +181,45 @@ def series_start(
     return min(starts.values())
 
 
+def latest_half_yearly_snapshot(as_of: dt.date) -> dt.date:
+    """The most recent CDSL report date (31 March / 30 September) on or before ``as_of``."""
+    year = as_of.year
+    for candidate in (dt.date(year, 9, 30), dt.date(year, 3, 31), dt.date(year - 1, 9, 30)):
+        if candidate <= as_of:
+            return candidate
+    raise AssertionError("unreachable: one of the three candidates always precedes as_of")
+
+
+def cdsl_snapshot_due(database: Database, *, as_of: dt.date) -> dt.date | None:
+    """The CDSL report date still to ingest, or ``None`` when the latest one is already in.
+
+    CDSL is a half-yearly snapshot (31-Mar / 30-Sep) so it belongs in no daily loop — but it was
+    in no loop at all: a single manual run in July 2026 loaded the 2025-09-30 file and the
+    amount-outstanding history then sat 11 months stale. Re-attempting the due snapshot every
+    night costs one request until it publishes (CDSL posts days after the report date, and an
+    unpublished date records SKIPPED), then nothing for six months.
+
+    The predicate is "has this report date ever loaded **successfully**", not the usual
+    ``processed_through``: that anchor is the newest run_date with a success *or a skip*
+    (:meth:`IngestionRunRepository.dataset_progress`), so the first attempt at an unpublished
+    date would record SKIPPED, advance the anchor to the snapshot date, and stop every later
+    night from retrying — missing the file for six months, which is exactly the staleness this
+    function exists to prevent.
+    """
+    snapshot = latest_half_yearly_snapshot(as_of)
+    with database.session() as session:
+        loaded = session.execute(
+            select(func.count())
+            .select_from(IngestionRun)
+            .where(
+                IngestionRun.dataset == f"{CdslSource.name}.universe",
+                IngestionRun.run_date == snapshot,
+                IngestionRun.status == "success",
+            )
+        ).scalar_one()
+    return None if loaded else snapshot
+
+
 def catch_up(
     database: Database, *, as_of: dt.date, max_gap_days: int = DEFAULT_MAX_GAP_DAYS
 ) -> CatchUpReport:
@@ -271,12 +321,39 @@ def catch_up(
 
     # --- snapshot / latest-session: refresh once for as_of ----------------------------------
     groups["Universe · BondCentral"] = [UniversePipeline(database).run(as_of)]
+
+    cdsl_snapshot = cdsl_snapshot_due(database, as_of=as_of)
+    logger.info("catchup.cdsl", snapshot=cdsl_snapshot.isoformat() if cdsl_snapshot else None)
+    groups["Amount outstanding · CDSL"] = (
+        [UniversePipeline(database, source=CdslSource()).run(cdsl_snapshot)]
+        if cdsl_snapshot is not None
+        else []
+    )
     groups["Public issues · SEBI"] = [PublicIssuePipeline(database).run(as_of)]
-    groups["Auctions · RBI"] = [RbiAuctionPipeline(database).run(as_of)]
-    groups["Corp trades · NSE"] = [
-        TradePipeline(database, source=NseSource(), derive_securities=derive_nse_securities).run(
-            as_of
-        )
+    # One source instance for both RBI pipelines. Each sweeps the same undated press-release
+    # index and then fetches every entry's detail page; sharing the instance (which caches those
+    # bodies) turns three passes over rbi.org.in per release into one.
+    rbi_source = RbiSource()
+    groups["Auctions · RBI"] = [RbiAuctionPipeline(database, source=rbi_source).run(as_of)]
+    # The index is not date-scoped, so it always lists the most recent full results: this
+    # normally succeeds and re-upserts the same releases rather than skipping. That is the point
+    # — a correction reposted by RBI is picked up — and the upsert makes it idempotent.
+    groups["Auction results · RBI"] = [
+        RbiAuctionResultPipeline(database, source=rbi_source).run(as_of)
     ]
+    groups["Corp trades · NSE"] = [
+        TradePipeline(
+            database,
+            source=NseSource(),
+            derive_securities=derive_nse_securities,
+        ).run(as_of)
+    ]
+
+    # --- derived products: recomputed from the tapes above, so they run last ----------------
+    # Both are windowed views of the trade tapes rather than ingests, so there is no gap to fill:
+    # recomputing for as_of is the whole job, and it must happen after the tapes are current or
+    # the metrics describe yesterday's data.
+    groups["Liquidity metrics · derived"] = [LiquidityPipeline(database).run(as_of)]
+    groups["Spread matrix · derived"] = [SpreadMatrixPipeline(database).run(as_of)]
 
     return CatchUpReport(as_of=as_of, groups=groups)

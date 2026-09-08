@@ -31,6 +31,7 @@ from bonds.logging import get_logger
 from bonds.models import InstrumentType, SovereignValuation, YieldCurvePoint
 from bonds.quality.metrics import MetricsCollector
 from bonds.sources.base import DataUnavailable, SourceError
+from bonds.states import is_state_sovereign_isin
 
 logger = get_logger(__name__)
 
@@ -367,8 +368,15 @@ def _row_to_valuation(
     isin = _cell(row, columns.get("isin"))
     if not isinstance(isin, str) or len(isin.strip()) != 12 or not isin.strip().startswith("IN"):
         return None
+    isin = isin.strip()
+    if instrument is not InstrumentType.SDL and is_state_sovereign_isin(isin):
+        # Pre-Feb-2023 combined workbooks carry state UDAY and SDL-SPL bonds on the G-Sec
+        # workbook's "Special" sheet, whose title maps to GSEC. The ISIN form is structural, so
+        # it outranks the sheet title: without this, state paper lands in the central bucket
+        # (233 such securities were mislabelled before this guard).
+        instrument = InstrumentType.SDL
     return SovereignValuation(
-        isin=isin.strip(),
+        isin=isin,
         quote_date=date,
         instrument_type=instrument,
         source=source,

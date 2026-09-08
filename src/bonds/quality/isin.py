@@ -17,9 +17,22 @@ from typing import Final
 _ISIN_RE: Final = re.compile(r"[A-Z]{2}[A-Z0-9]{9}[0-9]")
 
 
+def has_isin_shape(isin: str) -> bool:
+    """Return ``True`` if ``isin`` has the ISO 6166 *shape* (ignoring the check digit).
+
+    Separated from the check digit deliberately. Every identifier our sources publish has the
+    right shape; the ones that fail validation fail only on the check digit, and they are real
+    securities as published (FBIL prints ``IN1520250085``, NSE prints ``INEO81J07036`` with a
+    letter O for a zero). Rejecting those would drop tradeable paper from the master, so a shape
+    violation — truncation, lowercase, junk characters, a garbled column — is the ERROR, and a
+    bad check digit is a WARN we surface with the offending identifiers.
+    """
+    return len(isin) == 12 and _ISIN_RE.fullmatch(isin) is not None
+
+
 def is_valid_isin(isin: str) -> bool:
     """Return ``True`` if ``isin`` is 12 chars with a correct ISO 6166 check digit."""
-    if len(isin) != 12 or not _ISIN_RE.fullmatch(isin):
+    if not has_isin_shape(isin):
         return False
     expanded = "".join(str(ord(c) - 55) if c.isalpha() else c for c in isin)
     total = 0

@@ -73,6 +73,73 @@ def normalize_interest_type(raw: str | None) -> str | None:
     return _INTEREST_TYPE_CANONICAL.get(key, "OTHER")
 
 
+# --- corporate-trade categorical vocabularies -----------------------------------------------
+# NSE and BSE publish the same categories in different casings and abbreviations — "Listed" and
+# "LISTED", "Direct" and "DIRECT", "IST" and "Inter Scheme Transfer" — so the raw columns
+# fragment into twice as many values as there are real states. Normalising at the model boundary
+# (as :func:`normalize_interest_type` already does for the master) keeps every source on one
+# vocabulary no matter which connector wrote the row.
+_DEAL_TYPE_CANONICAL: Final[dict[str, str]] = {
+    "direct": "DIRECT",
+    "brokered": "BROKERED",
+    "ist": "INTER_SCHEME_TRANSFER",
+    "inter scheme transfer": "INTER_SCHEME_TRANSFER",
+    "buyback": "BUYBACK",
+    "buy back": "BUYBACK",
+}
+_LISTED_CANONICAL: Final[dict[str, str]] = {
+    "listed": "LISTED",
+    "unlisted": "UNLISTED",
+    "y": "LISTED",
+    "n": "UNLISTED",
+}
+_SETTLEMENT_STATUS_CANONICAL: Final[dict[str, str]] = {
+    "settled": "SETTLED",
+    "not settled": "NOT_SETTLED",
+    "unsettled": "NOT_SETTLED",
+    "pending": "PENDING",
+    "rejected": "REJECTED",
+}
+
+
+def _canonicalize(raw: str | None, vocabulary: dict[str, str]) -> str | None:
+    """Map a raw source value onto ``vocabulary``, or ``OTHER`` when unrecognised.
+
+    Case-insensitive, whitespace-collapsed. An unknown non-empty value becomes ``OTHER`` rather
+    than raising: a new source spelling must never break ingestion, and the DQ vocabulary checks
+    surface the ``OTHER`` count.
+    """
+    if raw is None:
+        return None
+    key = " ".join(raw.split()).lower()
+    if not key:
+        return None
+    return vocabulary.get(key, "OTHER")
+
+
+def normalize_deal_type(raw: str | None) -> str | None:
+    """Normalize a published deal type to the canonical vocabulary.
+
+    One of ``DIRECT``, ``BROKERED``, ``INTER_SCHEME_TRANSFER``, ``BUYBACK`` or ``OTHER``;
+    ``None`` stays ``None``.
+    """
+    return _canonicalize(raw, _DEAL_TYPE_CANONICAL)
+
+
+def normalize_listed(raw: str | None) -> str | None:
+    """Normalize a listing flag to ``LISTED``/``UNLISTED``/``OTHER`` (``None`` stays ``None``)."""
+    return _canonicalize(raw, _LISTED_CANONICAL)
+
+
+def normalize_settlement_status(raw: str | None) -> str | None:
+    """Normalize a settlement status to the canonical vocabulary.
+
+    One of ``SETTLED``, ``NOT_SETTLED``, ``PENDING``, ``REJECTED`` or ``OTHER``; ``None``
+    stays ``None``.
+    """
+    return _canonicalize(raw, _SETTLEMENT_STATUS_CANONICAL)
+
+
 class InstrumentType(StrEnum):
     """Bond instrument classification used across the universe."""
 
@@ -158,6 +225,24 @@ class CorporateTradeRecord(BaseModel):
     """Reporting venue flag: ``RFQ`` vs ``OTC``/``Reported``."""
     remarks: str | None = None
 
+    @field_validator("deal_type", "seller_deal_type", "buyer_deal_type")
+    @classmethod
+    def _deal_type_canonical(cls, v: str | None) -> str | None:
+        """Normalize to the canonical deal-type vocabulary (see :func:`normalize_deal_type`)."""
+        return normalize_deal_type(v)
+
+    @field_validator("listed")
+    @classmethod
+    def _listed_canonical(cls, v: str | None) -> str | None:
+        """Normalize to ``LISTED``/``UNLISTED`` (see :func:`normalize_listed`)."""
+        return normalize_listed(v)
+
+    @field_validator("settlement_status")
+    @classmethod
+    def _settlement_status_canonical(cls, v: str | None) -> str | None:
+        """Normalize to the canonical settlement vocabulary."""
+        return normalize_settlement_status(v)
+
     @field_validator("price")
     @classmethod
     def _price_positive_or_none(cls, v: float | None) -> float | None:
@@ -226,6 +311,48 @@ class RbiAuctionRecord(BaseModel):
     auction_date: dt.date | None = None
     detail_url: str | None = None
     pdf_url: str | None = None
+
+
+class RbiAuctionResultRecord(BaseModel):
+    """One security's outcome in an RBI auction, from a "Full Auction Result" press release.
+
+    The announcement (:class:`RbiAuctionRecord`) is a calendar entry; this is what actually
+    happened — notified versus accepted amount, and the cut-off the auction cleared at, which is
+    the primary-market pricing reference the secondary curve is judged against.
+
+    Every financial field is optional because the three result layouts publish different subsets:
+    G-Sec and T-Bill releases give a cut-off *price* with the yield in a parenthetical, SDL
+    releases give cut-off yield and price as separate rows, and only T-Bill releases carry a
+    weighted-average line.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    prid: str
+    security: str
+    """Security label as published ("New GS 2031", "91-Day", "ASSAM SGS 2046")."""
+    source: str
+    auction_date: dt.date | None = None
+    auction_type: str | None = None
+    tenor_note: str | None = None
+    """As-published tenor text, e.g. "Re-issue of 7.62% ASSAM SGS 2046" or "25 -Years"."""
+    notified_amount_cr: float | None = None
+    bids_received_count: int | None = None
+    bids_received_amount_cr: float | None = None
+    bids_accepted_count: int | None = None
+    bids_accepted_amount_cr: float | None = None
+    cut_off_price: float | None = None
+    cut_off_yield: float | None = None
+    wavg_price: float | None = None
+    wavg_yield: float | None = None
+    partial_allotment_pct: float | None = None
+
+    @property
+    def bid_cover_ratio(self) -> float | None:
+        """Bids received over amount notified — the auction's demand signal."""
+        if not self.notified_amount_cr or self.bids_received_amount_cr is None:
+            return None
+        return self.bids_received_amount_cr / self.notified_amount_cr
 
 
 class PublicIssueRecord(BaseModel):

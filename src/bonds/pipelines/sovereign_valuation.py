@@ -23,6 +23,7 @@ from bonds.models import InstrumentType, SecurityRecord, SovereignValuation
 from bonds.pipelines.base import PipelineResult, execute_run, persist_file_metrics
 from bonds.quality import QualityInspector
 from bonds.sources.fbil import FbilSource
+from bonds.states import sdl_issuer
 from bonds.storage import Database
 from bonds.storage.repositories import SecurityRepository, ValuationRepository
 
@@ -83,7 +84,11 @@ class SovereignValuationPipeline:
             return rows
 
         return execute_run(
-            self._db, source=self._source.name, dataset=dataset, run_date=date, work=work
+            self._db,
+            source=self._source.name,
+            dataset=dataset,
+            run_date=date,
+            work=work,
         )
 
     @staticmethod
@@ -121,14 +126,14 @@ def _to_security(v: SovereignValuation) -> SecurityRecord:
 def _sovereign_issuer(v: SovereignValuation) -> str | None:
     """Derive the issuer: GoI for G-Secs; the issuing state (from the description) for SDLs.
 
-    An SDL whose description doesn't carry the expected state code yields ``None`` — an unknown
+    An SDL whose description doesn't carry a recognisable state yields ``None`` — an unknown
     issuer, never a wrong "Government of India".
+
+    The state vocabulary is shared with the CCIL connector (:mod:`bonds.states`). It has to be:
+    this pipeline previously emitted the raw two-letter code from the description while CCIL
+    normalised to full state names, so the same issuer arrived under two spellings and the
+    master fragmented into 63 issuer strings for ~31 states.
     """
     if v.instrument_type is InstrumentType.SDL:
-        if v.description:
-            # SDL descriptions look like "07.83 GJ SDL 2026" -> state code is the 2nd token.
-            parts = v.description.split()
-            if len(parts) >= 2 and len(parts[1]) == 2 and parts[1].isalpha():
-                return f"State Government ({parts[1].upper()})"
-        return None
+        return sdl_issuer(v.description)
     return "Government of India"

@@ -11,13 +11,14 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from bonds.models import (
+    InstrumentType,
     PublicIssueRecord,
     RbiAuctionRecord,
     SecurityRecord,
     SovereignValuation,
     TradeRecord,
 )
-from bonds.quality.isin import is_valid_isin
+from bonds.quality.isin import has_isin_shape, is_valid_isin
 
 # --- thresholds (tunable) -------------------------------------------------------------------
 PRICE_MIN, PRICE_MAX = 50.0, 200.0
@@ -26,6 +27,10 @@ YTM_MIN, YTM_MAX = 0.0, 25.0
 """Plausible annualised yields for INR bonds."""
 MAX_NULL_VALUE_RATE = 0.05
 """Warn if >5% of a valuation batch has a null price/YTM."""
+STRIPS_PRICE_MIN, STRIPS_PRICE_MAX = 0.5, 200.0
+"""STRIPS are zero-coupon: a long-dated principal strip legitimately prices in single rupees per
+100 face (the landed history bottoms out at 0.98), so the par band does not apply. The floor
+still catches a zero/negative price or a lost scale factor."""
 _PAR_PRICED_SEGMENTS = frozenset({"GSEC", "SDL", "TBILL"})
 """Trade segments quoted per 100 face; SGB (per gram) and STRIPS (deep discount) are excluded
 from the par-price band check."""
@@ -54,6 +59,42 @@ def _rate(count: int, total: int) -> float:
     return count / total if total else 0.0
 
 
+def _isin_checks(isins: list[str]) -> list[QualityCheck]:
+    """ERROR on malformed ISINs; WARN (with samples) on as-published bad check digits."""
+    malformed = [i for i in isins if not has_isin_shape(i)]
+    bad_digit = [i for i in isins if has_isin_shape(i) and not is_valid_isin(i)]
+    return [
+        QualityCheck(
+            "invalid_isin",
+            Level.ERROR,
+            passed=not malformed,
+            observed=float(len(malformed)),
+            detail=("e.g. " + ", ".join(sorted(malformed)[:5])) if malformed else None,
+        ),
+        QualityCheck(
+            "isin_check_digit_mismatch",
+            Level.WARN,
+            passed=not bad_digit,
+            observed=float(len(bad_digit)),
+            detail=(
+                "as-published identifiers failing the ISO 6166 check digit: "
+                + ", ".join(sorted(bad_digit)[:5])
+            )
+            if bad_digit
+            else None,
+        ),
+    ]
+
+
+def _price_out_of_band(v: SovereignValuation) -> bool:
+    """Whether a valuation's price falls outside the plausible band for its instrument."""
+    if v.price is None:
+        return False
+    if v.instrument_type is InstrumentType.STRIPS:
+        return not STRIPS_PRICE_MIN <= v.price <= STRIPS_PRICE_MAX
+    return not PRICE_MIN <= v.price <= PRICE_MAX
+
+
 def check_valuations(valuations: list[SovereignValuation]) -> list[QualityCheck]:
     """Quality checks for a batch of valuations (price/YTM sanity, ISINs, null rates)."""
     total = len(valuations)
@@ -63,18 +104,13 @@ def check_valuations(valuations: list[SovereignValuation]) -> list[QualityCheck]
     if total == 0:
         return checks
 
-    invalid_isin = sum(1 for v in valuations if not is_valid_isin(v.isin))
     null_price = sum(1 for v in valuations if v.price is None)
     null_ytm = sum(1 for v in valuations if v.ytm is None)
-    px_oob = sum(
-        1 for v in valuations if v.price is not None and not PRICE_MIN <= v.price <= PRICE_MAX
-    )
+    px_oob = sum(1 for v in valuations if _price_out_of_band(v))
     ytm_oob = sum(1 for v in valuations if v.ytm is not None and not YTM_MIN <= v.ytm <= YTM_MAX)
 
     checks += [
-        QualityCheck(
-            "invalid_isin", Level.ERROR, passed=invalid_isin == 0, observed=float(invalid_isin)
-        ),
+        *_isin_checks([v.isin for v in valuations]),
         QualityCheck(
             "null_price_rate",
             Level.WARN,
@@ -92,7 +128,8 @@ def check_valuations(valuations: list[SovereignValuation]) -> list[QualityCheck]
             Level.WARN,
             passed=px_oob == 0,
             observed=float(px_oob),
-            detail=f"outside [{PRICE_MIN}, {PRICE_MAX}]",
+            detail=f"outside [{PRICE_MIN}, {PRICE_MAX}] (STRIPS: [{STRIPS_PRICE_MIN}, "
+            f"{STRIPS_PRICE_MAX}])",
         ),
         QualityCheck(
             "ytm_out_of_range",
@@ -114,14 +151,11 @@ def check_universe(records: list[SecurityRecord], *, as_of: dt.date) -> list[Qua
     if total == 0:
         return checks
 
-    invalid_isin = sum(1 for r in records if not is_valid_isin(r.isin))
     null_maturity = sum(1 for r in records if r.maturity_date is None)
     matured = sum(1 for r in records if r.maturity_date is not None and r.maturity_date < as_of)
 
     checks += [
-        QualityCheck(
-            "invalid_isin", Level.ERROR, passed=invalid_isin == 0, observed=float(invalid_isin)
-        ),
+        *_isin_checks([r.isin for r in records]),
         # A metric, not an enforced check (no threshold) -> INFO, so it can't masquerade as a
         # warning that never fires.
         QualityCheck(
@@ -174,7 +208,6 @@ def check_trades(trades: list[TradeRecord]) -> list[QualityCheck]:
     ]
     if total == 0:
         return checks
-    invalid_isin = sum(1 for t in trades if not is_valid_isin(t.isin))
     # The [PRICE_MIN, PRICE_MAX] bound is a per-100-face coupon-bond sanity range. SGB (quoted per
     # gram of gold, ~thousands) and STRIPS (deep-discount zero-coupon, single digits) trade on a
     # different basis, so applying it to them is a false positive — scope the check to par-priced
@@ -187,9 +220,7 @@ def check_trades(trades: list[TradeRecord]) -> list[QualityCheck]:
     ytm_bearing = [t for t in trades if t.segment != "SGB"]
     yld_oob = sum(1 for t in ytm_bearing if t.lty is not None and not YTM_MIN <= t.lty <= YTM_MAX)
     checks += [
-        QualityCheck(
-            "invalid_isin", Level.ERROR, passed=invalid_isin == 0, observed=float(invalid_isin)
-        ),
+        *_isin_checks([t.isin for t in trades]),
         QualityCheck(
             "ltp_out_of_range",
             Level.WARN,

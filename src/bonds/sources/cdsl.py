@@ -27,7 +27,7 @@ from bonds.http import ThrottledClient
 from bonds.logging import get_logger
 from bonds.models import InstrumentType, SecurityRecord
 from bonds.quality.metrics import MetricsCollector
-from bonds.sources.base import SourceError
+from bonds.sources.base import DataUnavailable, SourceError
 
 logger = get_logger(__name__)
 
@@ -124,6 +124,11 @@ def parse_snapshot(content: bytes) -> ParsedSnapshot:
         if len(isin) != 12 or not isin.startswith("IN"):
             continue
         records.append(_to_record(cells))
+    if candidates == 0:
+        # CDSL serves the page shell for a report date it has not published yet (the 31-Mar /
+        # 30-Sep snapshots appear days late). That is "not available", so it must record SKIPPED
+        # and be re-attempted, not FAILED.
+        raise DataUnavailable("CDSL has not published this report date yet (no data rows)")
     if not records:
         raise SourceError("no ISIN rows found in CDSL report (layout changed?)")
     logger.info(

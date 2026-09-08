@@ -12,7 +12,7 @@ import respx
 from bonds.config import HttpSettings, Settings
 from bonds.http import ThrottledClient
 from bonds.models import InstrumentType
-from bonds.sources.base import SourceError
+from bonds.sources.base import DataUnavailable, SourceError
 from bonds.sources.cdsl import CdslSource, parse_snapshot
 
 REPORT_DATE = dt.date(2025, 9, 30)
@@ -113,8 +113,18 @@ def test_parse_snapshot_counts_funnel_rows() -> None:
     assert len(parsed.records) == 2
 
 
-def test_parse_snapshot_raises_when_no_isin_rows() -> None:
+def test_parse_snapshot_unpublished_report_is_data_unavailable() -> None:
+    # CDSL serves the page shell for a report date it hasn't published yet: no data rows at all.
+    # That must record SKIPPED and be retried, not FAILED.
     html = f"<html><body><table>{_HEADER}<tr><td>x</td></tr></table></body></html>".encode()
+    with pytest.raises(DataUnavailable):
+        list(parse_snapshot(html))
+
+
+def test_parse_snapshot_raises_when_rows_carry_no_isin() -> None:
+    # Rows of the right width but no valid ISIN column = a layout change, which must fail loudly.
+    cells = "".join("<td>x</td>" for _ in range(12))
+    html = f"<html><body><table>{_HEADER}<tr>{cells}</tr></table></body></html>".encode()
     with pytest.raises(SourceError, match="ISIN"):
         list(parse_snapshot(html))
 

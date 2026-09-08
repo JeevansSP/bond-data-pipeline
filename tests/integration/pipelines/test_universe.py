@@ -147,10 +147,18 @@ def test_quality_checks_are_persisted(database: Database) -> None:
             .all()
         )
     names = {c["check_name"] for c in checks}
-    assert {"row_count", "invalid_isin", "matured_in_universe", "row_count_drift"} <= names
-    # row_count is a real signal here; invalid_isin correctly *flags* the synthetic sentinels.
+    assert {
+        "row_count",
+        "invalid_isin",
+        "isin_check_digit_mismatch",
+        "matured_in_universe",
+        "row_count_drift",
+    } <= names
+    # row_count is a real signal here. The synthetic sentinels are well-formed ISINs with a
+    # wrong check digit, so they trip the WARN half, not the malformed-shape ERROR.
     assert next(c for c in checks if c["check_name"] == "row_count")["passed"]
-    assert not next(c for c in checks if c["check_name"] == "invalid_isin")["passed"]
+    assert next(c for c in checks if c["check_name"] == "invalid_isin")["passed"]
+    assert not next(c for c in checks if c["check_name"] == "isin_check_digit_mismatch")["passed"]
 
 
 def test_active_securities_view_excludes_matured_and_dead(database: Database) -> None:

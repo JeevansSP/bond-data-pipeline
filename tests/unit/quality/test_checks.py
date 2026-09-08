@@ -88,8 +88,22 @@ def test_check_valuations_flags_anomalies() -> None:
     assert not _find(checks, "null_price_rate").passed
 
 
-def test_check_valuations_invalid_isin_is_error() -> None:
-    checks = check_valuations([_val("IN0020160034", 100.0, 6.0)])  # bad check digit
+def test_check_valuations_bad_check_digit_is_warn_not_error() -> None:
+    # The sources publish real securities whose ISO check digit does not validate (FBIL prints
+    # IN1520250085, NSE prints INEO81J07036 with a letter O). Rejecting those would drop
+    # tradeable paper from the master, so a bad check digit warns and names the identifier.
+    checks = check_valuations([_val("IN0020160034", 100.0, 6.0)])
+    assert _find(checks, "invalid_isin").passed
+    mismatch = _find(checks, "isin_check_digit_mismatch")
+    assert mismatch.observed == 1.0
+    assert mismatch.level is Level.WARN and not mismatch.passed
+    assert mismatch.detail is not None and "IN0020160034" in mismatch.detail
+
+
+def test_check_valuations_malformed_isin_is_error() -> None:
+    # A shape violation is garbling (lowercase, a non-digit check position, a stray space in a
+    # fixed-width column), not an upstream typo.
+    checks = check_valuations([_val("IN002016003X", 100.0, 6.0)])
     invalid = _find(checks, "invalid_isin")
     assert invalid.observed == 1.0
     assert invalid.level is Level.ERROR and not invalid.passed
@@ -118,3 +132,28 @@ def test_check_universe_counts_matured() -> None:
     checks = check_universe(records, as_of=DATE)
     assert _find(checks, "matured_in_universe").observed == 1.0
     assert _find(checks, "invalid_isin").passed
+
+
+def test_strips_deep_discount_price_is_in_band() -> None:
+    # A long-dated principal STRIP legitimately prices in single rupees per 100 face (the landed
+    # history bottoms out at 0.98). The par band flagged ~1,070 such rows every night, which is
+    # exactly the sort of permanently-red warning that trains people to ignore warnings.
+    checks = check_valuations(
+        [
+            SovereignValuation(
+                isin="IN000724C022",
+                quote_date=DATE,
+                instrument_type=InstrumentType.STRIPS,
+                source="fbil",
+                price=0.98,
+                ytm=9.74,
+            )
+        ]
+    )
+    assert _find(checks, "price_out_of_range").passed
+
+
+def test_par_priced_instrument_keeps_the_tight_band() -> None:
+    # The same price on a G-Sec is implausible and must still be flagged.
+    checks = check_valuations([_val("IN0020260025", 0.98, 6.9)])
+    assert not _find(checks, "price_out_of_range").passed
