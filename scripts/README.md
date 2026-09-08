@@ -41,7 +41,15 @@ uv run bonds ingest catch-up            # or: bash scripts/run_daily_ingest.sh
 ## macOS (launchd)
 
 launchd runs a missed `StartCalendarInterval` job when the Mac next wakes or boots, so a missed
-21:00 run fires on wake and the catch-up fills the gap.
+13:00 run fires on wake and the catch-up fills the gap.
+
+The agent fires at **13:00 local**, before most sources publish (FBIL ~19:00, CCIL and BSE after
+the 17:00 close), so each run ingests the *previous* business day and the current day lands
+tomorrow. That only works because a source with nothing to give records `skipped` and is
+re-attempted — catch-up resumes from the last **successful** run, so a connector that reports
+`success` with zero rows (or that lands an empty artifact the lake then serves back) makes the
+day unreachable forever. See the warning in the plist comment; `bonds dq assess` fails on both
+signatures.
 
 ```bash
 # 0. Make sure the log directory exists — launchd does NOT create intermediate directories

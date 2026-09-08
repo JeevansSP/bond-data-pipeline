@@ -34,14 +34,14 @@ def db() -> Iterator[Database]:
     _clean()
 
 
-def _record(db: Database, dataset: str, run_date: dt.date, status: str) -> None:
+def _record(db: Database, dataset: str, run_date: dt.date, status: str, *, rows: int = 1) -> None:
     with db.session() as s:
         IngestionRunRepository(s).record(
             source=SOURCE,
             dataset=dataset,
             run_date=run_date,
             status=status,
-            rows=1,
+            rows=rows,
             started_at=dt.datetime.now(dt.UTC),
         )
 
@@ -148,3 +148,32 @@ def test_series_start_gives_new_expected_dataset_the_full_window(db: Database) -
         expected_datasets=[f"{SOURCE}.gsec", f"{SOURCE}.newproduct"],
     )
     assert start == AS_OF - dt.timedelta(days=30)
+
+
+def test_zero_row_success_is_not_sticky(db: Database) -> None:
+    # A success that ingested nothing has no rows to protect, and letting it stick is what makes
+    # a mis-recorded empty day permanent: catch-up resumes from the last successful run, so the
+    # date is never re-attempted and no later skip can correct the record. This is the audit-row
+    # half of the CCIL/BSE outage; the connector fix is the other half.
+    _record(db, f"{SOURCE}.trades", AS_OF, "success", rows=0)
+    _record(db, f"{SOURCE}.trades", AS_OF, "skipped", rows=0)
+    with db.session() as s:
+        row = s.execute(
+            select(IngestionRun).where(
+                IngestionRun.dataset == f"{SOURCE}.trades", IngestionRun.run_date == AS_OF
+            )
+        ).scalar_one()
+    assert row.status == "skipped"
+
+
+def test_zero_row_success_still_yields_to_a_real_success(db: Database) -> None:
+    _record(db, f"{SOURCE}.trades", AS_OF, "success", rows=0)
+    _record(db, f"{SOURCE}.trades", AS_OF, "success", rows=42)
+    with db.session() as s:
+        row = s.execute(
+            select(IngestionRun).where(
+                IngestionRun.dataset == f"{SOURCE}.trades", IngestionRun.run_date == AS_OF
+            )
+        ).scalar_one()
+    assert row.status == "success"
+    assert row.rows_ingested == 42

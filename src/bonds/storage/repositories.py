@@ -9,7 +9,7 @@ from __future__ import annotations
 import datetime as dt
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from sqlalchemy import CursorResult, and_, case, delete, func, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -20,6 +20,7 @@ from bonds.models import (
     CorporateTradeRecord,
     PublicIssueRecord,
     RbiAuctionRecord,
+    RbiAuctionResultRecord,
     SecurityRecord,
     SovereignValuation,
     TradeRecord,
@@ -38,6 +39,7 @@ from bonds.storage.schema import (
     IngestionRun,
     PublicIssue,
     RbiAuction,
+    RbiAuctionResult,
     Security,
     SecurityAttributeHistory,
     Trade,
@@ -553,6 +555,12 @@ class IngestionRunRepository:
         downgrade it to ``failed``/``rows=0`` — the successfully-ingested rows are still in the
         database, and drift baselines (``previous_row_count``) would otherwise lose the day.
         A success always overwrites (refreshing the row count).
+
+        The one exception is a success that ingested **nothing**. It has no rows to protect, and
+        letting it stick is what makes a mis-recorded empty day permanent: ``catch-up`` resumes
+        from the last successful run, so the date is never re-attempted and no later skip can
+        correct the record. Connectors now raise ``DataUnavailable`` instead of returning an
+        empty batch, but the rows written before that fix still have to be able to heal.
         """
         stmt = pg_insert(IngestionRun).values(
             source=source,
@@ -573,7 +581,11 @@ class IngestionRunRepository:
                 "started_at": stmt.excluded.started_at,
                 "finished_at": stmt.excluded.finished_at,
             },
-            where=(stmt.excluded.status == "success") | (IngestionRun.status != "success"),
+            where=(
+                (stmt.excluded.status == "success")
+                | (IngestionRun.status != "success")
+                | (IngestionRun.rows_ingested == 0)
+            ),
         )
         self._session.execute(stmt)
 
@@ -845,3 +857,54 @@ class DataQualityRepository:
                 },
             )
             self._session.execute(stmt)
+
+
+class RbiAuctionResultRepository:
+    """Persist per-security auction outcomes (idempotent per prid + security)."""
+
+    _FIELDS: Final = (
+        "source",
+        "auction_date",
+        "auction_type",
+        "tenor_note",
+        "notified_amount_cr",
+        "bids_received_count",
+        "bids_received_amount_cr",
+        "bids_accepted_count",
+        "bids_accepted_amount_cr",
+        "cut_off_price",
+        "cut_off_yield",
+        "wavg_price",
+        "wavg_yield",
+        "partial_allotment_pct",
+    )
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def upsert_many(self, results: list[RbiAuctionResultRecord]) -> int:
+        """Insert or refresh auction outcomes.
+
+        A re-parse overwrites: RBI occasionally reposts a release with a correction, and the
+        press release is the record of truth — there is no "previous belief" worth keeping for a
+        primary-market result the way there is for a daily mark.
+        """
+        if not results:
+            return 0
+        rows = [
+            {"prid": r.prid, "security": r.security, **{f: getattr(r, f) for f in self._FIELDS}}
+            for r in results
+        ]
+        # One release can list the same security twice when a state re-issues in two tranches;
+        # keep the last, matching the upsert's own semantics.
+        rows = list({(r["prid"], r["security"]): r for r in rows}.values())
+        written = 0
+        for chunk in _chunks(rows):
+            stmt = pg_insert(RbiAuctionResult).values(chunk)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["prid", "security"],
+                set_={f: getattr(stmt.excluded, f) for f in self._FIELDS},
+            )
+            self._session.execute(stmt)
+            written += len(chunk)
+        return written

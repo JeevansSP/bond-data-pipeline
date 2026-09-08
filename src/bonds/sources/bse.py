@@ -21,7 +21,7 @@ from bonds.http import ThrottledClient
 from bonds.logging import get_logger
 from bonds.models import CorporateTradeRecord
 from bonds.quality.metrics import MetricsCollector
-from bonds.sources.base import DataUnavailable
+from bonds.sources.base import DataUnavailable, SourceError
 
 logger = get_logger(__name__)
 
@@ -55,12 +55,26 @@ class BseSource(MetricsCollector):
         )
 
     def download(self, date: dt.date) -> bytes:
-        """Download one day's trades, landing a copy in the data lake."""
+        """Download one day's trades, landing a copy in the data lake.
+
+        Raises:
+            DataUnavailable: When BSE answers with an empty ``Table`` — a holiday, or a run that
+                fired before the day's trades were published. Such a body is *not* landed: it is
+                syntactically valid JSON, so landing it would make ``read_or_download`` serve it
+                back on every later retry and permanently cache "no data" for that date. That is
+                how three weeks of BSE trades stayed missing while the audit trail dutifully
+                recorded a skip each night — the retries were all reading a 12-byte lake file.
+
+                A body that is not JSON at all is a different failure and is landed as usual, so
+                ``parse`` can report it and the artifact survives for diagnosis.
+        """
         stamp = date.strftime("%Y%m%d")
         response = self._client.get(
             _API, params={"frmDate": stamp, "toDate": stamp}, headers=_HEADERS
         )
         content = response.content
+        if _is_empty_table(content):
+            raise DataUnavailable(f"BSE published no corporate trades for {date}")
         path = self._raw_path(date)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
@@ -68,10 +82,19 @@ class BseSource(MetricsCollector):
         return content
 
     def read_or_download(self, date: dt.date) -> bytes:
-        """Return the raw payload, serving from the data lake when already landed."""
+        """Return the raw payload, serving from the data lake when already landed.
+
+        A landed artifact carrying no rows is treated as a cache *miss*, not as data: earlier
+        runs (before ``download`` learnt to reject them) poisoned the lake with empty-``Table``
+        bodies, and serving those back is what stopped every nightly retry from healing the gap.
+        """
         path = self._raw_path(date)
         if path.exists():
-            return path.read_bytes()
+            # One read, not two: a landed day is a multi-MB file and the backfill loop hits
+            # this once per business day.
+            landed = path.read_bytes()
+            if not _is_empty_table(landed):
+                return landed
         return self.download(date)
 
     # ------------------------------------------------------------------ parsing
@@ -79,8 +102,9 @@ class BseSource(MetricsCollector):
         """Fetch + parse one day's trade-level records.
 
         Raises:
-            DataUnavailable: When BSE reports no trades for the date (holiday/weekend,
-                or a date before the feed's late-2020 start).
+            DataUnavailable: When BSE published no trades for the date (holiday/weekend, a date
+                before the feed's late-2020 start, or a run before publication).
+            SourceError: When rows were returned but none parsed — a layout change.
         """
         self.reset_metrics()
         content = self.read_or_download(date)
@@ -93,7 +117,9 @@ class BseSource(MetricsCollector):
             rows_dropped=seen - len(records),
         )
         if not records:
-            raise DataUnavailable(f"BSE has no corporate trades for {date}")
+            # download() already rejects an empty Table, so rows existed and none parsed:
+            # a layout change, which must fail loudly rather than look like a holiday.
+            raise SourceError(f"BSE returned {seen} rows for {date} but none parsed (layout?)")
         return records
 
     def parse(self, content: bytes, *, date: dt.date) -> tuple[list[CorporateTradeRecord], int]:
@@ -114,6 +140,21 @@ class BseSource(MetricsCollector):
             dropped=len(rows) - len(records),
         )
         return records, len(rows)
+
+
+def _is_empty_table(content: bytes) -> bool:
+    """Whether a raw BSE payload is valid JSON carrying an empty ``Table``.
+
+    Deliberately narrower than "has no rows": a body that is not JSON at all — a WAF challenge
+    page, a truncated response — is **not** an empty day. Conflating the two would report an
+    extended BSE block as a run of holidays and, worse, discard the artifact that shows what
+    actually came back. Non-JSON therefore falls through to be landed and reported by
+    :meth:`BseSource.parse`.
+    """
+    try:
+        return not json.loads(content).get("Table")
+    except (json.JSONDecodeError, AttributeError):
+        return False
 
 
 def _to_record(row: dict[str, Any], date: dt.date, source: str) -> CorporateTradeRecord | None:

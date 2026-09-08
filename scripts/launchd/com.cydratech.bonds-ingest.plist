@@ -3,7 +3,19 @@
 <!--
   macOS launchd agent for the daily bonds ingest.
 
-  StartCalendarInterval fires at 21:00 local. If the Mac is asleep or powered off at that time,
+  StartCalendarInterval fires at 13:00 local (midday: the machine is reliably awake, unlike
+  21:00 where laptop sleep repeatedly stretched runs across the night). Most sources publish
+  after the close — FBIL ~19:00, CCIL and BSE after 17:00 — so a midday run ingests the PREVIOUS
+  business day and the current day lands tomorrow.
+
+  That is only safe because a source with nothing to give records `skipped` and is re-attempted.
+  A connector that reports `success` with zero rows, or that lands an empty artifact in the data
+  lake, turns this schedule into silent permanent data loss: catch-up resumes from the last
+  SUCCESSFUL run, so the day is never revisited. Exactly that cost three weeks of the CCIL
+  sovereign tape and the BSE corporate tape in August 2026. `bonds dq assess` now fails on both
+  signatures — do not weaken those checks to make this schedule look green.
+
+  If the Mac is asleep or powered off at that time,
   launchd runs the missed job once when the machine next wakes/boots — that single run's
   `catch-up` command then gap-fills every business day that was missed. RunAtLoad also triggers
   a run at login, so a freshly-booted machine catches up immediately.
@@ -27,7 +39,7 @@
   <key>StartCalendarInterval</key>
   <dict>
     <key>Hour</key>
-    <integer>21</integer>
+    <integer>13</integer>
     <key>Minute</key>
     <integer>0</integer>
   </dict>

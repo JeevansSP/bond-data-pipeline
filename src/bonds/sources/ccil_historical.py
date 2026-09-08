@@ -39,7 +39,8 @@ from bonds.http import ThrottledClient
 from bonds.logging import get_logger
 from bonds.models import InstrumentType, SecurityRecord, TradeRecord
 from bonds.quality.metrics import MetricsCollector
-from bonds.sources.base import SourceError
+from bonds.sources.base import DataUnavailable, SourceError
+from bonds.states import sdl_issuer
 
 logger = get_logger(__name__)
 
@@ -89,10 +90,28 @@ class CcilHistoricalTradesSource(MetricsCollector):
         self._primed = False
 
     def fetch_trades(self, as_of: dt.date) -> list[TradeRecord]:
-        """Fetch + aggregate one day's NDS-OM trades (holidays return an empty list)."""
+        """Fetch + aggregate one day's NDS-OM trades.
+
+        Raises:
+            DataUnavailable: When the CSV carries no trade rows — a holiday, or (the common
+                case) a run that fired before CCIL published the day's file. Either way the day
+                is *not yet ingested*, so it must be recorded SKIPPED and re-attempted, never
+                SUCCESS with zero rows: a zero-row success advances the catch-up anchor past the
+                date and the data is lost for good. That is exactly how three weeks of the
+                sovereign tape went missing behind 17 consecutive "success" audit rows after the
+                scheduler drifted to a 13:00 run (CCIL publishes after the 17:00 close).
+            SourceError: When the CSV has rows but none parse — a layout change, which must fail
+                loudly rather than masquerade as an empty day.
+        """
         self.reset_metrics()
         csv_text = self.download(as_of, as_of)
         result = aggregate_trades_with_stats(csv_text, source=self.name)
+        if result.rows_seen == 0:
+            raise DataUnavailable(f"CCIL published no trades for {as_of} (holiday or not yet up)")
+        if result.rows_used == 0:
+            raise SourceError(
+                f"CCIL returned {result.rows_seen} rows for {as_of} but none parsed (layout?)"
+            )
         dropped = result.rows_seen - result.rows_used
         if dropped:
             # A layout change breaking a fraction of rows would silently skew VWAPs otherwise.
@@ -433,94 +452,9 @@ def _parse_coupon(desc: str | None, segment: str) -> float | None:
     return float(m.group(1)) if m else None
 
 
-# SDL descriptions carry the state name between the coupon and a drift-prone marker. Across
-# 24 years of naming the marker appears as SDL / SGS / SGL / GS / G.S. / G S / S.D.(L.) /
-# GOVT(. STOCK) / LOAN — or not at all, in which case the 4-digit maturity year bounds the state
-# ("10.50% JAMMU & KASHMIR 2011"). Validated against every distinct SDL description in the
-# landed history (10k+): 31 canonical issuers, zero unmatched.
-_SDL_MARKER: Final = (
-    r"(?:SDL|SGS|SGL|GS|G\.?\s?S\.?|S\.?\s?D\.?L?\.?|GOVT\.?\s*(?:STOCK)?|STOCK|LOAN)"
-)
-_SDL_STATE_RE: Final = re.compile(
-    rf"^\s*[\d.]+\s*%?\s*(?P<state>[A-Z][A-Z .&]*?)\s*(?:\b{_SDL_MARKER}(?=[\s\d.(]|$)|\d{{4}})"
-)
-
-# Observed spelling variants -> canonical state, keyed on the squashed form (A-Z and & only, so
-# "A. P.", "A.P" and "AP" share a key). Unknown states pass through raw rather than being lost.
-_STATE_ALIASES: Final[dict[str, str]] = {
-    "ANDHRA": "ANDHRA PRADESH",
-    "ANDHRAPRADESH": "ANDHRA PRADESH",
-    "AP": "ANDHRA PRADESH",
-    "ARPR": "ARUNACHAL PRADESH",
-    "ARUNACHAL": "ARUNACHAL PRADESH",
-    "ARUNACHALPRADESH": "ARUNACHAL PRADESH",
-    "ARUNPRA": "ARUNACHAL PRADESH",
-    "ARUNACHALPRA": "ARUNACHAL PRADESH",
-    "ARUNACHALPR": "ARUNACHAL PRADESH",
-    "CHATTISGARH": "CHHATTISGARH",
-    "CHATISGAR": "CHHATTISGARH",
-    "CHATTIS": "CHHATTISGARH",
-    "CHHATISGARH": "CHHATTISGARH",
-    "CHHATISHGARH": "CHHATTISGARH",
-    "GUJRAT": "GUJARAT",
-    "HARAYANA": "HARYANA",
-    "HIMACHAL": "HIMACHAL PRADESH",
-    "HIMACHALPRADESH": "HIMACHAL PRADESH",
-    "HP": "HIMACHAL PRADESH",
-    "HIMACHALPR": "HIMACHAL PRADESH",
-    "HIMACHALPRADESHSDL": "HIMACHAL PRADESH",
-    "J&K": "JAMMU & KASHMIR",
-    "JAMMU&KASHMIR": "JAMMU & KASHMIR",
-    "JAMMUANDKASHMIR": "JAMMU & KASHMIR",
-    "JK": "JAMMU & KASHMIR",
-    "JAMMUKASHMIR": "JAMMU & KASHMIR",
-    "JAMMUKASMIR": "JAMMU & KASHMIR",
-    "JHARKAND": "JHARKHAND",
-    "KARN": "KARNATAKA",
-    "KARNATAK": "KARNATAKA",
-    "KER": "KERALA",
-    "KERELA": "KERALA",
-    "MADHYAPRADESH": "MADHYA PRADESH",
-    "MP": "MADHYA PRADESH",
-    "MADHYAPR": "MADHYA PRADESH",
-    "MAHRASTRA": "MAHARASHTRA",
-    "MAHARASTRA": "MAHARASHTRA",
-    "MAH": "MAHARASHTRA",
-    "MAHA": "MAHARASHTRA",
-    "MANI": "MANIPUR",
-    "MEGH": "MEGHALAYA",
-    "MEGHALAY": "MEGHALAYA",
-    "ORISSA": "ODISHA",
-    "ORRISA": "ODISHA",
-    "PONDICHERRY": "PUDUCHERRY",
-    "RAJ": "RAJASTHAN",
-    "RAJSTHAN": "RAJASTHAN",
-    "TAMILNADU": "TAMIL NADU",
-    "TN": "TAMIL NADU",
-    "TELENGANA": "TELANGANA",
-    "UP": "UTTAR PRADESH",
-    "UTTARPRADESH": "UTTAR PRADESH",
-    "UTRANCHAL": "UTTARAKHAND",
-    "UTTARANCHAL": "UTTARAKHAND",
-    "UTRRANCHAL": "UTTARAKHAND",
-    "UTTARC": "UTTARAKHAND",
-    "UTTRANCHAL": "UTTARAKHAND",
-    "WB": "WEST BENGAL",
-    "WBENGAL": "WEST BENGAL",
-    "WESTBENGAL": "WEST BENGAL",
-}
-
-
-def _canonical_state(raw: str) -> str:
-    return _STATE_ALIASES.get(re.sub(r"[^A-Z&]", "", raw), raw)
-
-
-def _sdl_issuer(desc: str | None) -> str | None:
-    m = _SDL_STATE_RE.match((desc or "").strip().upper())
-    if not m:
-        return None
-    state = _canonical_state(" ".join(m.group("state").split()))
-    return f"State Government ({state})"
+# The state vocabulary and description parsing live in bonds.states, shared with the FBIL
+# valuation pipeline: when each connector kept its own, CCIL normalised to full state names
+# while FBIL emitted raw two-letter codes and the master fragmented into 63 issuer strings.
 
 
 def derive_security(isin: str, descriptor: str | None, segment: str) -> SecurityRecord | None:
@@ -531,7 +465,7 @@ def derive_security(isin: str, descriptor: str | None, segment: str) -> Security
     if segment in _CENTRAL_SEGMENTS:
         issuer: str | None = "Government of India"
     else:
-        issuer = _sdl_issuer(descriptor)  # SDL: state parsed from the description
+        issuer = sdl_issuer(descriptor)  # SDL: state parsed from the description
     return SecurityRecord(
         isin=isin,
         instrument_type=itype,

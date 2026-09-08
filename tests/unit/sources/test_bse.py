@@ -79,13 +79,39 @@ def test_parse_drops_bad_isin(tmp_path: Path) -> None:
     assert records == [] and seen == 1
 
 
+@respx.mock
 def test_fetch_trades_empty_day_is_data_unavailable(tmp_path: Path) -> None:
-    src = _source(tmp_path)
+    respx.get("https://api.bseindia.com/BseIndiaAPI/api/rdbTradensettle/w").mock(
+        return_value=httpx.Response(200, content=_payload())
+    )
+    with pytest.raises(DataUnavailable):
+        _source(tmp_path).fetch_trades(DATE)
+
+
+@respx.mock
+def test_empty_day_is_not_landed(tmp_path: Path) -> None:
+    # An empty Table must never reach the lake: it is valid JSON, so a landed copy would be
+    # served back by read_or_download on every retry and cache "no data" for that date forever.
+    respx.get("https://api.bseindia.com/BseIndiaAPI/api/rdbTradensettle/w").mock(
+        return_value=httpx.Response(200, content=_payload())
+    )
+    with pytest.raises(DataUnavailable):
+        _source(tmp_path).fetch_trades(DATE)
+    assert not (tmp_path / "raw" / "bse" / "tradensettle" / f"{DATE.isoformat()}.json").exists()
+
+
+@respx.mock
+def test_poisoned_empty_lake_copy_is_refetched(tmp_path: Path) -> None:
+    # Runs from before the guard above left empty-Table files in the lake; those must be treated
+    # as a cache miss so the nightly retry can finally heal the gap.
     raw = tmp_path / "raw" / "bse" / "tradensettle" / f"{DATE.isoformat()}.json"
     raw.parent.mkdir(parents=True)
     raw.write_bytes(_payload())
-    with pytest.raises(DataUnavailable):
-        src.fetch_trades(DATE)
+    route = respx.get("https://api.bseindia.com/BseIndiaAPI/api/rdbTradensettle/w").mock(
+        return_value=httpx.Response(200, content=_payload(_ROW))
+    )
+    assert len(_source(tmp_path).fetch_trades(DATE)) == 1
+    assert route.called
 
 
 @respx.mock
@@ -106,3 +132,21 @@ def test_read_or_download_serves_lake_copy_without_network(tmp_path: Path) -> No
     raw.parent.mkdir(parents=True)
     raw.write_bytes(_payload(_ROW))
     assert len(_source(tmp_path).fetch_trades(DATE)) == 1
+
+
+@respx.mock
+def test_a_non_json_body_is_landed_and_reported_not_treated_as_empty(tmp_path: Path) -> None:
+    """A WAF challenge page is not a holiday.
+
+    ``download`` rejects an empty ``Table`` before landing it, but that test must stay narrow:
+    if it also swallowed non-JSON, an extended BSE block would look identical in the audit trail
+    to a run of holidays, and the artifact showing what actually came back would be discarded.
+    """
+    respx.get("https://api.bseindia.com/BseIndiaAPI/api/rdbTradensettle/w").mock(
+        return_value=httpx.Response(200, content=b"<html>Access Denied</html>")
+    )
+    src = _source(tmp_path)
+    with pytest.raises(DataUnavailable, match="non-JSON"):
+        src.fetch_trades(DATE)
+    # The artifact survives for diagnosis.
+    assert (tmp_path / "raw" / "bse" / "tradensettle" / f"{DATE.isoformat()}.json").exists()

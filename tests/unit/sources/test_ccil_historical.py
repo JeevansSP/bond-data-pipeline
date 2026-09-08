@@ -12,7 +12,7 @@ import respx
 from bonds.config import HttpSettings, Settings
 from bonds.http import ThrottledClient
 from bonds.models import InstrumentType, TradeRecord
-from bonds.sources import SourceError
+from bonds.sources import DataUnavailable, SourceError
 from bonds.sources.ccil_historical import (
     CcilHistoricalTradesSource,
     _as_date,
@@ -397,3 +397,34 @@ def test_sgb_issuer_is_goi() -> None:
     rec = derive_security("IN0020260033", "02.50 SGB 2026 SERIES XIV 17 18 FV 2881", "SGB")
     assert rec is not None
     assert rec.issuer == "Government of India"
+
+
+class _StubDownload(CcilHistoricalTradesSource):
+    """Bypasses the network: fetch_trades' emptiness policy is what's under test."""
+
+    def __init__(self, csv_text: str) -> None:
+        self.reset_metrics()
+        self._csv = csv_text
+
+    def download(self, start: dt.date, end: dt.date) -> str:
+        return self._csv
+
+
+def test_fetch_trades_header_only_is_data_unavailable() -> None:
+    # CCIL answers with a bare header before it publishes the day's file (and on holidays).
+    # Recording that SUCCESS with zero rows advances the catch-up anchor past the date and the
+    # data is lost — which is how 17 nights of the sovereign tape went missing behind clean
+    # "success" audit rows. It must be SKIPPED so catch-up re-attempts it.
+    with pytest.raises(DataUnavailable):
+        _StubDownload(_HEADER).fetch_trades(dt.date(2026, 9, 4))
+
+
+def test_fetch_trades_unparseable_rows_is_source_error() -> None:
+    # Rows present but none parsed is a layout change, not a quiet day: fail loudly.
+    with pytest.raises(SourceError, match="none parsed"):
+        _StubDownload(_HEADER + "not,a,valid,row\n").fetch_trades(dt.date(2026, 9, 4))
+
+
+def test_fetch_trades_returns_records_for_a_normal_day() -> None:
+    records = _StubDownload(_CSV).fetch_trades(dt.date(2026, 7, 17))
+    assert {r.isin for r in records} == {"IN0020260025", "IN2220190127", "IN0020260099"}

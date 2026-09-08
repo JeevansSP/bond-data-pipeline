@@ -12,8 +12,11 @@ from dataclasses import dataclass, field
 
 from sqlalchemy import Connection, text
 
+from bonds.pipelines.spread_matrix import MIN_TRADES_PER_CELL
 from bonds.quality.checks import Level, QualityCheck
+from bonds.states import SDL_ISSUERS
 from bonds.storage import Database
+from bonds.valuation import TRADED_PRICE_CAP_DAYS
 
 # --- thresholds (tunable) -------------------------------------------------------------------
 MAX_VALUATION_NULL_PRICE_RATE = 0.05
@@ -23,6 +26,14 @@ MIN_CROSS_SOURCE_PAIRS = 500  # too few matched pairs -> reconciliation is uninf
 # Fewest tenor points a published curve day can legitimately carry (sdl_zcyc's grid is 56;
 # gsec 160-205). Below this the workbook parsed only partially.
 MIN_CURVE_POINTS_PER_DAY = 20
+# How far a daily series may lag the newest date anywhere in the warehouse before it is stale.
+# Measured against the warehouse high-water mark rather than today, so a machine that was off
+# for a week doesn't light up every series — only a series that fell behind its siblings does.
+# 8 days clears a weekend plus a holiday cluster; the CCIL/BSE outages that motivated this ran
+# to 21 days.
+MAX_SERIES_LAG_DAYS = 8
+# Window for the empty-successful-day check (below).
+EMPTY_SUCCESS_WINDOW_DAYS = 60
 _SOVEREIGN = ("GSEC", "SDL", "TBILL", "STRIPS")
 # Canonical interest_type vocabulary (NULL allowed); anything else is a raw source string a
 # new/regressed source wrote past the normalizer.
@@ -86,6 +97,30 @@ def check_uniqueness(conn: Connection) -> list[QualityCheck]:
         )
         for name, sql in specs
     ]
+    # An attribute must have exactly one value in force at any instant. Nothing enforced this:
+    # SCD-2 correctness lived entirely in the writer. It matters beyond tidiness because the
+    # spread matrix joins prints to "the rating in force on the quote date" — two overlapping
+    # windows would silently duplicate every print in that ISIN's cell and skew the weighted
+    # yield, with no error anywhere.
+    overlapping = _scalar(
+        conn,
+        """
+        SELECT count(*) FROM security_attribute_history a
+          JOIN security_attribute_history b
+            ON b.isin = a.isin AND b.attribute = a.attribute AND b.id <> a.id
+           AND a.valid_from < coalesce(b.valid_to, DATE '9999-12-31')
+           AND b.valid_from < coalesce(a.valid_to, DATE '9999-12-31')
+        """,
+    )
+    checks.append(
+        QualityCheck(
+            "attribute_history_overlap",
+            Level.ERROR,
+            passed=overlapping == 0,
+            observed=overlapping,
+            detail="SCD-2 rows whose validity windows overlap for the same (isin, attribute)",
+        )
+    )
     # corporate_trades has no natural transaction key, and content-based duplicate detection
     # false-positives on real market structure (a sliced block order prints hundreds of
     # identical lots — verified against raw files). The honest invariant is audit
@@ -331,6 +366,24 @@ def check_consistency(conn: Connection) -> list[QualityCheck]:
         "WHERE s.maturity_date < CURRENT_DATE - INTERVAL '365 days'",
     )
     coupon_above_25 = _scalar(conn, "SELECT count(*) FROM securities WHERE coupon > 25")
+    # The SDL issuer vocabulary is closed (bonds.states.SDL_ISSUERS). It fragmented once
+    # already — FBIL wrote two-letter codes while CCIL wrote full state names, giving 63 issuer
+    # strings for 31 states — and a one-off SQL repair was undone by the next nightly load. This
+    # check is what makes that regression fail the same night instead of six weeks later.
+    noncanonical_sdl_issuer = _scalar(
+        conn,
+        "SELECT count(*) FROM securities "
+        "WHERE instrument_type='SDL' AND issuer IS NOT NULL AND NOT (issuer = ANY(:canon))",
+        canon=sorted(SDL_ISSUERS),
+    )
+    # Sovereign ISINs are structural: central paper is IN00…, state paper IN10…-IN49…. A
+    # central-typed row with a state ISIN means a worksheet title outranked the ISIN (FBIL's
+    # pre-2023 combined workbooks put state UDAY bonds on the G-Sec "Special" sheet).
+    sovereign_isin_mismatch = _scalar(
+        conn,
+        "SELECT count(*) FROM securities "
+        "WHERE instrument_type IN ('GSEC','TBILL','STRIPS','SGB') AND isin NOT LIKE 'IN00%'",
+    )
     # A curve day with a handful of tenor points is a partially-parsed workbook, not a
     # published curve — full grids run 56 (sdl_zcyc) to ~205 (gsec) points.
     sparse_curve_days = _scalar(
@@ -392,6 +445,23 @@ def check_consistency(conn: Connection) -> list[QualityCheck]:
                 "matured >1y ago yet upstream status still ACTIVE (stale source status; "
                 "the active_securities view already excludes them by maturity)"
             ),
+        ),
+        QualityCheck(
+            "sdl_issuer_noncanonical",
+            Level.ERROR,
+            passed=noncanonical_sdl_issuer == 0,
+            observed=noncanonical_sdl_issuer,
+            detail=(
+                f"SDL issuers outside the closed {len(SDL_ISSUERS)}-state vocabulary — "
+                "a connector bypassed bonds.states.sdl_issuer"
+            ),
+        ),
+        QualityCheck(
+            "sovereign_instrument_isin_mismatch",
+            Level.ERROR,
+            passed=sovereign_isin_mismatch == 0,
+            observed=sovereign_isin_mismatch,
+            detail="central-typed securities (GSEC/TBILL/STRIPS/SGB) whose ISIN is not IN00…",
         ),
         QualityCheck(
             "coupon_above_25pct",
@@ -475,6 +545,238 @@ def check_cross_source(conn: Connection) -> list[QualityCheck]:
     ]
 
 
+def check_freshness(conn: Connection) -> list[QualityCheck]:
+    """Every daily series must keep pace with the rest of the warehouse.
+
+    Two failure modes, both observed in production and both invisible to every other check here:
+
+    * a connector silently returns nothing while its audit row still says ``success``, so the
+      catch-up anchor advances and the days are lost (CCIL, 17 nights);
+    * a connector correctly records ``skipped`` but the retry reads a poisoned empty artifact
+      out of the data lake, so it never heals (BSE, 20 nights).
+
+    Both show up here as one series lagging its siblings.
+    """
+    series = {
+        "valuations": "SELECT max(quote_date) FROM valuations",
+        "yield_curves": "SELECT max(quote_date) FROM yield_curves",
+        "trades_ccil": "SELECT max(trade_date) FROM trades WHERE source='ccil'",
+        "trades_nse_cbm": "SELECT max(trade_date) FROM trades WHERE source='nse_cbm'",
+        "corp_trades_nse": "SELECT max(trade_date) FROM corporate_trades WHERE source='nse'",
+        "corp_trades_bse": "SELECT max(trade_date) FROM corporate_trades WHERE source='bse'",
+    }
+    latest = {name: conn.execute(text(sql)).scalar() for name, sql in series.items()}
+    dated = {name: day for name, day in latest.items() if day is not None}
+    if not dated:
+        return [
+            QualityCheck(
+                "freshness_assessable",
+                Level.INFO,
+                passed=True,
+                observed=0.0,
+                detail="no dated series in the warehouse yet",
+            )
+        ]
+    high_water = max(dated.values())
+    checks = [
+        QualityCheck(
+            "warehouse_high_water_mark",
+            Level.INFO,
+            passed=True,
+            observed=0.0,
+            detail=f"newest date in any daily series: {high_water.isoformat()}",
+        )
+    ]
+    for name, day in sorted(dated.items()):
+        lag = (high_water - day).days
+        checks.append(
+            QualityCheck(
+                f"stale_series_{name}",
+                Level.ERROR,
+                passed=lag <= MAX_SERIES_LAG_DAYS,
+                observed=float(lag),
+                detail=(
+                    f"newest row {day.isoformat()}, {lag}d behind {high_water.isoformat()} "
+                    f"(limit {MAX_SERIES_LAG_DAYS}d)"
+                ),
+            )
+        )
+    # The silent-loss signature: a date-series run recorded SUCCESS, yet the table it feeds holds
+    # nothing for that date. A zero-row audit figure alone is NOT that signature — a bitemporal
+    # upsert legitimately writes nothing when catch-up re-runs a day whose data is already
+    # loaded and unchanged — so the invariant has to be checked against the data, not the count.
+    for dataset, table, date_column, source_filter in (
+        ("ccil.trades", "trades", "trade_date", "source='ccil'"),
+        ("nse_cbm.trades", "trades", "trade_date", "source='nse_cbm'"),
+        ("bse.corp_trades", "corporate_trades", "trade_date", "source='bse'"),
+    ):
+        empty_days = _scalar(
+            conn,
+            f"""
+            SELECT count(*) FROM ingestion_runs r
+             WHERE r.dataset = :dataset
+               AND r.status = 'success'
+               AND r.run_date >= CURRENT_DATE - make_interval(days => :window)
+               AND NOT EXISTS (
+                     SELECT 1 FROM {table} t
+                      WHERE t.{date_column} = r.run_date AND {source_filter}
+                   )
+            """,
+            dataset=dataset,
+            window=int(EMPTY_SUCCESS_WINDOW_DAYS),
+        )
+        checks.append(
+            QualityCheck(
+                f"empty_successful_days_{dataset.replace('.', '_')}",
+                Level.ERROR,
+                passed=empty_days == 0,
+                observed=empty_days,
+                detail=(
+                    f"days in the last {EMPTY_SUCCESS_WINDOW_DAYS}d whose {dataset} run says "
+                    "SUCCESS but which have no rows in the table — catch-up resumes from the "
+                    "last success, so those dates are never re-attempted"
+                ),
+            )
+        )
+    return checks
+
+
+def check_derived_products(conn: Connection) -> list[QualityCheck]:
+    """Invariants for the derived product tables (liquidity, spread matrix, auction results).
+
+    These are computed by us rather than published to us, so a defect here is a defect in our
+    arithmetic — a different class from the upstream oddities the other dimensions tolerate, and
+    held to a tighter standard accordingly.
+    """
+    checks: list[QualityCheck] = []
+
+    # --- liquidity -------------------------------------------------------------------------
+    liquidity_rows = _scalar(conn, "SELECT count(*) FROM security_liquidity")
+    if liquidity_rows:
+        # An as-of snapshot where nothing qualifies as an active market means the thresholds or
+        # the trade join broke: the corporate tape alone carries ~400 ISINs printing most days.
+        latest = conn.execute(text("SELECT max(as_of_date) FROM security_liquidity")).scalar()
+        active = _scalar(
+            conn,
+            "SELECT count(*) FROM security_liquidity WHERE as_of_date = :d AND active_market",
+            d=latest,
+        )
+        checks.append(
+            QualityCheck(
+                "liquidity_active_market_count",
+                Level.ERROR,
+                passed=active > 0,
+                observed=active,
+                detail=f"instruments meeting the active-market test on {latest}",
+            )
+        )
+        # traded_within_15d must agree with days_since_trade; they are computed together, so a
+        # disagreement means one of the two expressions drifted.
+        inconsistent = _scalar(
+            conn,
+            """
+            SELECT count(*) FROM security_liquidity
+             WHERE traded_within_15d
+                <> (days_since_trade IS NOT NULL AND days_since_trade <= :cap_days)
+            """,
+            cap_days=TRADED_PRICE_CAP_DAYS,
+        )
+        checks.append(
+            QualityCheck(
+                "liquidity_15d_flag_consistent",
+                Level.ERROR,
+                passed=inconsistent == 0,
+                observed=inconsistent,
+                detail="rows where traded_within_15d disagrees with days_since_trade",
+            )
+        )
+        # A window count can never exceed a longer window's.
+        nested = _scalar(
+            conn,
+            """
+            SELECT count(*) FROM security_liquidity
+             WHERE prints_1m > prints_3m OR prints_3m > prints_12m
+                OR days_traded_1m > days_traded_3m OR days_traded_3m > days_traded_12m
+            """,
+        )
+        checks.append(
+            QualityCheck(
+                "liquidity_windows_nested",
+                Level.ERROR,
+                passed=nested == 0,
+                observed=nested,
+                detail="rows whose 1m count exceeds 3m, or 3m exceeds 12m",
+            )
+        )
+
+    # --- spread matrix ---------------------------------------------------------------------
+    if _scalar(conn, "SELECT count(*) FROM corporate_spread_matrix"):
+        # A cell computed from fewer prints than the floor should never have been written.
+        thin = _scalar(
+            conn,
+            "SELECT count(*) FROM corporate_spread_matrix WHERE trade_count < :floor",
+            floor=MIN_TRADES_PER_CELL,
+        )
+        checks.append(
+            QualityCheck(
+                "spread_matrix_thin_cells",
+                Level.ERROR,
+                passed=thin == 0,
+                observed=thin,
+                detail="cells below the minimum-prints floor",
+            )
+        )
+        # Negative spreads are possible in a thin cell (a print below the CG curve) and are kept
+        # deliberately — the cell's trade_count is how a caller sees why. Reported, not failed.
+        negative = _scalar(conn, "SELECT count(*) FROM corporate_spread_matrix WHERE spread_bp < 0")
+        checks.append(
+            QualityCheck(
+                "spread_matrix_negative_cells",
+                Level.INFO,
+                passed=True,
+                observed=negative,
+                detail="cells priced through the CG curve (thin cells; check trade_count)",
+            )
+        )
+
+    # --- auction results -------------------------------------------------------------------
+    if _scalar(conn, "SELECT count(*) FROM rbi_auction_results"):
+        # RBI can accept slightly more than notified (non-competitive add-ons) but not double
+        # it; a large overshoot means a column was read from the wrong security.
+        overshoot = _scalar(
+            conn,
+            """
+            SELECT count(*) FROM rbi_auction_results
+             WHERE notified_amount_cr IS NOT NULL AND bids_accepted_amount_cr IS NOT NULL
+               AND bids_accepted_amount_cr > notified_amount_cr * 1.5
+            """,
+        )
+        checks.append(
+            QualityCheck(
+                "auction_accepted_within_notified",
+                Level.ERROR,
+                passed=overshoot == 0,
+                observed=overshoot,
+                detail="securities where accepted exceeds 150% of notified (column misread?)",
+            )
+        )
+        implausible = _scalar(
+            conn,
+            "SELECT count(*) FROM rbi_auction_results "
+            "WHERE cut_off_yield IS NOT NULL AND (cut_off_yield < 0 OR cut_off_yield > 20)",
+        )
+        checks.append(
+            QualityCheck(
+                "auction_cut_off_yield_plausible",
+                Level.ERROR,
+                passed=implausible == 0,
+                observed=implausible,
+                detail="cut-off yields outside 0-20% — a parenthetical read as a price",
+            )
+        )
+    return checks
+
+
 def run_assessment(database: Database) -> AssessmentReport:
     """Run every DB-wide assessment dimension and return the grouped results."""
     with database.engine.connect() as conn:
@@ -485,5 +787,7 @@ def run_assessment(database: Database) -> AssessmentReport:
                 "Completeness": check_completeness(conn),
                 "Consistency": check_consistency(conn),
                 "Cross-source reconciliation": check_cross_source(conn),
+                "Freshness": check_freshness(conn),
+                "Derived products": check_derived_products(conn),
             }
         )
