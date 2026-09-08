@@ -68,6 +68,13 @@ def execute_run(
 
     ``work`` returns the number of rows loaded and may raise :class:`DataUnavailable` (-> SKIPPED)
     or any other exception (-> FAILED).
+
+    A date-series connector must raise :class:`DataUnavailable` when the *source* published
+    nothing, so the day records SKIPPED and is re-attempted — a zero-row SUCCESS advances the
+    catch-up anchor past the date and no retry ever revisits it. That cannot be enforced here:
+    ``work`` returns rows *written*, and a bitemporal upsert legitimately writes zero when
+    re-running a day whose data is already loaded and unchanged. Only the connector can tell an
+    empty source response from an idempotent no-op, so the invariant lives in the connectors.
     """
     started = dt.datetime.now(dt.UTC)
     try:
