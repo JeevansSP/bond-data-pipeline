@@ -3,8 +3,12 @@
     GET https://api.bseindia.com/BseIndiaAPI/api/rdbTradensettle/w?frmDate=YYYYMMDD&toDate=YYYYMMDD
     -> {"Table": [one object per transaction]}
 
-No cookies/captcha — just a browser User-Agent and a bseindia.com Referer. One row per
-transaction with second-resolution ``Trade_Time`` and an RFQ-vs-OTC flag. Trade-level history
+No cookies/captcha, but Akamai scores the request headers: since ~24-Sep-2026 a bare browser
+User-Agent + Referer gets a host-wide ``403 Access Denied``. :data:`_HEADERS` therefore carries
+what bseindia.com's own frontend sends on its XHR — ``Accept-Language`` or the ``Sec-Fetch-*``
+trio each passed on their own when probed (``Origin`` alone did not), but the threshold is
+Akamai's to move, so all are sent for margin. One row per transaction with second-resolution
+``Trade_Time`` and an RFQ-vs-OTC flag. Trade-level history
 starts ~25-Nov-2020 (SEBI's Oct-2020 dissemination circular); earlier dates return zero rows.
 Empty days (holidays) are ``DataUnavailable`` so pipelines record SKIPPED.
 """
@@ -26,7 +30,15 @@ from bonds.sources.base import DataUnavailable, SourceError
 logger = get_logger(__name__)
 
 _API: Final = "https://api.bseindia.com/BseIndiaAPI/api/rdbTradensettle/w"
-_HEADERS: Final = {"Accept": "application/json", "Referer": "https://www.bseindia.com/"}
+_HEADERS: Final = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://www.bseindia.com",
+    "Referer": "https://www.bseindia.com/",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
+}
 
 # Yield types whose YieldDate is an embedded option exercise date rather than maturity.
 _OPTION_YIELD_TYPES: Final = frozenset({"YTC", "YTP"})
