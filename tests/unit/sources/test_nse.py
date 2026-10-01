@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -12,6 +13,7 @@ import respx
 from bonds.config import HttpSettings, Settings
 from bonds.http import ThrottledClient
 from bonds.models import InstrumentType
+from bonds.sources.base import DataUnavailable
 from bonds.sources.nse import NseSource, _as_float, _as_int, _parse_timestamp, _to_record
 
 _ROW = {
@@ -85,6 +87,51 @@ def test_fetch_trades_primes_cookies_and_parses_segments(tmp_path: Path) -> None
     assert len(records) == 1
     assert records[0].trade_date == dt.date(2026, 7, 17)  # from the envelope timestamp
     assert (tmp_path / "raw" / "nse" / "2026-07-18" / "otctrades_listed.json").exists()
+
+
+_IST = ZoneInfo("Asia/Kolkata")
+
+
+def _live_source(tmp_path: Path, *, now: dt.datetime) -> NseSource:
+    respx.get(
+        "https://www.nseindia.com/market-data/debt-market-reporting-corporate-bonds-traded-on-exchange"
+    ).mock(return_value=httpx.Response(200, text="<html>ok</html>"))
+    respx.get("https://www.nseindia.com/api/liveCorp-bonds").mock(
+        return_value=httpx.Response(200, json={"data": [_ROW], "timestamp": "17-Jul-2026 13:05"})
+    )
+    settings = Settings(data_root=tmp_path, http=HttpSettings(min_interval_seconds=0.0))
+    return NseSource(client=ThrottledClient(settings.http), settings=settings, now=lambda: now)
+
+
+@respx.mock
+def test_fetch_trades_refuses_a_session_still_in_progress(tmp_path: Path) -> None:
+    # 13:07 IST on the trading day: the feed shows the morning's prints, not the session. The
+    # scheduled midday run wrote exactly this as a session summary for six weeks.
+    source = _live_source(tmp_path, now=dt.datetime(2026, 7, 17, 13, 7, tzinfo=_IST))
+    with pytest.raises(DataUnavailable, match="still in progress at 13:07 IST"):
+        source.fetch_trades(dt.date(2026, 7, 17))
+    # The intraday snapshot still lands in the lake — only the warehouse refuses it.
+    assert (tmp_path / "raw" / "nse" / "2026-07-17" / "otctrades_listed.json").exists()
+
+
+@respx.mock
+def test_fetch_trades_accepts_the_same_session_after_the_close(tmp_path: Path) -> None:
+    source = _live_source(tmp_path, now=dt.datetime(2026, 7, 17, 18, 30, tzinfo=_IST))
+    assert len(source.fetch_trades(dt.date(2026, 7, 17))) == 4  # one row per segment
+
+
+@respx.mock
+def test_fetch_trades_accepts_a_previous_session_at_any_hour(tmp_path: Path) -> None:
+    # Saturday morning: the feed still shows Friday, which is over.
+    source = _live_source(tmp_path, now=dt.datetime(2026, 7, 18, 11, 0, tzinfo=_IST))
+    assert len(source.fetch_trades(dt.date(2026, 7, 18))) == 4  # one row per segment
+
+
+@respx.mock
+def test_session_guard_compares_in_ist_not_the_clock_zone(tmp_path: Path) -> None:
+    # 12:37 UTC on the trading day is 18:07 IST: closed, whatever tz the clock reports in.
+    source = _live_source(tmp_path, now=dt.datetime(2026, 7, 17, 12, 37, tzinfo=dt.UTC))
+    assert len(source.fetch_trades(dt.date(2026, 7, 17))) == 4  # one row per segment
 
 
 class TestDeriveSecurities:

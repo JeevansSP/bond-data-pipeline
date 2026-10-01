@@ -16,7 +16,7 @@ Source-by-source data mapping (endpoints, schemas, quirks) lives in [`docs/resea
 | `security_attribute_history` | SCD-2 effective-dated values (rating, day-count convention, coupon frequency, next coupon date, status…) | BondCentral, CDSL, NSE bond report | per attribute |
 | `valuations` | per-ISIN daily price/YTM, **append-only bitemporal** (restatements close the old row via `superseded_at`, never overwrite) | FBIL (G-Sec, SDL, STRIPS incl. Special/UDAY sheets) | 2021 → |
 | `yield_curves` | tenor point per curve per day, bitemporal | FBIL (G-Sec Par Yield, GOI ZCYC, SDL ZCYC) | 2023 → |
-| `trades` | per-ISIN session summary | CCIL NDS-OM (2002 →), NSE CBM daily archive (2008 →), NSE live segments | 2002 → |
+| `trades` | per-ISIN session summary | CCIL NDS-OM (2002 →), NSE CBM daily archive (2008 →), NSE live segments (manual after-close pulls only — the scheduled run excludes it; rows before 2026-09-19 captured at 13:00 are partial sessions) | 2002 → |
 | `corporate_trades` | **one row per transaction** (RFQ + OTC-reported) | NSE Trade & Settlement (2014 →), BSE Trade & Settlement (2020 →) | ~4.5M rows |
 | `public_issues`, `rbi_auctions` | primary-market calendars | SEBI, RBI | current |
 | `rbi_auction_results` | one row per security per auction: notified/accepted amounts, cut-off price & yield, weighted average | RBI press releases (G-Sec, T-Bill, SDL layouts) | current |

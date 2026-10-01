@@ -7,6 +7,14 @@ segments: otctrades_listed / otctrades_unlisted / exchtrades_listed / exchtrades
 Row: {descriptor, isin, ltp, lty, noOfTrades, tradeValue, wap, way}; envelope carries a
 last-session ``timestamp`` (used as the trade date).
 See ``docs/research/2026-07-18_113141_nseindia.com.md``.
+
+This is a *live* feed: during the session it shows the session so far. A snapshot taken before
+the close is therefore not a session summary, and writing it as one is silent data loss — the
+scheduled 13:00 run did exactly that from August to 2026-09-18, recording 35-106 rows for each
+weekday against 585-711 in the CBM archive for the same day, and only Fridays (captured on the
+Saturday) were complete. The connector now refuses a session that is still in progress (records
+SKIPPED); the completed session reaches the warehouse through the NSE CBM daily archive and the
+trade-level Trade & Settlement report, both of which gap-fill properly.
 """
 
 from __future__ import annotations
@@ -14,13 +22,16 @@ from __future__ import annotations
 import datetime as dt
 import json
 import re
+from collections.abc import Callable
 from typing import Any, Final
+from zoneinfo import ZoneInfo
 
 from bonds.config import Settings, get_settings
 from bonds.http import ThrottledClient
 from bonds.logging import get_logger
 from bonds.models import InstrumentType, SecurityRecord, TradeRecord
 from bonds.quality.metrics import MetricsCollector
+from bonds.sources.base import DataUnavailable
 
 logger = get_logger(__name__)
 
@@ -40,6 +51,10 @@ _PAGE_HEADERS: Final = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 _API_HEADERS: Final = {"Accept": "*/*", "Referer": _PAGE}
+_IST: Final = ZoneInfo("Asia/Kolkata")
+# NSE's corporate-bond reporting window (OTC reporting and RFQ) closes at 17:30 IST; the feed
+# is treated as a finished session only after this, with a margin for late postings.
+_SESSION_CLOSE: Final = dt.time(18, 0)
 
 
 class NseSource(MetricsCollector):
@@ -48,14 +63,24 @@ class NseSource(MetricsCollector):
     name: Final = "nse"
 
     def __init__(
-        self, client: ThrottledClient | None = None, settings: Settings | None = None
+        self,
+        client: ThrottledClient | None = None,
+        settings: Settings | None = None,
+        *,
+        now: Callable[[], dt.datetime] | None = None,
     ) -> None:
         self.reset_metrics()
         self._settings = settings or get_settings()
         self._client = client or ThrottledClient(self._settings.http)
+        self._now = now or (lambda: dt.datetime.now(_IST))
 
     def fetch_trades(self, as_of: dt.date) -> list[TradeRecord]:
-        """Prime Akamai cookies, then fetch + parse every segment's trades."""
+        """Prime Akamai cookies, then fetch + parse every segment's trades.
+
+        Raises:
+            DataUnavailable: If the feed is showing today's session before the close — a
+                snapshot mid-session is not a session summary (see the module note).
+        """
         self.reset_metrics()
         self._client.get(_PAGE, headers=_PAGE_HEADERS)  # cookie priming
         records: list[TradeRecord] = []
@@ -91,6 +116,16 @@ class NseSource(MetricsCollector):
             )
             logger.info(
                 "nse.segment", segment=segment, rows=len(rows), trade_date=trade_date.isoformat()
+            )
+        now = self._now().astimezone(_IST)
+        in_progress = sorted({r.trade_date for r in records if r.trade_date >= now.date()})
+        if in_progress and now.time() < _SESSION_CLOSE:
+            # Raw payloads are already landed above, so the intraday snapshot is kept in the
+            # lake; only the warehouse refuses it.
+            raise DataUnavailable(
+                f"NSE live feed shows the {in_progress[0].isoformat()} session still in progress "
+                f"at {now:%H:%M} IST; a session summary is only complete after "
+                f"{_SESSION_CLOSE:%H:%M} IST"
             )
         return records
 

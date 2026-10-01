@@ -214,6 +214,8 @@ def test_catch_up_gap_fills_series_and_refreshes_snapshots(
         "nse.corp_trades_ts": dt.date(2026, 7, 17),
         "nse_cbm.trades": dt.date(2026, 7, 16),
         "nse_cbr.bond_report": dt.date(2026, 7, 17),
+        "derived.liquidity": dt.date(2026, 7, 16),
+        "derived.spread_matrix": AS_OF,
     }
     monkeypatch.setattr(
         catchup,
@@ -249,15 +251,19 @@ def test_catch_up_gap_fills_series_and_refreshes_snapshots(
         "public_issues": [AS_OF],
         "rbi_auctions_RbiSource": [AS_OF],
         "rbi_results_RbiSource": [AS_OF],
-        # Derived products recompute for as_of *after* the tapes above are current.
-        "liquidity": [AS_OF],
+        # Derived products gap-fill their missed days and recompute for as_of, *after* the
+        # tapes above are current.
+        "liquidity": [dt.date(2026, 7, 16), AS_OF],
         "spread_matrix": [AS_OF],
     }
-    assert _FakeTradePipeline.runs["NseSource"] == [AS_OF]
+    # The NSE live feed is not part of the scheduled run: mid-session it is not a session
+    # summary, and the CBM archive + trade-level report carry the finished session.
+    assert "NseSource" not in _FakeTradePipeline.runs
+    assert "Corp trades · NSE" not in report.groups
     # The report flattens all group results.
     assert report.as_of == AS_OF
-    # 5 backfills + 3 ccil days + 2 cbm days + 7 snapshot/derived runs
-    assert len(report.results) == 5 + 3 + 2 + 7
+    # 5 backfills + 3 ccil days + 2 cbm days + 4 snapshot runs + 3 derived runs
+    assert len(report.results) == 5 + 3 + 2 + 4 + 3
 
 
 def test_catch_up_with_nothing_to_gap_fill_still_refreshes_snapshots(
@@ -284,7 +290,45 @@ def test_catch_up_with_nothing_to_gap_fill_still_refreshes_snapshots(
     assert report.groups["Corp trades (trade-level) · NSE"] == []
     assert report.groups["Corp trades (daily archive) · NSE"] == []
     assert report.groups["Bond master · NSE report"] == []
-    assert len(report.results) == 7  # snapshot + derived runs only
+    # Derived products still recompute as_of even with nothing to gap-fill.
+    assert orchestration["liquidity"] == [AS_OF]
+    assert orchestration["spread_matrix"] == [AS_OF]
+    assert len(report.results) == 6  # snapshot + derived runs only
+
+
+def test_derived_products_always_recompute_as_of_even_on_a_sunday(
+    orchestration: dict[str, list[dt.date]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A Sunday run whose derived series resume *on* Sunday: business_days() yields no Sunday,
+    # but as_of must still be recomputed — the tapes it summarises were refreshed moments ago.
+    sunday = dt.date(2026, 7, 19)
+    assert sunday.weekday() == 6
+    monkeypatch.setattr(
+        catchup, "series_start", lambda db, source, *, as_of, max_gap_days, **kw: sunday
+    )
+
+    catch_up(object(), as_of=sunday)  # type: ignore[arg-type]
+
+    assert orchestration["liquidity"] == [sunday]
+    assert orchestration["spread_matrix"] == [sunday]
+
+
+def test_derived_products_gap_fill_missed_days_including_saturday(
+    orchestration: dict[str, list[dt.date]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two missed runs (Sat 18th, then the Sunday is no market day) before a Monday run: both the
+    # Saturday and Monday as-of views are computed, oldest first.
+    monday = dt.date(2026, 7, 20)
+    monkeypatch.setattr(
+        catchup,
+        "series_start",
+        lambda db, source, *, as_of, max_gap_days, **kw: dt.date(2026, 7, 18),
+    )
+
+    catch_up(object(), as_of=monday)  # type: ignore[arg-type]
+
+    assert orchestration["liquidity"] == [dt.date(2026, 7, 18), monday]
+    assert orchestration["spread_matrix"] == [dt.date(2026, 7, 18), monday]
 
 
 @pytest.mark.parametrize(

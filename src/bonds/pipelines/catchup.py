@@ -8,11 +8,17 @@ invocation self-healing:
   *every* missed business day — from the day after the source's last processed date up to
   ``as_of`` — bounded to ``max_gap_days`` so a fresh or long-idle database never triggers a
   runaway backfill.
-* **Snapshot / latest-session sources** (universe, SEBI public issues, RBI auctions, NSE trades)
-  represent current state and are simply refreshed once for ``as_of``.
-* **Derived products** (liquidity metrics, corporate spread matrix) are recomputed for ``as_of``
-  after every source above has been brought current — they are windowed views of the tapes, so
-  running them first would describe yesterday's data.
+* **Snapshot sources** (universe, SEBI public issues, RBI auctions) represent current state and
+  are simply refreshed once for ``as_of``. The NSE *live* trade feed is deliberately absent: at
+  the 13:00 schedule it shows a session in progress, which is not a session summary and can
+  never be completed later from a live endpoint — the finished session arrives through the NSE
+  CBM daily archive and the trade-level report above, both of which gap-fill. (From August to
+  2026-09-18 the live snapshot was written as the day's summary: 35-106 rows a weekday against
+  585-711 in the archive.) ``bonds ingest nse-trades`` remains for a deliberate after-close pull.
+* **Derived products** (liquidity metrics, corporate spread matrix) are recomputed for every
+  missed business day and for ``as_of``, after every source above has been brought current —
+  they are point-in-time views of the tapes, so a missed day is a missing answer, and running
+  them first would describe yesterday's data.
 
 Every write is idempotent (``ON CONFLICT`` upserts keyed by ``(source, dataset, run_date)``), so
 re-running — whether twice in a day or after an outage — converges rather than duplicating.
@@ -34,6 +40,7 @@ from bonds.pipelines.corporate_trade import (
     BseCorporateTradePipeline,
     NseCorporateTradePipeline,
 )
+from bonds.pipelines.liquidity import SOURCE as DERIVED_SOURCE
 from bonds.pipelines.liquidity import LiquidityPipeline
 from bonds.pipelines.public_issue import PublicIssuePipeline
 from bonds.pipelines.rbi_auction import RbiAuctionPipeline
@@ -47,8 +54,6 @@ from bonds.sources.bse import BseSource
 from bonds.sources.ccil_historical import CcilHistoricalTradesSource, derive_securities
 from bonds.sources.cdsl import CdslSource
 from bonds.sources.fbil import FbilSource
-from bonds.sources.nse import NseSource
-from bonds.sources.nse import derive_securities as derive_nse_securities
 from bonds.sources.nse_bond_report import NseBondReportSource
 from bonds.sources.nse_cbm import NseCbmDailySource
 from bonds.sources.nse_trade_settlement import NseTradeSettlementSource
@@ -63,6 +68,8 @@ logger = get_logger(__name__)
 # that don't carry the class attribute.
 _BSE_CORP_TRADES_DATASET = BseCorporateTradePipeline.dataset
 _NSE_CORP_TRADES_DATASET = NseCorporateTradePipeline.dataset
+_LIQUIDITY_DATASET = LiquidityPipeline.dataset
+_SPREAD_MATRIX_DATASET = SpreadMatrixPipeline.dataset
 
 DEFAULT_MAX_GAP_DAYS = 30
 # A skip may mean "holiday" or "ran before the source published" (FBIL 500s for both). Re-attempt
@@ -179,6 +186,29 @@ def series_start(
                 floor=floor.isoformat(),
             )
     return min(starts.values())
+
+
+def derived_days(
+    database: Database, dataset: str, *, as_of: dt.date, max_gap_days: int
+) -> list[dt.date]:
+    """Business days a derived product must be recomputed for: every missed one, plus ``as_of``.
+
+    The derived tables are point-in-time — each row answers "as at this date" — so a day the
+    scheduler missed is a day with no answer, and it is gap-filled like any other series
+    (:func:`series_start`, same cap). ``as_of`` is always recomputed, even on a repeat run or a
+    Sunday: the tapes it summarises were refreshed moments ago.
+    """
+    start = series_start(
+        database,
+        DERIVED_SOURCE,
+        as_of=as_of,
+        max_gap_days=max_gap_days,
+        expected_datasets=[dataset],
+    )
+    days = list(business_days(start, as_of)) if start <= as_of else []
+    if not days or days[-1] != as_of:
+        days.append(as_of)
+    return days
 
 
 def latest_half_yearly_snapshot(as_of: dt.date) -> dt.date:
@@ -341,19 +371,29 @@ def catch_up(
     groups["Auction results · RBI"] = [
         RbiAuctionResultPipeline(database, source=rbi_source).run(as_of)
     ]
-    groups["Corp trades · NSE"] = [
-        TradePipeline(
-            database,
-            source=NseSource(),
-            derive_securities=derive_nse_securities,
-        ).run(as_of)
-    ]
 
     # --- derived products: recomputed from the tapes above, so they run last ----------------
-    # Both are windowed views of the trade tapes rather than ingests, so there is no gap to fill:
-    # recomputing for as_of is the whole job, and it must happen after the tapes are current or
-    # the metrics describe yesterday's data.
-    groups["Liquidity metrics · derived"] = [LiquidityPipeline(database).run(as_of)]
-    groups["Spread matrix · derived"] = [SpreadMatrixPipeline(database).run(as_of)]
+    # Both are windowed views of the trade tapes rather than ingests, so their gap-fill is a
+    # recomputation, not a fetch — but it is still a gap-fill. Every row is keyed to an as-of
+    # date and the questions asked of these tables are point-in-time ("was there a print within
+    # 15 days of 17 September"), so a missed day is a missing answer: the 2026-09-17/18 outage
+    # left no liquidity or spread rows for either date while every tape was healed. Trade dates,
+    # not load dates, drive the windows, so recomputing a missed day from the now-complete tapes
+    # gives the same as-at view. They run after every source above or the metrics describe
+    # yesterday's data.
+    liquidity = LiquidityPipeline(database)
+    groups["Liquidity metrics · derived"] = [
+        liquidity.run(day)
+        for day in derived_days(
+            database, _LIQUIDITY_DATASET, as_of=as_of, max_gap_days=max_gap_days
+        )
+    ]
+    spread_matrix = SpreadMatrixPipeline(database)
+    groups["Spread matrix · derived"] = [
+        spread_matrix.run(day)
+        for day in derived_days(
+            database, _SPREAD_MATRIX_DATASET, as_of=as_of, max_gap_days=max_gap_days
+        )
+    ]
 
     return CatchUpReport(as_of=as_of, groups=groups)
