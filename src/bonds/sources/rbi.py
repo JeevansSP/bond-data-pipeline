@@ -53,6 +53,13 @@ _TYPES: Final[tuple[tuple[str, str], ...]] = (
     ("dated securit", "G-Sec"),
     ("underwriting", "Underwriting"),
     ("sovereign gold", "SGB"),
+    # RBI abbreviates in result titles ("91-Day, 182-Day and 364-Day T-Bill Auction Result:
+    # Cut-off") where the announcement spells out "Treasury Bills". A conversion/switch is a
+    # G-Sec operation but not issuance, so it gets its own label rather than inflating G-Sec
+    # primary supply. Both fell through to "Other" until 2026-09-19 (12 rows; repaired by
+    # migration 182dad9285da).
+    ("t-bill", "T-Bill"),
+    ("conversion/switch", "Switch"),
 )
 _AUCTION_KEYWORDS: Final = ("auction", "treasury bill", "government stock", "state government")
 

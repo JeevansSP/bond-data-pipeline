@@ -29,6 +29,24 @@ _DETAIL = (
 )
 
 
+_INDEX_RESULTS = (
+    b"<html><body><table>"
+    b"<tr><td><a class='link2' href='FS_PressRelease.aspx?prid=63300&fn=2757'>"
+    b"91-Day, 182-Day and 364-Day T-Bill Auction Result: Cut-off</a></td><td>x</td></tr>"
+    b"<tr><td><a class='link2' href='FS_PressRelease.aspx?prid=63301&fn=2757'>"
+    b"Result: Conversion/Switch Auction of Government of India Securities</a></td><td>x</td></tr>"
+    b"</table></body></html>"
+)
+
+
+def test_parse_index_classifies_abbreviated_and_switch_titles() -> None:
+    # RBI's result titles abbreviate "Treasury Bills" to "T-Bill", and a conversion/switch is a
+    # G-Sec operation but not issuance; both fell through to "Other" until 2026-09-19.
+    records = {r.prid: r for r in parse_index(_INDEX_RESULTS, source="rbi")}
+    assert records["63300"].auction_type == "T-Bill"
+    assert records["63301"].auction_type == "Switch"
+
+
 def test_parse_index_extracts_auctions_and_types() -> None:
     records = {r.prid: r for r in parse_index(_INDEX, source="rbi")}
     assert set(records) == {"63182", "63185"}  # SGB redemption is not an auction -> excluded
