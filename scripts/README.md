@@ -18,8 +18,9 @@ Two pieces make that work:
    - **gap-fills** the date-series sources (FBIL valuations, CCIL trades) for *every* missed
      business day, from the day after each source's last processed date up to today (bounded by
      `--max-gap-days`, default 30, so a fresh/idle DB never backfills years by accident);
-   - **refreshes** the snapshot / latest-session sources (universe, SEBI public issues, RBI
-     auctions, NSE trades) once for today.
+   - **refreshes** the snapshot sources (universe, SEBI public issues, RBI auctions) once for
+     today. The NSE *live* trade feed is not in the scheduled run: at 13:00 it shows a session in
+     progress, and the connector now refuses to record that as a session summary.
    - Every write is an `ON CONFLICT` upsert keyed by `(source, dataset, run_date)`, so running it
      twice in a day — or after a week offline — converges instead of duplicating.
 
@@ -75,9 +76,12 @@ launchctl bootout gui/$(id -u)/com.cydratech.bonds-ingest
 ```
 
 Notes:
-- Docker Desktop must be set to **start at login** (System Settings → General → Login Items), or the
-  container won't be up when the job runs; the runner starts it via `docker compose up -d` but
-  cannot start Docker Desktop itself.
+- Docker Desktop does not have to be running: if the daemon is down the runner launches it
+  (`open -g -a Docker`) and waits up to 3 minutes before `docker compose up -d`. Before this
+  existed, the 2026-09-17 and 2026-09-18 runs died on a stopped Docker after a restart. Setting
+  Docker Desktop to **start at login** (System Settings → General → Login Items) still saves the wait.
+- A failed run posts a macOS notification (`bonds ingest FAILED`) as well as writing the log — a
+  failure that only reaches `launchd.out.log` goes unnoticed for days.
 - Change the time by editing `StartCalendarInterval` in the plist, then bootout + bootstrap again.
 
 ## Linux (systemd)

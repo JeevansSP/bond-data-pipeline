@@ -89,8 +89,40 @@ for lf in "$LOG_DIR"/launchd.out.log "$LOG_DIR"/launchd.err.log; do
   fi
 done
 
+# --- make sure the Docker daemon itself is up ---
+# On macOS the daemon lives inside Docker Desktop, a GUI app that only runs once launched: after
+# a reboot (or a logout) it is simply not there, and `docker compose up` fails instantly. That
+# killed the 2026-09-17 and 2026-09-18 scheduled runs while the operator was travelling — two
+# days of "is Docker running?" in the log and nothing else. A LaunchAgent runs in the user's GUI
+# session, so it may launch the app itself; the daemon then takes ~10-40s to accept connections.
+DOCKER_START_TIMEOUT_SECONDS=180
+ensure_docker_daemon() {
+  docker info >/dev/null 2>&1 && return 0
+  if [ "$(uname)" = "Darwin" ] && [ -d /Applications/Docker.app ]; then
+    log "Docker daemon not running; launching Docker Desktop"
+    open -g -a Docker || log "WARN: 'open -a Docker' failed"
+    for _ in $(seq 1 $((DOCKER_START_TIMEOUT_SECONDS / 2))); do
+      docker info >/dev/null 2>&1 && { log "Docker daemon ready"; return 0; }
+      sleep 2
+    done
+    log "WARN: Docker daemon not ready after ${DOCKER_START_TIMEOUT_SECONDS}s"
+  else
+    log "WARN: Docker daemon not running and cannot be started from here"
+  fi
+  return 1
+}
+
+# --- surface a failure to the operator (macOS Notification Center) ---
+# A failure that only reaches the log files is a failure nobody sees until they look.
+notify_failure() {
+  command -v osascript >/dev/null 2>&1 || return 0
+  osascript -e "display notification \"$1\" with title \"bonds ingest FAILED\"" \
+    >/dev/null 2>&1 || true
+}
+
 # --- ensure the Postgres container is up and accepting connections ---
 if command -v docker >/dev/null 2>&1; then
+  ensure_docker_daemon || true  # fall through: the ingest fails loudly below if it is still down
   log "starting Postgres container"
   if docker compose up -d postgres >>"$LOG_FILE" 2>&1; then
     DOCKER_STARTED=1  # stop it in cleanup, even if the ingest itself fails
@@ -132,5 +164,6 @@ if $KEEP_AWAKE uv run bonds ingest catch-up >>"$LOG_FILE" 2>&1; then
 else
   code=$?
   log "ingest FAILED (exit $code) — see $LOG_FILE"
+  notify_failure "exit $code — see data/logs/ingest-$(date +%Y-%m-%d).log"
   exit "$code"
 fi
