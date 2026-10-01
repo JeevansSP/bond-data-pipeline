@@ -99,11 +99,118 @@ def test_iter_records_skips_persistently_failing_page(tmp_path: Path) -> None:
         return_value=httpx.Response(200, json=_page("INE002A07809", total=3, has_next=True))
     )
     respx.get(URL, params={"page": "2", "size": "100"}).mock(return_value=httpx.Response(500))
+    # ...and every slice and single record of it fails too, so the window is written off.
+    respx.get(URL, params={"size": "10"}).mock(return_value=httpx.Response(500))
+    respx.get(URL, params={"size": "1"}).mock(return_value=httpx.Response(500))
     respx.get(URL, params={"page": "3", "size": "100"}).mock(
         return_value=httpx.Response(200, json=_page("IN8241O08017", total=3, has_next=False))
     )
     records = list(_source(tmp_path).iter_records(AS_OF))
     assert {r.isin for r in records} == {"INE002A07809", "IN8241O08017"}  # page 2 skipped
+
+
+def _subpage(isin: str, *, total_records: int, has_next: bool, size: int = 10) -> dict[str, Any]:
+    return {
+        "data": [{"isin": isin, "data": {"isin": isin, "coupon_rate": 7.0}}],
+        "pagination_info": {
+            "total_records": total_records,
+            "total_pages": -(-total_records // size),
+            "has_next": has_next,
+        },
+    }
+
+
+@respx.mock
+def test_failing_page_is_recovered_as_subpages(tmp_path: Path) -> None:
+    # The windows BondCentral 500s at size=100 mostly serve at size=10, and a slice that still
+    # fails is read record by record: page 2 is re-read as slices 11..20; slice 11 fails — even
+    # though it is the FIRST slice, page 1 just succeeded so the feed is known to be up — and is
+    # re-read as records 101..110, of which only 103 (the unserialisable one) is lost. has_next
+    # comes from the last slice, so the crawl still continues to page 3.
+    respx.get(URL, params={"page": "1", "size": "100"}).mock(
+        return_value=httpx.Response(200, json=_page("INE002A07809", total=3, has_next=True))
+    )
+    respx.get(URL, params={"page": "2", "size": "100"}).mock(return_value=httpx.Response(500))
+    for sub in range(11, 21):
+        respx.get(URL, params={"page": str(sub), "size": "10"}).mock(
+            return_value=httpx.Response(500)
+            if sub == 11
+            else httpx.Response(
+                200, json=_subpage(f"INE{sub:03d}A07001", total_records=300, has_next=True)
+            )
+        )
+    for rec in range(101, 111):
+        respx.get(URL, params={"page": str(rec), "size": "1"}).mock(
+            return_value=httpx.Response(500)
+            if rec == 103
+            else httpx.Response(
+                200,
+                json=_subpage(f"INE{rec:03d}A07002", total_records=300, has_next=True, size=1),
+            )
+        )
+    respx.get(URL, params={"page": "3", "size": "100"}).mock(
+        return_value=httpx.Response(200, json=_page("IN8241O08017", total=3, has_next=False))
+    )
+    source = _source(tmp_path)
+    isins = {r.isin for r in source.iter_records(AS_OF)}
+    assert {"INE002A07809", "IN8241O08017"} <= isins
+    assert {f"INE{sub:03d}A07001" for sub in range(12, 21)} <= isins  # the nine good slices
+    assert {f"INE{rec:03d}A07002" for rec in range(101, 111) if rec != 103} <= isins
+    assert "INE103A07002" not in isins  # the one record that cannot be served at any size
+    base = tmp_path / "raw" / "bondcentral" / AS_OF.isoformat()
+    assert (base / "page_0012_size010.json").exists()  # slices land under their own name
+    assert (base / "page_0104_size001.json").exists()  # so do single records
+    assert not (base / "page_0002.json").exists()  # the failed full page never landed
+    assert source.metrics[0].rows_parsed == 1 + 9 + 9 + 1
+
+
+@respx.mock
+def test_second_consecutive_failing_page_bails_on_its_first_slice(tmp_path: Path) -> None:
+    # Page 2 fails and every slice fails (feed down). Page 3 then fails too: with the previous
+    # page already failed, the first failing slice must end the attempt — an outage costs one
+    # extra request per page, not ten — so slices 22..30 are never requested.
+    respx.get(URL, params={"page": "1", "size": "100"}).mock(
+        return_value=httpx.Response(200, json=_page("INE002A07809", total=4, has_next=True))
+    )
+    respx.get(URL, params={"page": "2", "size": "100"}).mock(return_value=httpx.Response(500))
+    respx.get(URL, params={"page": "3", "size": "100"}).mock(return_value=httpx.Response(500))
+    respx.get(URL, params={"page": "4", "size": "100"}).mock(
+        return_value=httpx.Response(200, json=_page("IN8241O08017", total=4, has_next=False))
+    )
+    slices = {
+        sub: respx.get(URL, params={"page": str(sub), "size": "10"}).mock(
+            return_value=httpx.Response(500)
+        )
+        for sub in range(11, 31)
+    }
+    respx.get(URL, params={"size": "1"}).mock(return_value=httpx.Response(500))
+    isins = {r.isin for r in _source(tmp_path).iter_records(AS_OF)}
+    assert isins == {"INE002A07809", "IN8241O08017"}
+    assert all(slices[sub].called for sub in range(11, 21))  # page 2: feed was alive, all tried
+    assert slices[21].called and not any(slices[sub].called for sub in range(22, 31))
+
+
+@respx.mock
+def test_recovered_page_with_lost_tail_slice_keeps_crawling(tmp_path: Path) -> None:
+    # When the LAST slice of a recovered page is lost, has_next is unknown; the record count
+    # (300 / 100 = 3 pages) must decide that page 3 exists rather than ending the crawl early.
+    respx.get(URL, params={"page": "1", "size": "100"}).mock(
+        return_value=httpx.Response(200, json=_page("INE002A07809", total=3, has_next=True))
+    )
+    respx.get(URL, params={"page": "2", "size": "100"}).mock(return_value=httpx.Response(500))
+    for sub in range(11, 20):
+        respx.get(URL, params={"page": str(sub), "size": "10"}).mock(
+            return_value=httpx.Response(
+                200, json=_subpage(f"INE{sub:03d}A07001", total_records=300, has_next=True)
+            )
+        )
+    respx.get(URL, params={"page": "20", "size": "10"}).mock(return_value=httpx.Response(500))
+    respx.get(URL, params={"size": "1"}).mock(return_value=httpx.Response(500))  # records too
+    respx.get(URL, params={"page": "3", "size": "100"}).mock(
+        return_value=httpx.Response(200, json=_page("IN8241O08017", total=3, has_next=False))
+    )
+    isins = {r.isin for r in _source(tmp_path).iter_records(AS_OF)}
+    assert "IN8241O08017" in isins
 
 
 @respx.mock
@@ -200,6 +307,7 @@ def test_iter_records_skips_non_json_page_and_continues(tmp_path: Path) -> None:
     respx.get(URL, params={"page": "1", "size": "100"}).mock(
         return_value=httpx.Response(200, content=b"<html>edge error</html>")
     )
+    respx.get(URL, params={"page": "1", "size": "10"}).mock(return_value=httpx.Response(500))
     respx.get(URL, params={"page": "2", "size": "100"}).mock(
         return_value=httpx.Response(200, json=_PAGE_2)
     )
@@ -220,5 +328,7 @@ def test_tail_failures_without_total_pages_keep_the_snapshot(tmp_path: Path) -> 
         respx.get(URL, params={"page": str(p), "size": "100"}).mock(
             return_value=httpx.Response(500)
         )
+    respx.get(URL, params={"size": "10"}).mock(return_value=httpx.Response(500))  # no sub-pages
+    respx.get(URL, params={"size": "1"}).mock(return_value=httpx.Response(500))
     records = list(_source(tmp_path).iter_records(AS_OF))
     assert {r.isin for r in records} == {"INE002A07809"}  # page 1 kept, no SourceError
