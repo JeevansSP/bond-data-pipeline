@@ -121,6 +121,16 @@ def test_parse_snapshot_unpublished_report_is_data_unavailable() -> None:
         list(parse_snapshot(html))
 
 
+def test_parse_snapshot_padded_no_records_placeholder_is_data_unavailable() -> None:
+    # The live shell (30-Sep-2026, before CDSL posted it) pads its "No Records Found" row to the
+    # full ten columns, so it passes the width test; it must still mean "not published yet".
+    cells = ["<td></td>"] * 10
+    cells[4] = "<td>No Records Found</td>"
+    html = f"<html><body><table>{_HEADER}<tr>{''.join(cells)}</tr></table></body></html>".encode()
+    with pytest.raises(DataUnavailable):
+        list(parse_snapshot(html))
+
+
 def test_parse_snapshot_raises_when_rows_carry_no_isin() -> None:
     # Rows of the right width but no valid ISIN column = a layout change, which must fail loudly.
     cells = "".join("<td>x</td>" for _ in range(12))

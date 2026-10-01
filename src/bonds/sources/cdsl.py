@@ -44,6 +44,8 @@ _COL_EMBEDDED: Final = 7
 _COL_AMT_ISSUED: Final = 8
 _COL_AMT_OUTSTANDING: Final = 9
 _MIN_COLS: Final = 10
+# An unpublished report date renders one full-width placeholder row: ten cells, nine empty.
+_NO_RECORDS: Final = "no records found"
 
 
 class CdslSource(MetricsCollector):
@@ -118,6 +120,11 @@ def parse_snapshot(content: bytes) -> ParsedSnapshot:
     for row in rows:
         cells = [_text(c) for c in cast("list[HtmlElement]", row.xpath("./td"))]
         if len(cells) < _MIN_COLS:
+            continue
+        if " ".join(c for c in cells if c).lower() == _NO_RECORDS:
+            # The placeholder is as wide as a data row, so the width test above lets it through;
+            # counting it would turn "not published yet" into "layout changed?" — which failed
+            # every nightly run on the 30-Sep-2026 snapshot until CDSL posted it.
             continue
         candidates += 1
         isin = cells[_COL_ISIN]
