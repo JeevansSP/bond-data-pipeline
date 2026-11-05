@@ -223,6 +223,39 @@ def test_iter_records_aborts_when_too_many_pages_fail(tmp_path: Path) -> None:
 
 
 @respx.mock
+def test_unreachable_host_aborts_after_two_pages_without_sub_paging(tmp_path: Path) -> None:
+    # 2026-11-03..05: the host refused every connection, and the pull walked all 31 skip-budget
+    # pages (~18 min). A refused connection is the host being down, not a broken window: no
+    # size ladder, and two such pages in a row end the pull.
+    from bonds.sources.base import SourceError
+
+    route = respx.get(URL).mock(side_effect=httpx.ConnectError("[Errno 61] Connection refused"))
+    with pytest.raises(SourceError, match="host unreachable"):
+        list(_source(tmp_path).iter_records(AS_OF))
+    sizes = {call.request.url.params["size"] for call in route.calls}
+    pages = {call.request.url.params["page"] for call in route.calls}
+    assert sizes == {"100"} and pages == {"1", "2"}
+
+
+@respx.mock
+def test_single_unreachable_page_mid_crawl_keeps_the_snapshot(tmp_path: Path) -> None:
+    # One refused page between good pages is skipped like any failed page; it must not abort.
+    respx.get(URL, params={"page": "1", "size": "100"}).mock(
+        return_value=httpx.Response(200, json=_page("INE002A07809", total=3, has_next=True))
+    )
+    respx.get(URL, params={"page": "2", "size": "100"}).mock(
+        side_effect=httpx.ConnectError("[Errno 61] Connection refused")
+    )
+    slices = respx.get(URL, params={"size": "10"}).mock(return_value=httpx.Response(500))
+    respx.get(URL, params={"page": "3", "size": "100"}).mock(
+        return_value=httpx.Response(200, json=_page("IN8241O08017", total=3, has_next=False))
+    )
+    isins = {r.isin for r in _source(tmp_path).iter_records(AS_OF)}
+    assert isins == {"INE002A07809", "IN8241O08017"}
+    assert not slices.called  # a refused page is not re-read down the ladder
+
+
+@respx.mock
 def test_parsing_maps_fields_and_rating(tmp_path: Path) -> None:
     _mock_pages()
     by_isin = {r.isin: r for r in _source(tmp_path).iter_records(AS_OF)}
