@@ -44,6 +44,13 @@ _MAX_PAGE_SIZE: Final = 100
 # records of page 200 to bailing on its first slice.)
 _MAX_SKIPPED_PAGES: Final = 30
 _LADDER_STEP: Final = 10  # a failed page of n records is re-read as 10 pages of n/10
+# A refused or timed-out connection (after the client's own retries) means the host is down, not
+# that a window is broken: a broken window answers 500. Sub-paging such a page only multiplies the
+# wait, and walking the skip budget page by page cost ~18 minutes per run in the 2026-11-03..05
+# outage. So unreachable pages skip the size ladder, and this many in a row abort the pull. (Two,
+# not one: a single refused page mid-crawl must not discard a nearly complete snapshot.)
+_UNREACHABLE: Final = (httpx.ConnectError, httpx.ConnectTimeout)
+_MAX_UNREACHABLE_PAGES: Final = 2
 _ZERO_INTEREST: Final = "ZERO"  # canonical zero-coupon interest type (bonds.models)
 
 
@@ -93,7 +100,7 @@ class BondCentralSource(MetricsCollector):
         try:
             payload, page_bytes = self._fetch_page(page, size, as_of)
         except (httpx.HTTPError, ValueError) as exc:
-            if not _splittable(size):
+            if isinstance(exc, _UNREACHABLE) or not _splittable(size):
                 raise
             logger.warning("bondcentral.page_failed", page=page, error=str(exc)[:80])
             return self._recover_page(page, size, as_of, cause=exc, bail_on_first=not feed_alive)
@@ -131,6 +138,8 @@ class BondCentralSource(MetricsCollector):
                 info: dict[str, Any] = dict(payload.get("pagination_info") or {})
                 sub_lost = 0
             except (httpx.HTTPError, ValueError) as exc:
+                if isinstance(exc, _UNREACHABLE):
+                    raise
                 if sub == first and bail_on_first:
                     raise cause from exc
                 try:
@@ -140,6 +149,8 @@ class BondCentralSource(MetricsCollector):
                         sub, sub_size, as_of, cause=exc, bail_on_first=False
                     )
                 except (httpx.HTTPError, ValueError) as sub_exc:
+                    if isinstance(sub_exc, _UNREACHABLE):
+                        raise
                     logger.warning(
                         "bondcentral.subpage_skipped",
                         page=page,
@@ -186,7 +197,7 @@ class BondCentralSource(MetricsCollector):
         self.reset_metrics()
         page = 1
         total_bytes = total_items = total_kept = skipped_pages = lost_records = 0
-        consecutive_failures = 0
+        consecutive_failures = consecutive_unreachable = 0
         known_total_pages: int | None = None
         while True:
             try:
@@ -199,7 +210,15 @@ class BondCentralSource(MetricsCollector):
                 # capped so a genuine outage still fails loudly.
                 skipped_pages += 1
                 consecutive_failures += 1
+                consecutive_unreachable = (
+                    consecutive_unreachable + 1 if isinstance(exc, _UNREACHABLE) else 0
+                )
                 logger.warning("bondcentral.page_skipped", page=page, error=str(exc)[:80])
+                if consecutive_unreachable >= _MAX_UNREACHABLE_PAGES:
+                    raise SourceError(
+                        f"BondCentral: host unreachable ({exc!s:.80}) on "
+                        f"{consecutive_unreachable} pages in a row; aborting"
+                    ) from exc
                 if skipped_pages > _MAX_SKIPPED_PAGES:
                     raise SourceError(
                         f"BondCentral: {skipped_pages} pages failed to fetch; aborting"
@@ -219,7 +238,7 @@ class BondCentralSource(MetricsCollector):
                     break
                 page += 1
                 continue
-            consecutive_failures = 0
+            consecutive_failures = consecutive_unreachable = 0
             lost_records += lost
             kept = 0
             for item in items:
