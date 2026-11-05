@@ -21,7 +21,7 @@ import httpx
 from bonds.config import Settings, get_settings
 from bonds.http import ThrottledClient
 from bonds.logging import get_logger
-from bonds.models import InstrumentType, SecurityRecord
+from bonds.models import InstrumentType, SecurityRecord, normalize_interest_type
 from bonds.quality.metrics import MetricsCollector
 from bonds.sources.base import SourceError
 
@@ -44,6 +44,7 @@ _MAX_PAGE_SIZE: Final = 100
 # records of page 200 to bailing on its first slice.)
 _MAX_SKIPPED_PAGES: Final = 30
 _LADDER_STEP: Final = 10  # a failed page of n records is re-read as 10 pages of n/10
+_ZERO_INTEREST: Final = "ZERO"  # canonical zero-coupon interest type (bonds.models)
 
 
 class BondCentralSource(MetricsCollector):
@@ -295,14 +296,21 @@ def _parse_item(item: dict[str, Any]) -> SecurityRecord | None:
     if len(isin) != 12 or not isin.startswith("IN"):
         return None
     rating, agency, rating_date = _first_rating(data.get("ratings"))
+    interest_type = _as_str(data.get("interest_type"))
+    coupon = _as_float(data.get("coupon_rate"))
+    if coupon is None and normalize_interest_type(interest_type) == _ZERO_INTEREST:
+        # A zero-interest bond has a coupon of 0, not an unknown one. The universe upsert keeps
+        # the stored value when the incoming coupon is NULL, so a NULL here would leave a coupon
+        # that another source (CDSL) wrote — an implied yield for these bonds — in place forever.
+        coupon = 0.0
     return SecurityRecord(
         isin=isin,
         instrument_type=InstrumentType.CORP,
         source=BondCentralSource.name,
         description=_as_str(data.get("security_name")),
         issuer=_as_str(data.get("issuer")),
-        coupon=_as_float(data.get("coupon_rate")),
-        interest_type=_as_str(data.get("interest_type")),
+        coupon=coupon,
+        interest_type=interest_type,
         maturity_date=_as_date(data.get("maturity_date")),
         face_value=_as_float(data.get("face_value")),
         attributes={
