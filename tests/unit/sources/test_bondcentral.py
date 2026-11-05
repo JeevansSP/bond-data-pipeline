@@ -13,7 +13,7 @@ import respx
 from bonds.config import HttpSettings, Settings
 from bonds.http import ThrottledClient
 from bonds.models import InstrumentType
-from bonds.sources.bondcentral import BondCentralSource
+from bonds.sources.bondcentral import BondCentralSource, _parse_item
 
 URL = "https://api.bondcentral.in/securities/"
 AS_OF = dt.date(2026, 7, 18)
@@ -332,3 +332,30 @@ def test_tail_failures_without_total_pages_keep_the_snapshot(tmp_path: Path) -> 
     respx.get(URL, params={"size": "1"}).mock(return_value=httpx.Response(500))
     records = list(_source(tmp_path).iter_records(AS_OF))
     assert {r.isin for r in records} == {"INE002A07809"}  # page 1 kept, no SourceError
+
+
+def _item(interest_type: str | None, coupon: float | None) -> dict[str, Any]:
+    return {
+        "isin": "INE121A07QL6",
+        "data": {"isin": "INE121A07QL6", "interest_type": interest_type, "coupon_rate": coupon},
+    }
+
+
+def test_zero_interest_bond_without_coupon_parses_to_zero_coupon() -> None:
+    record = _parse_item(_item("Zero Interest", None))
+    assert record is not None
+    assert record.interest_type == "ZERO"
+    assert record.coupon == 0.0  # not None: a NULL would keep a stale coupon on upsert
+
+
+def test_zero_interest_bond_keeps_a_published_coupon() -> None:
+    record = _parse_item(_item("Zero Interest", 8.4))
+    assert record is not None
+    assert record.coupon == pytest.approx(8.4)  # a source contradiction stays visible to DQ
+
+
+@pytest.mark.parametrize("interest_type", ["Fixed Interest", "Variable-Index Linked", None])
+def test_other_interest_types_keep_a_null_coupon(interest_type: str | None) -> None:
+    record = _parse_item(_item(interest_type, None))
+    assert record is not None
+    assert record.coupon is None
